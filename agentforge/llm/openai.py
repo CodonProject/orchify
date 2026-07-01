@@ -1,59 +1,12 @@
 import json
 import requests
 
-from dataclasses import dataclass, field
 from typing import Generator, Optional, Literal
 
-
-@dataclass
-class Chunk:
-    is_cot: bool
-    content: str
-
-    is_assembly_tool: bool = field(default=False)
-    assembly_chunk: str    = field(default='')
-
-    total_content: str          = field(default='')
-    total_cot_content: str      = field(default='')
-    total_tool_call: list[dict] = field(default_factory=list)
-
-    is_cot_end: bool = field(default=False)
+from agentforge.llm.base import Chunk, FinalStatus, Response, LLMInterface
 
 
-@dataclass
-class FinalStatus:
-    content: str
-    reasoning: str
-    tool_calls: list[dict] = field(default_factory=list)
-
-    completion_tokens: int = field(default=0)
-    prompt_tokens: int = field(default=0)
-    prompt_cache_hit_tokens: int = field(default=0)
-    prompt_cache_miss_tokens: int = field(default=0)
-    total_tokens: int = field(default=0)
-
-    @property
-    def completion_token(self) -> int:
-        return self.completion_tokens
-
-    @property
-    def prompt_token(self) -> int:
-        return self.prompt_tokens
-
-    @property
-    def total_token(self) -> int:
-        return self.total_tokens
-
-
-@dataclass
-class Response:
-    current_chunk: Optional[Chunk]
-    final_status: Optional[FinalStatus] = field(default=None)
-
-    is_final: bool = field(default=False)
-
-
-class OpenAICompat:
+class OpenAICompat(LLMInterface):
     def __init__(self, api_key: str, base_url: str = 'https://api.openai.com/v1'):
         self.api_key  = api_key
         self.base_url = base_url
