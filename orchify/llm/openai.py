@@ -10,6 +10,7 @@ from orchify.backend import orchify_web_backend
 
 class OpenAICompat(LLMInterface):
     def __init__(self, api_key: str = req_key(), base_url: str = req_url('https://api.openai.com/v1')):
+        super().__init__()
         self.api_key  = api_key
         self.base_url = base_url
         self.url = '/chat/completions'
@@ -269,7 +270,7 @@ class OpenAICompat(LLMInterface):
         except httpx.RequestError as e:
             raise e
 
-    async def request(
+    async def _core_request(
         self,
         messages: list[dict],
         model: str = req_model('gpt-4o'),

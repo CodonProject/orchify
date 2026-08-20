@@ -3,6 +3,7 @@ from typing import Literal, Optional
 from dataclasses import dataclass
 
 import json
+import time
 
 
 EVENT_TYPES = Literal[
@@ -19,12 +20,22 @@ EVENT_TYPES = Literal[
     'tool:call:finish',
     'run:start',
     'run:next',
+    'run:paused',
+    'run:resumed',
     'run:finish'
 ]
 
 FEEDBACK_TYPES = Literal[
     'control:stop',
-    'control:continue'
+    'control:continue',
+    'control:pause',
+    'control:resume',
+    'control:retry',
+    'control:override_answer',
+    'control:deny_tool',
+    'control:inject_tool_result',
+    'control:update_messages',
+    'control:switch_model'
 ]
 
 
@@ -32,6 +43,10 @@ FEEDBACK_TYPES = Literal[
 class EventFeedback:
     ftype: FEEDBACK_TYPES
     comment: Optional[str] = None
+    payload: dict = None
+
+    def __post_init__(self):
+        self.payload = self.payload or {}
 
 
 class BaseEvent:
@@ -43,6 +58,9 @@ class BaseEvent:
         event_type: EVENT_TYPES,
         turn: int = 1,
         payload: dict = None,
+        run_id: str = '',
+        source: str = '',
+        metadata: dict = None,
     ):
         self.agent_name = agent_name
         self.agent_code = agent_code
@@ -50,6 +68,14 @@ class BaseEvent:
         self.turn = turn
         self.event_type = event_type
         self.payload = payload or {}
+
+        self.run_id = run_id
+        self.source = source
+        self.created_at = time.time()
+        self.metadata = dict(metadata or {})
+        self.metadata.setdefault('timestamp', self.created_at)
+        self.metadata.setdefault('run_id', run_id)
+        self.metadata.setdefault('source', source)
 
 
 class AgentEvent(BaseEvent):
@@ -61,9 +87,12 @@ class AgentEvent(BaseEvent):
         event_type: EVENT_TYPES,
         content: str = '',
         payload: dict = None,
-        turn: int = 1
+        turn: int = 1,
+        run_id: str = '',
+        source: str = 'agent',
+        metadata: dict = None,
     ):
-        super().__init__(agent_name, agent_code, turn_id, turn=turn, event_type=event_type, payload=payload)
+        super().__init__(agent_name, agent_code, turn_id, turn=turn, event_type=event_type, payload=payload, run_id=run_id, source=source, metadata=metadata)
         self.content = content
     
     @staticmethod
@@ -124,9 +153,12 @@ class ToolEvent(BaseEvent):
         tool_id: str = '',
         tool_name: str = '',
         chunk_arg: str = '',
-        turn: int = 1
+        turn: int = 1,
+        run_id: str = '',
+        source: str = 'tool',
+        metadata: dict = None,
     ):
-        super().__init__(agent_name, agent_code, turn_id, turn=turn, event_type=event_type, payload=payload)
+        super().__init__(agent_name, agent_code, turn_id, turn=turn, event_type=event_type, payload=payload, run_id=run_id, source=source, metadata=metadata)
         self.tool_id = tool_id
         self.tool_name = tool_name
         self.chunk_arg = chunk_arg
@@ -262,7 +294,10 @@ class RuntimeEvent(BaseEvent):
         turn_id: str,
         event_type: EVENT_TYPES,
         payload: dict = None,
-        turn: int = 1
+        turn: int = 1,
+        run_id: str = '',
+        source: str = 'runtime',
+        metadata: dict = None,
     ):
-        super().__init__(agent_name, agent_code, turn_id, turn=turn, event_type=event_type, payload=payload)
+        super().__init__(agent_name, agent_code, turn_id, turn=turn, event_type=event_type, payload=payload, run_id=run_id, source=source, metadata=metadata)
     

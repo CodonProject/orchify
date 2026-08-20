@@ -1,27 +1,44 @@
-from orchify.event import BaseEvent, AgentEvent, RuntimeEvent, EVENT_TYPES
+from orchify.event import BaseEvent, AgentEvent, ToolEvent, RuntimeEvent, EventFeedback, FEEDBACK_TYPES, EVENT_TYPES
 import inspect
 import threading as td
 import asyncio
+from collections import deque
+from fnmatch import fnmatchcase
 from typing import Any, Callable, Optional, Literal
 from typing import get_args
 
+
+BUILTIN_EVENT_TYPES = set(get_args(EVENT_TYPES)) | {'*'}
 
 HOOK_MODES = Literal['normal', 'once', 'agent']
 
 
 class HookBinding:
-    __slots__ = ('func', 'event_type', 'turn_id', 'mode', 'count', 'disposed')
+    __slots__ = ('func', 'event_type', 'turn_id', 'mode', 'count', 'disposed', 'agent_name', 'match', 'owner')
 
-    def __init__(self, func: Callable, event_type: str, turn_id: Optional[str], mode: str):
+    def __init__(
+        self,
+        func: Callable,
+        event_type: str,
+        turn_id: Optional[str],
+        mode: str,
+        agent_name: Optional[str] = None,
+        match: Optional[Callable] = None,
+        owner: str = '',
+    ):
         self.func = func
         self.event_type = event_type
         self.turn_id = turn_id
         self.mode = mode
         self.count = 0
         self.disposed = False
+        self.agent_name = agent_name
+        self.match = match
+        self.owner = owner
 
     def __repr__(self):
-        return f"<HookBinding event_type={self.event_type!r} turn_id={self.turn_id!r} mode={self.mode!r} count={self.count} disposed={self.disposed}>"
+        return (f"<HookBinding event_type={self.event_type!r} turn_id={self.turn_id!r} "
+                f"mode={self.mode!r} agent_name={self.agent_name!r} count={self.count} disposed={self.disposed}>")
 
 
 class Broker:
@@ -31,8 +48,29 @@ class Broker:
 
         self.requests: dict[str, td.Event] = {}
         self.runs: dict[str, Any] = {}
+        self.run_contexts: dict[str, dict] = {}
 
-        self._emit_lock = td.Lock()
+        self._feedback: dict[str, deque] = {}
+        self._feedback_lock = td.Lock()
+        self._pause_events: dict[str, asyncio.Event] = {}
+        self._pause_loops: dict[str, Any] = {}
+        self._pause_lock = td.Lock()
+
+        self._event_owners: dict[str, str] = {}
+
+        self._emit_lock = td.RLock()
+
+    # ---------- hook registration ----------
+
+    def declare(self, event_type: str, owner: str = '') -> None:
+        '''Dynamically register a custom event type (e.g. namespaced plugin types).'''
+        if event_type not in self.hooks:
+            self.hooks[event_type] = []
+        self._event_owners.setdefault(event_type, owner)
+
+    def _all_hooks(self):
+        for bindings in self.hooks.values():
+            yield from bindings
 
     def _execute_hook(self, func: Callable, event: BaseEvent):
         try: func(event)
@@ -42,35 +80,50 @@ class Broker:
     def _matches(self, binding: HookBinding, event: BaseEvent) -> bool:
         if binding.turn_id is not None and event.turn_id != binding.turn_id:
             return False
+        if binding.agent_name is not None and event.agent_name != binding.agent_name:
+            return False
+        if not fnmatchcase(event.event_type, binding.event_type):
+            return False
+        if binding.match is not None and not binding.match(event):
+            return False
         return True
 
-    def emit(self, event: BaseEvent) -> None:
-        with self._emit_lock:
-            for binding in list(self.hooks.get(event.event_type, [])):
-                if binding.disposed: continue
-                if not self._matches(binding, event): continue
-                binding.count += 1
-                self._execute_hook(binding.func, event)
-                if binding.mode == 'once':
-                    binding.disposed = True
+    # ---------- emit ----------
 
-            for binding in list(self.hooks['*']):
-                if binding.disposed: continue
-                if not self._matches(binding, event): continue
+    def emit(self, event: BaseEvent) -> None:
+        if not isinstance(event, BaseEvent):
+            raise TypeError(f'emit() requires a BaseEvent, got {type(event)}')
+
+        with self._emit_lock:
+            if event.event_type not in self.hooks:
+                self.hooks[event.event_type] = []
+
+            # expose the run context to hooks via event metadata
+            if event.run_id and event.run_id in self.run_contexts:
+                event.metadata.setdefault('run_context', self.run_contexts[event.run_id])
+
+            candidates = [
+                b for b in self._all_hooks()
+                if not b.disposed and self._matches(b, event)
+            ]
+
+            for binding in candidates:
                 binding.count += 1
                 self._execute_hook(binding.func, event)
                 if binding.mode == 'once':
                     binding.disposed = True
 
             if event.event_type == 'run:finish':
-                for event_type in self.hooks:
-                    self.hooks[event_type] = [
-                        b for b in self.hooks[event_type]
+                for et in list(self.hooks):
+                    self.hooks[et] = [
+                        b for b in self.hooks[et]
                         if not b.disposed and not (b.mode == 'agent' and b.turn_id == event.turn_id)
                     ]
             else:
-                for event_type in self.hooks:
-                    self.hooks[event_type] = [b for b in self.hooks[event_type] if not b.disposed]
+                for et in list(self.hooks):
+                    self.hooks[et] = [b for b in self.hooks[et] if not b.disposed]
+
+    # ---------- registration API ----------
 
     def register_hook(
         self,
@@ -78,24 +131,178 @@ class Broker:
         hook: Callable,
         turn_id: Optional[str] = None,
         mode: str = 'normal',
+        agent_name: Optional[str] = None,
+        match: Optional[Callable] = None,
     ) -> None:
-        if event_type not in self.hooks.keys():
-            raise ValueError(f"Invalid event type: '{event_type}'")
         if not callable(hook):
             raise ValueError(f'Hook must be callable, got {type(hook)}')
         signature = inspect.signature(hook)
-        if len(signature.parameters) != 1 or list(signature.parameters.values())[0].annotation not in [BaseEvent, AgentEvent, RuntimeEvent, inspect._empty]:
-            raise ValueError(f'Hook must accept a single argument of type BaseEvent, AgentEvent, or RuntimeEvent, got {signature}')
+        if len(signature.parameters) != 1 or list(signature.parameters.values())[0].annotation not in [BaseEvent, AgentEvent, ToolEvent, RuntimeEvent, inspect._empty]:
+            raise ValueError(f'Hook must accept a single argument of type BaseEvent, AgentEvent, ToolEvent, or RuntimeEvent, got {signature}')
         if mode == 'agent' and turn_id is None:
             raise ValueError("Hook mode 'agent' requires a turn_id so it can be destroyed on that run's finish.")
-        binding = HookBinding(hook, event_type, turn_id, mode)
+        if match is not None and not callable(match):
+            raise ValueError(f'Match filter must be callable, got {type(match)}')
+        self.declare(event_type)
+        binding = HookBinding(hook, event_type, turn_id, mode, agent_name=agent_name, match=match)
         self.hooks[event_type].append(binding)
 
-    def hook(self, event_type: str = '*', turn_id: Optional[str] = None, mode: str = 'normal', once: bool = False) -> Callable:
+    def hook(
+        self,
+        event_type: str = '*',
+        turn_id: Optional[str] = None,
+        mode: str = 'normal',
+        once: bool = False,
+        agent_name: Optional[str] = None,
+        match: Optional[Callable] = None,
+    ) -> Callable:
         def decorator(func: Callable) -> Callable:
-            self.register_hook(event_type, func, turn_id=turn_id, mode='once' if once else mode)
+            self.register_hook(event_type, func, turn_id=turn_id, mode='once' if once else mode,
+                               agent_name=agent_name, match=match)
             return func
         return decorator
+
+    # ---------- plugin event factory ----------
+
+    def event(
+        self,
+        event_type: str,
+        *,
+        agent_name: str = '',
+        agent_code: str = '',
+        turn_id: str = '',
+        turn: int = 1,
+        payload: dict = None,
+        run_id: str = '',
+        source: str = 'plugin',
+        metadata: dict = None,
+    ) -> BaseEvent:
+        self.declare(event_type)
+        return BaseEvent(
+            agent_name=agent_name,
+            agent_code=agent_code,
+            turn_id=turn_id,
+            turn=turn,
+            event_type=event_type,
+            payload=payload,
+            run_id=run_id,
+            source=source,
+            metadata=metadata,
+        )
+
+    def get_run_context(self, name: str) -> Optional[dict]:
+        return self.run_contexts.get(name)
+
+    # ---------- feedback (reverse control channel) ----------
+
+    def feedback(
+        self,
+        ftype: str,
+        *,
+        task_name: Optional[str] = None,
+        turn_id: Optional[str] = None,
+        comment: Optional[str] = None,
+        payload: dict = None,
+    ) -> bool:
+        '''
+        Push feedback from a hook/plugin back into a running agent task.
+        Target the run by its task_name or turn_id. Returns False if the target
+        run is not active, True once queued.
+
+        Supported types:
+          - 'control:stop':           abort the run at the next checkpoint.
+          - 'control:continue':       no-op (reserved for flow control).
+          - 'control:pause':          suspend the run until 'control:resume'.
+          - 'control:resume':         wake a paused run (by task_name/turn_id).
+          - 'control:retry':          payload={'kwargs': {...}, 'max_retries': n}
+                                      re-issue the current request on failure with
+                                      the given request overrides.
+          - 'control:override_answer': payload={'content': str} answers directly,
+                                      skipping the LLM call for the next request.
+          - 'control:deny_tool':      payload={'tool_id'|'tool_name', 'reason'} blocks
+                                      the tool call and feeds the reason back as result.
+          - 'control:inject_tool_result': payload={'tool_id'|'tool_name', 'result'}
+                                      replaces a pending tool execution with the
+                                      given result.
+          - 'control:update_messages': payload={'op': 'append'|'truncate'|'replace',
+                                      'messages': [...], 'keep': n} mutates the
+                                      conversation history at the next checkpoint.
+          - 'control:switch_model':   payload={'model': str} overrides the model
+                                      for the next request.
+        '''
+        if ftype not in get_args(FEEDBACK_TYPES):
+            raise ValueError(f"Invalid feedback type: '{ftype}'")
+
+        if task_name is None and turn_id is not None:
+            for name, ctx in self.run_contexts.items():
+                if ctx.get('turn_id') == turn_id:
+                    task_name = name
+                    break
+
+        if task_name is None or task_name not in self.run_contexts:
+            return False
+
+        if ftype == 'control:resume':
+            return self._resume_run(task_name)
+
+        fb = EventFeedback(ftype=ftype, comment=comment, payload=payload)
+        with self._feedback_lock:
+            self._feedback.setdefault(task_name, deque()).append(fb)
+        return True
+
+    def drain_feedback(self, task_name: str, types: Optional[set] = None) -> list:
+        '''
+        Pop queued feedback for a task. If `types` is given, only items with an
+        ftype in that set are consumed; the rest stay queued for later checkpoints.
+        '''
+        with self._feedback_lock:
+            q = self._feedback.get(task_name)
+            if not q:
+                return []
+            if types is None:
+                self._feedback.pop(task_name, None)
+                return list(q)
+            kept = deque()
+            out = []
+            while q:
+                item = q.popleft()
+                if item.ftype in types:
+                    out.append(item)
+                else:
+                    kept.append(item)
+            if kept:
+                self._feedback[task_name] = kept
+            else:
+                self._feedback.pop(task_name, None)
+            return out
+
+    async def wait_resume(self, task_name: str) -> None:
+        '''
+        Park the current task until a 'control:resume' feedback arrives for it.
+        Used by the agent to suspend between steps (human-in-the-loop approval).
+        '''
+        loop = asyncio.get_running_loop()
+        event = asyncio.Event()
+        with self._pause_lock:
+            self._pause_events[task_name] = event
+            self._pause_loops[task_name] = loop
+        try:
+            await event.wait()
+        finally:
+            with self._pause_lock:
+                self._pause_events.pop(task_name, None)
+                self._pause_loops.pop(task_name, None)
+
+    def _resume_run(self, task_name: str) -> bool:
+        with self._pause_lock:
+            event = self._pause_events.get(task_name)
+            loop = self._pause_loops.get(task_name)
+        if event is None or loop is None:
+            return False
+        loop.call_soon_threadsafe(event.set)
+        return True
+
+    # ---------- request / run tracking ----------
 
     def start_req(self, code: str) -> td.Event | None:
         if code in self.requests.keys(): return
@@ -122,12 +329,24 @@ class Broker:
         if not t.name in self.runs.keys(): return
         del self.runs[t.name]
 
-    def start_task(self, name: str, task: asyncio.Task):
+    def start_task(self, name: str, task: asyncio.Task, context: Optional[dict] = None):
         self.runs[name] = task
+        if context is not None:
+            self.run_contexts[name] = context
 
     def finish_task(self, name: str):
         if name in self.runs:
             del self.runs[name]
+        if name in self.run_contexts:
+            del self.run_contexts[name]
+        with self._feedback_lock:
+            self._feedback.pop(name, None)
+        with self._pause_lock:
+            event = self._pause_events.pop(name, None)
+            self._pause_loops.pop(name, None)
+        if event is not None:
+            loop = asyncio.get_event_loop()
+            loop.call_soon_threadsafe(event.set)
 
 
 orchify_broker = Broker()

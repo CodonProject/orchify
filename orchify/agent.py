@@ -11,6 +11,7 @@ from orchify.broker import orchify_broker
 from orchify.backend import orchify_web_backend
 
 import json
+import time
 
 
 tool_executor = ThreadPoolExecutor(max_workers=32, thread_name_prefix='OrchifyToolExecutor')
@@ -121,7 +122,14 @@ class Agent:
         '''
         turn_id = turn_id or safecode(length=4)
         task_name = f'{self.name}#{self.code}_{safecode()}'
-        orchify_broker.start_task(task_name, None)
+        run_context = {
+            'task_name': task_name,
+            'agent_name': self.name,
+            'agent_code': self.code,
+            'turn_id': turn_id,
+            'started_at': time.time(),
+        }
+        orchify_broker.start_task(task_name, None, context=run_context)
         asyncio.run_coroutine_threadsafe(
             self._async_thread_process(
                 user_input,
@@ -145,7 +153,14 @@ class Agent:
         llm_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         current_task = asyncio.current_task()
-        orchify_broker.start_task(task_name, current_task)
+        run_context = {
+            'task_name': task_name,
+            'agent_name': self.name,
+            'agent_code': self.code,
+            'turn_id': turn_id or '',
+            'started_at': time.time(),
+        }
+        orchify_broker.start_task(task_name, current_task, context=run_context)
         
         generator = self._run(
             user_input=user_input,
@@ -153,9 +168,12 @@ class Agent:
             turn_id=turn_id,
             messages=messages,
             llm_kwargs=llm_kwargs,
+            task_name=task_name,
         )
         try:
-            async for e in generator: 
+            async for e in generator:
+                e.run_id = e.run_id or task_name
+                e.source = e.source or 'runtime'
                 orchify_broker.emit(e)
         except Exception:
             import traceback
@@ -167,6 +185,8 @@ class Agent:
                 turn_id=turn_id or '',
                 event_type='agent:abort',
                 payload={'error': error_text},
+                run_id=task_name,
+                source='runtime',
             ))
         finally:
             orchify_broker.finish_task(task_name)
@@ -178,9 +198,35 @@ class Agent:
         turn_id: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
         llm_kwargs: Optional[Dict[str, Any]] = None,
+        task_name: str = '',
     ) -> AsyncGenerator[Union[AgentEvent, ToolEvent, RuntimeEvent], None]:
         turn_id = turn_id or safecode(length=4)
         working_messages = self._build_run_messages(messages)
+
+        def drain_feedback(types: Optional[set] = None) -> list:
+            return orchify_broker.drain_feedback(task_name, types) if task_name else []
+
+        def apply_update(payload: dict) -> None:
+            op = payload.get('op')
+            msgs = payload.get('messages') or []
+            if op == 'append':
+                working_messages.extend(dict(m) for m in msgs)
+            elif op == 'replace':
+                system = working_messages[:1] if working_messages and working_messages[0].get('role') == 'system' else []
+                replaced = [dict(m) for m in msgs if dict(m).get('role') != 'system']
+                working_messages[:] = system + replaced
+            elif op == 'truncate':
+                keep = max(0, int(payload.get('keep', 0)))
+                system = []
+                rest = working_messages
+                if rest and rest[0].get('role') == 'system':
+                    system = [rest[0]]
+                    rest = rest[1:]
+                working_messages[:] = system + rest[:keep]
+
+        stopped = False
+        override_content: Optional[str] = None
+        req_overrides: Dict[str, Any] = {}
 
         accumulated_usage = {
             'completion_tokens': 0,
@@ -225,53 +271,65 @@ class Agent:
                     payload={'step': step},
                     turn=step
                 )
+
+            # checkpoint 1: pre-request feedback
+            for fb in drain_feedback({'control:stop', 'control:override_answer', 'control:update_messages', 'control:switch_model'}):
+                if fb.ftype == 'control:stop':
+                    stopped = True
+                elif fb.ftype == 'control:override_answer':
+                    override_content = fb.payload.get('content', '')
+                elif fb.ftype == 'control:update_messages':
+                    apply_update(fb.payload)
+                elif fb.ftype == 'control:switch_model':
+                    req_overrides['model'] = fb.payload.get('model', '')
+            if stopped:
+                break
+
+            if override_content is not None:
+                # plugin-provided answer: skip the LLM call entirely
+                working_messages.append({'role': 'assistant', 'content': override_content})
+                yield AgentEvent(
+                    agent_name=self.name,
+                    agent_code=self.code,
+                    turn_id=turn_id,
+                    turn=step,
+                    event_type='agent:answer',
+                    content=override_content,
+                )
+                break
             
             tools_payload = [t.info for t in self.tools.values()] if self.tools else None
-            
-            req_kwargs = {**self.llm_kwargs, **(llm_kwargs or {})}
-            req_kwargs.pop('messages', None)
-            req_kwargs.pop('tools', None)
 
-            extra_data = dict(self.extra_data or {})
-            run_extra = req_kwargs.pop('extra_data', None)
-            if run_extra:
-                extra_data.update(run_extra)
-            for k, v in list(req_kwargs.items()):
-                if k not in REQUEST_PARAMS:
-                    extra_data[k] = req_kwargs.pop(k)
+            def build_request():
+                req_kwargs = {**self.llm_kwargs, **(llm_kwargs or {}), **req_overrides}
+                req_kwargs.pop('messages', None)
+                req_kwargs.pop('tools', None)
 
-            response_gen = self.llm.request(
-                messages=working_messages,
-                model=req_kwargs.pop('model', self.model),
-                tools=tools_payload,
-                extra_data=extra_data,
-                **req_kwargs,
-            )
-            
+                extra_data = dict(self.extra_data or {})
+                run_extra = req_kwargs.pop('extra_data', None)
+                if run_extra:
+                    extra_data.update(run_extra)
+                for k, v in list(req_kwargs.items()):
+                    if k not in REQUEST_PARAMS:
+                        extra_data[k] = req_kwargs.pop(k)
+                return req_kwargs, extra_data
+
             final_status = None
-            async for response in response_gen:
-                if response.is_final:
-                    final_status = response.final_status
-                    yield AgentEvent.build_from_resp(
-                        response,
-                        agent_name=self.name,
-                        agent_code=self.code,
-                        turn_id=turn_id,
-                        turn=step
-                    )
-                else:
-                    chunk = response.current_chunk
-                    if chunk:
-                        if chunk.is_assembly_tool:
-                            tool_events = ToolEvent.build_from_resp(
-                                response,
-                                agent_name=self.name,
-                                agent_code=self.code,
-                                turn_id=turn_id,
-                                turn=step
-                            )
-                            for te in tool_events: yield te
-                        else:
+            retries = 0
+            while True:
+                req_kwargs, extra_data = build_request()
+
+                response_gen = self.llm.request(
+                    messages=working_messages,
+                    model=req_kwargs.pop('model', self.model),
+                    tools=tools_payload,
+                    extra_data=extra_data,
+                    **req_kwargs,
+                )
+                try:
+                    async for response in response_gen:
+                        if response.is_final:
+                            final_status = response.final_status
                             yield AgentEvent.build_from_resp(
                                 response,
                                 agent_name=self.name,
@@ -279,8 +337,81 @@ class Agent:
                                 turn_id=turn_id,
                                 turn=step
                             )
-            
+                        else:
+                            chunk = response.current_chunk
+                            if chunk:
+                                if chunk.is_assembly_tool:
+                                    tool_events = ToolEvent.build_from_resp(
+                                        response,
+                                        agent_name=self.name,
+                                        agent_code=self.code,
+                                        turn_id=turn_id,
+                                        turn=step
+                                    )
+                                    for te in tool_events: yield te
+                                else:
+                                    yield AgentEvent.build_from_resp(
+                                        response,
+                                        agent_name=self.name,
+                                        agent_code=self.code,
+                                        turn_id=turn_id,
+                                        turn=step
+                                    )
+                    break
+                except Exception:
+                    # control:retry feedback re-issues this request with overrides
+                    retry_fb = None
+                    for fb in drain_feedback({'control:retry'}):
+                        if fb.ftype == 'control:retry':
+                            retry_fb = fb
+                    if retry_fb is not None and retries < int(retry_fb.payload.get('max_retries', 1)):
+                        retries += 1
+                        req_overrides.update(retry_fb.payload.get('kwargs', {}) or {})
+                        continue
+                    raise
+
             if final_status is None: break
+
+            # checkpoint 2: post-stream feedback (stop / inject / deny / pause / update)
+            inject_map = {}
+            deny_map = {}
+            pause_requested = False
+            for fb in drain_feedback({'control:stop', 'control:inject_tool_result', 'control:deny_tool', 'control:pause', 'control:update_messages'}):
+                if fb.ftype == 'control:stop':
+                    stopped = True
+                elif fb.ftype == 'control:inject_tool_result':
+                    key = fb.payload.get('tool_id') or fb.payload.get('tool_name')
+                    if key:
+                        inject_map[key] = fb.payload.get('result', '')
+                elif fb.ftype == 'control:deny_tool':
+                    key = fb.payload.get('tool_id') or fb.payload.get('tool_name')
+                    if key:
+                        deny_map[key] = fb.payload.get('reason', 'denied')
+                elif fb.ftype == 'control:pause':
+                    pause_requested = True
+                elif fb.ftype == 'control:update_messages':
+                    apply_update(fb.payload)
+            if stopped:
+                break
+
+            if pause_requested:
+                yield RuntimeEvent(
+                    agent_name=self.name,
+                    agent_code=self.code,
+                    turn_id=turn_id,
+                    event_type='run:paused',
+                    payload={'task_name': task_name},
+                    turn=step
+                )
+                await orchify_broker.wait_resume(task_name)
+                yield RuntimeEvent(
+                    agent_name=self.name,
+                    agent_code=self.code,
+                    turn_id=turn_id,
+                    event_type='run:resumed',
+                    payload={},
+                    turn=step
+                )
             
             accumulated_usage['completion_tokens'] += final_status.completion_tokens
             accumulated_usage['prompt_tokens'] += final_status.prompt_tokens
@@ -306,6 +437,7 @@ class Agent:
 
             loop = asyncio.get_running_loop()
             tasks = []
+            completed_results = {}
 
             for tool_call in final_status.tool_calls:
                 tool_id = tool_call.get('id') or ''
@@ -316,7 +448,7 @@ class Agent:
                     args = json.loads(args_str) if args_str.strip() else {}
                 except Exception:
                     args = {}
-                
+
                 yield ToolEvent.build_call_start(
                     agent_name=self.name,
                     agent_code=self.code,
@@ -327,15 +459,53 @@ class Agent:
                     turn=step
                 )
 
+                injected = inject_map.get(tool_id)
+                if injected is None:
+                    injected = inject_map.get(tool_name)
+                if injected is not None:
+                    # feedback-injected result: skip actual execution
+                    completed_results[tool_id] = (tool_name, injected)
+                    yield ToolEvent.build_call_finish(
+                        agent_name=self.name,
+                        agent_code=self.code,
+                        turn_id=turn_id,
+                        tool_id=tool_id,
+                        tool_name=tool_name,
+                        result=injected,
+                        turn=step
+                    )
+                    continue
+
+                denied = deny_map.get(tool_id)
+                if denied is None:
+                    denied = deny_map.get(tool_name)
+                if denied is not None:
+                    # feedback-denied tool: skip execution, feed denial back
+                    result = f"[denied] {denied}"
+                    completed_results[tool_id] = (tool_name, result)
+                    yield ToolEvent.build_call_finish(
+                        agent_name=self.name,
+                        agent_code=self.code,
+                        turn_id=turn_id,
+                        tool_id=tool_id,
+                        tool_name=tool_name,
+                        result=result,
+                        turn=step
+                    )
+                    continue
+
                 tool = self.tools.get(tool_name)
                 
                 def run_single_tool(t_tool=tool, t_name=tool_name, t_args=args, t_id=tool_id):
                     if t_tool:
+                        cached = False
                         try:
                             if isinstance(t_args, dict):
                                 res = t_tool.execute(**t_args)
                             else:
                                 res = t_tool.execute()
+
+                            cached = bool(getattr(t_tool, 'last_cached', False))
                             
                             if not isinstance(res, str):
                                 res = json.dumps(res, ensure_ascii=False)
@@ -343,14 +513,13 @@ class Agent:
                             res = f"Error executing tool '{t_name}': {str(e)}"
                     else:
                         res = f"Tool '{t_name}' not found."
-                    return t_id, t_name, res
+                    return t_id, t_name, res, cached
 
                 future = loop.run_in_executor(tool_executor, run_single_tool)
                 tasks.append(future)
 
-            completed_results = {}
             for future in asyncio.as_completed(tasks):
-                t_id, t_name, result = await future
+                t_id, t_name, result, cached = await future
                 completed_results[t_id] = (t_name, result)
                 
                 yield ToolEvent.build_call_finish(
@@ -360,6 +529,7 @@ class Agent:
                     tool_id=t_id,
                     tool_name=t_name,
                     result=result,
+                    payload={'cached': cached},
                     turn=step
                 )
 
@@ -389,7 +559,9 @@ class Agent:
             payload={
                 'total_steps': executed_step,
                 'usage': accumulated_usage,
-                'runs': runs
+                'runs': runs,
+                'stopped': stopped,
+                'overridden': override_content is not None
             },
             turn=executed_step
         )

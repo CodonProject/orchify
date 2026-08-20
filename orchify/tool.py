@@ -1,4 +1,7 @@
 from typing import Callable, Any, Dict, Optional, List
+import json
+import time
+import threading
 from .utils import analyze_tool_function 
 
 
@@ -10,17 +13,29 @@ class Tool:
         description: Optional[str] = None,
         parameters: Optional[List[Dict[str, Any]]] = None,
         is_agent_tool: bool = False,
-        is_group_tool: bool = False
+        is_group_tool: bool = False,
+        cache: Optional[Any] = None
     ):
+        '''
+        cache: 结果缓存配置
+          - None / False / 0 : 不缓存（默认）
+          - True            : 永久缓存（相同参数只执行一次）
+          - 数字（秒）       : 限时缓存，过期后重新执行
+        '''
         self.func = func
-        
+
         analysis = analyze_tool_function(func)
-        
+
         self.name: str = name or func.__name__
         self.description: str = description or analysis.get('docstring', 'No description provided.')
         self.parameters: List[Dict[str, Any]] = parameters or analysis.get('parameters', [])
         self.is_agent_tool = is_agent_tool
         self.is_group_tool = is_group_tool
+        self.cache = cache
+
+        self._cache: Dict[str, tuple] = {}
+        self._cache_lock = threading.RLock()
+        self.last_cached: bool = False
         self._info = self.build_info()
     
     @property
@@ -93,7 +108,35 @@ class Tool:
         Returns:
             The execution result of the tool's function.
         '''
-        return self.func(**kwargs)
+        self.last_cached = False
+
+        if not self.cache:
+            return self.func(**kwargs)
+
+        key = json.dumps(kwargs, sort_keys=True, default=str)
+        now = time.time()
+
+        with self._cache_lock:
+            cached = self._cache.get(key)
+            if cached is not None:
+                expires_at, result = cached
+                if self.cache is True or expires_at > now:
+                    self.last_cached = True
+                    return result
+
+        result = self.func(**kwargs)  # compute on success only; exceptions propagate
+
+        with self._cache_lock:
+            if self.cache is True:
+                self._cache[key] = (None, result)
+            else:
+                self._cache[key] = (now + float(self.cache), result)
+
+        return result
+
+    def clear_cache(self) -> None:
+        with self._cache_lock:
+            self._cache.clear()
 
     def __repr__(self) -> str:
         '''Provides a string representation of the Tool instance.'''
@@ -105,7 +148,8 @@ def tool(
     description: Optional[str] = None,
     parameters: Optional[List[Dict[str, Any]]] = None,
     is_agent_tool: bool = False,
-    is_group_tool: bool = False
+    is_group_tool: bool = False,
+    cache: Optional[Any] = None
 ):
     def decorator(func: Callable) -> Tool:
         return Tool(
@@ -114,6 +158,7 @@ def tool(
             description=description,
             parameters=parameters,
             is_agent_tool=is_agent_tool,
-            is_group_tool=is_group_tool
+            is_group_tool=is_group_tool,
+            cache=cache
         )
     return decorator

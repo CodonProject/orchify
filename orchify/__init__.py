@@ -1,12 +1,13 @@
 from .agent import Agent
-from .llm.openai import OpenAICompat
+from .llm import Middleware, OpenAICompat
 from .tool import Tool, tool
 
-__version__ = "0.0.1a1"
+__version__ = '0.0.1a2'
 
 __all__ = [
-    "Agent",
-    "OpenAICompat",
-    "Tool",
-    "tool",
+    'Agent',
+    'OpenAICompat',
+    'Middleware',
+    'Tool',
+    'tool',
 ]
