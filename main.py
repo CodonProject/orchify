@@ -10,9 +10,8 @@ agent = Agent(
     name='Agent',
     llm=endpoint,
     system_prompt='',
+    thinking='disable'
 )
-
-print(orchify_broker.hooks)
 
 @orchify_broker.hook('*')
 def handle_agent_events(event: BaseEvent):

@@ -29,12 +29,21 @@ class OpenAICompat(LLMInterface):
         max_tokens: Optional[int] = None,
         thinking: Literal['disabled', 'enabled', 'auto'] = 'auto',
         effort: Literal['minimal', 'low', 'medium', 'high', 'xhigh'] = 'medium',
+        extra_data: Optional[dict] = None,
     ) -> AsyncGenerator[Chunk, FinalStatus]:
         headers = {
             'Authorization': f'Bearer {self.api_key}',
             'Content-Type': 'application/json'
         }
         
+        # Normalize common shorthand for thinking flags before provider handling
+        if isinstance(thinking, bool):
+            thinking = 'enabled' if thinking else 'disabled'
+        elif thinking in ('disable', 'off', 'false'):
+            thinking = 'disabled'
+        elif thinking in ('on', 'true'):
+            thinking = 'enabled'
+
         # Build requests payload safely
         data = {
             'model': model,
@@ -78,6 +87,9 @@ class OpenAICompat(LLMInterface):
             # Fallback for other providers: only set if explicitly enabled/disabled
             if thinking in ('enabled', 'disabled'):
                 data['thinking'] = {'type': thinking}
+
+        if extra_data:
+            data.update(extra_data)
 
         total_content = ''
         total_cot_content = ''
@@ -186,6 +198,18 @@ class OpenAICompat(LLMInterface):
 
                 yield_triggered = False
 
+                if is_cot_end:
+                    yield Chunk(
+                        is_cot=False,
+                        content="",
+                        total_content=total_content,
+                        total_cot_content=total_cot_content,
+                        total_tool_call=list(tool_calls_map.values()),
+                        is_cot_end=True
+                    )
+                    yield_triggered = True
+                    is_cot_end = False
+
                 if cot_chunk:
                     yield Chunk(
                         is_cot=True,
@@ -219,16 +243,6 @@ class OpenAICompat(LLMInterface):
                         is_cot_end=is_cot_end
                     )
                     yield_triggered = True
-
-                if is_cot_end and not yield_triggered:
-                    yield Chunk(
-                        is_cot=False,
-                        content="",
-                        total_content=total_content,
-                        total_cot_content=total_cot_content,
-                        total_tool_call=list(tool_calls_map.values()),
-                        is_cot_end=True
-                    )
 
             if has_cot and not cot_ended:
                 yield Chunk(
@@ -266,12 +280,21 @@ class OpenAICompat(LLMInterface):
         max_tokens: Optional[int] = None,
         thinking: Literal['disabled', 'enabled', 'auto'] = 'auto',
         effort: Literal['minimal', 'low', 'medium', 'high', 'xhigh'] = 'medium',
+        extra_data: Optional[dict] = None,
     ) -> AsyncGenerator[Response, None]:
         headers = {
             'Authorization': f'Bearer {self.api_key}',
             'Content-Type': 'application/json'
         }
         
+        # Normalize common shorthand for thinking flags before provider handling
+        if isinstance(thinking, bool):
+            thinking = 'enabled' if thinking else 'disabled'
+        elif thinking in ('disable', 'off', 'false'):
+            thinking = 'disabled'
+        elif thinking in ('on', 'true'):
+            thinking = 'enabled'
+
         data = {
             'model': model,
             'messages': messages,
@@ -310,6 +333,9 @@ class OpenAICompat(LLMInterface):
         else:
             if thinking in ('enabled', 'disabled'):
                 data['thinking'] = {'type': thinking}
+
+        if extra_data:
+            data.update(extra_data)
 
         total_content = ''
         total_cot_content = ''
@@ -415,6 +441,21 @@ class OpenAICompat(LLMInterface):
 
                 yield_triggered = False
 
+                if is_cot_end:
+                    yield Response(
+                        current_chunk=Chunk(
+                            is_cot=False,
+                            content="",
+                            total_content=total_content,
+                            total_cot_content=total_cot_content,
+                            total_tool_call=list(tool_calls_map.values()),
+                            is_cot_end=True
+                        ),
+                        is_final=False
+                    )
+                    yield_triggered = True
+                    is_cot_end = False
+
                 if cot_chunk:
                     yield Response(
                         current_chunk=Chunk(
@@ -457,19 +498,6 @@ class OpenAICompat(LLMInterface):
                         is_final=False
                     )
                     yield_triggered = True
-
-                if is_cot_end and not yield_triggered:
-                    yield Response(
-                        current_chunk=Chunk(
-                            is_cot=False,
-                            content="",
-                            total_content=total_content,
-                            total_cot_content=total_cot_content,
-                            total_tool_call=list(tool_calls_map.values()),
-                            is_cot_end=True
-                        ),
-                        is_final=False
-                    )
 
             if has_cot and not cot_ended:
                 yield Response(

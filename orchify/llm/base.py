@@ -64,5 +64,6 @@ class LLMInterface:
         max_tokens: Optional[int] = None,
         thinking: Literal['disabled', 'enabled', 'auto'] = 'auto',
         effort: Literal['minimal', 'low', 'medium', 'high', 'xhigh'] = 'medium',
+        extra_data: Optional[dict] = None,
     ) -> AsyncGenerator[Response, None]:
         raise NotImplementedError('Subclasses must implement this method.')
