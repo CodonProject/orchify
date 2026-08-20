@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, Generator, AsyncGenerator, Literal
+from typing import Optional, AsyncGenerator, Literal
 
 
 @dataclass

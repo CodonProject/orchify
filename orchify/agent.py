@@ -13,7 +13,6 @@ from orchify.backend import orchify_web_backend
 import json
 
 
-# Global thread pool for parallel execution of blocking synchronous tools.
 tool_executor = ThreadPoolExecutor(max_workers=32, thread_name_prefix='OrchifyToolExecutor')
 
 
@@ -49,10 +48,7 @@ class Agent:
         This provides a non-blocking synchronous entry point, avoiding OS thread creation per run.
         '''
         task_name = f'{self.name}#{self.code}_{safecode()}'
-        # Register the task name synchronously before scheduling to avoid race condition where
-        # the main thread immediately checks orchify_broker.runs and sees it empty.
         orchify_broker.start_task(task_name, None)
-        # Schedule the coroutine execution inside our dedicated background thread's loop.
         asyncio.run_coroutine_threadsafe(
             self._async_thread_process(user_input, max_steps, task_name),
             orchify_web_backend._loop
@@ -64,7 +60,6 @@ class Agent:
         max_steps: int,
         task_name: str
     ) -> None:
-        # Register the running task with the broker using the current task object
         current_task = asyncio.current_task()
         orchify_broker.start_task(task_name, current_task)
         
@@ -193,7 +188,6 @@ class Agent:
             
             if not final_status.tool_calls: break
 
-            # Prepare and start all tool executions concurrently
             loop = asyncio.get_running_loop()
             tasks = []
 
@@ -235,12 +229,9 @@ class Agent:
                         res = f"Tool '{t_name}' not found."
                     return t_id, t_name, res
 
-                # Submit synchronous blocking tool functions to the thread pool executor via asyncio
                 future = loop.run_in_executor(tool_executor, run_single_tool)
                 tasks.append(future)
 
-            # Retrieve results as they complete and yield finish events.
-            # Using asyncio.as_completed allows us to emit ToolEvents as soon as they finish execution.
             completed_results = {}
             for future in asyncio.as_completed(tasks):
                 t_id, t_name, result = await future
@@ -256,7 +247,6 @@ class Agent:
                     turn=step
                 )
 
-            # Re-append to messages in original order to maintain message conversation integrity
             for tool_call in final_status.tool_calls:
                 tool_id = tool_call.get('id') or ''
                 tool_name = tool_call.get('function', {}).get('name') or ''

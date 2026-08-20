@@ -34,10 +34,8 @@ class Tool:
         Returns:
             A dictionary that can be directly serialized to JSON and sent to the LLM API.
         '''
-        # 1. Build 'properties' and 'required' list
         json_schema_properties = {}
         required_params = []
-        # Simple mapping from Python types to JSON Schema types
         py_to_json_type_map = {
             'str': 'string',
             'int': 'integer',

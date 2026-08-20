@@ -100,8 +100,6 @@ class WebBackend:
 
         while True:
             try:
-                # Wait for elements in the queue.
-                # If the future is done and queue is empty, we break.
                 msg_type, val = q.get(timeout=0.1)
                 if msg_type == 'line':
                     yield val
@@ -111,7 +109,6 @@ class WebBackend:
                     raise val
             except queue.Empty:
                 if future.done():
-                    # Check if any exception was raised in coro that didn't reach the queue
                     exc = future.exception()
                     if exc:
                         raise exc
