@@ -3,11 +3,12 @@ import inspect
 import threading as td
 import asyncio
 from typing import Any
+from typing import get_args
 
 
 class Broker:
     def __init__(self):
-        self.hooks: dict[str, list[callable]] = {event_type: [] for event_type in EVENT_TYPES}
+        self.hooks: dict[str, list[callable]] = {event_type: [] for event_type in get_args(EVENT_TYPES)}
         self.hooks['*'] = []
 
         self.requests: dict[str, td.Event] = {}
@@ -38,7 +39,7 @@ class Broker:
             raise ValueError(f'Hook must accept a single argument of type BaseEvent, AgentEvent, or RuntimeEvent, got {signature}')
         self.hooks[event_type].append(hook)
     
-    def hook(self, event_type: EVENT_TYPES = '*') -> callable:
+    def hook(self, event_type: str = '*') -> callable:
         def decorator(func: callable) -> callable:
             self.register_hook(event_type, func)
             return func
