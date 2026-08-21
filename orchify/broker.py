@@ -103,10 +103,18 @@ class Broker:
             if event.run_id and event.run_id in self.run_contexts:
                 event.metadata.setdefault('run_context', self.run_contexts[event.run_id])
 
+            # determine enabled plugins for this run (None = all enabled)
+            enabled_plugins = None
+            if event.run_id and event.run_id in self.run_contexts:
+                enabled_plugins = self.run_contexts[event.run_id].get('enabled_plugins')
+
             candidates = []
             seen = set()
             for b in self._all_hooks():
                 if not b.disposed and b not in seen and self._matches(b, event):
+                    # filter by enabled plugins: skip hooks owned by disabled plugins
+                    if enabled_plugins is not None and b.owner and b.owner not in enabled_plugins:
+                        continue
                     seen.add(b)
                     candidates.append(b)
 
@@ -227,6 +235,16 @@ class Broker:
 
     def get_run_context(self, name: str) -> Optional[dict]:
         return self.run_contexts.get(name)
+
+    def find_run_context(self, turn_id: str = None, agent_name: str = None) -> tuple[Optional[str], Optional[dict]]:
+        '''Find an active run context by turn_id or agent_name.
+        Returns (task_name, context) or (None, None).'''
+        for name, ctx in self.run_contexts.items():
+            if turn_id and ctx.get('turn_id') == turn_id:
+                return name, ctx
+            if agent_name and ctx.get('agent_name') == agent_name:
+                return name, ctx
+        return None, None
 
     # ---------- feedback (reverse control channel) ----------
 

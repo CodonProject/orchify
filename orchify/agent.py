@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Optional, Union, AsyncGenerator, Literal
+from typing import List, Dict, Any, Optional, Set, Union, AsyncGenerator, Literal
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
@@ -30,6 +30,8 @@ class Agent:
         model: str = req_model('gpt-4o'),
         messages_mode: Literal['agent', 'run'] = 'agent',
         *,
+        plugins: Optional[List[str]] = None,
+        plugin_config: Optional[Dict[str, Any]] = None,
         temperature: float = 0.7,
         top_p: float = 1.0,
         json_format: bool = False,
@@ -46,6 +48,14 @@ class Agent:
           - 'run': each run gets its own isolated message list built at run time.
             Safe for concurrent runs of the same agent; pass custom history via run(messages=...).
 
+        plugins: list of plugin names enabled for this agent. None = all plugins,
+          empty list = no plugins. Plugins not in this list will have their hooks
+          and middleware skipped for this agent's runs.
+
+        plugin_config: per-plugin configuration dict keyed by plugin name.
+          Plugins read their config via Plugin.get_config(key). This config is
+          stored in the broker task context and never sent to the LLM API.
+
         LLM request params (temperature, top_p, json_format, max_tokens, thinking,
         effort, extra_data, plus any other kwargs) are stored and forwarded to
         llm.request() on every run. The same values passed to run() override them.
@@ -56,8 +66,10 @@ class Agent:
         self.system_prompt = system_prompt
         self.model = model
         self.messages_mode = messages_mode
-        
+
         self.tools: Dict[str, Tool] = {t.name: t for t in (tools or [])}
+        self.enabled_plugins: Optional[Set[str]] = set(plugins) if plugins is not None else None
+        self.plugin_config: Dict[str, Any] = dict(plugin_config or {})
 
         self.messages: List[Dict[str, Any]] = [
             {'role': 'system', 'content': system_prompt} if system_prompt else {}
@@ -118,6 +130,29 @@ class Agent:
         '''Detach a Tool by name. Returns True if a tool was removed.'''
         return self.tools.pop(name, None) is not None
 
+    def enable_plugin(self, name: str) -> None:
+        '''Enable a plugin for this agent. If plugins were None (all), converts
+        to explicit mode with all registered plugins minus the disabled ones.'''
+        if self.enabled_plugins is None:
+            self._promote_to_explicit()
+        self.enabled_plugins.add(name)
+
+    def disable_plugin(self, name: str) -> None:
+        '''Disable a plugin for this agent. If plugins were None (all), converts
+        to explicit mode with all registered plugins minus the disabled ones.'''
+        if self.enabled_plugins is None:
+            self._promote_to_explicit()
+        self.enabled_plugins.discard(name)
+
+    def _promote_to_explicit(self) -> None:
+        '''Convert from None (all) to an explicit set containing all registered plugins.'''
+        from orchify.plugin_manager import orchify_plugins
+        self.enabled_plugins = set(orchify_plugins.registered().keys())
+
+    def set_plugins(self, plugins: Optional[List[str]]) -> None:
+        '''Set the list of enabled plugins. None = all (no filtering), empty = none.'''
+        self.enabled_plugins = set(plugins) if plugins is not None else None
+
     def run(
         self,
         user_input: str,
@@ -155,6 +190,8 @@ class Agent:
             'agent_code': self.code,
             'turn_id': turn_id,
             'started_at': time.time(),
+            'enabled_plugins': self.enabled_plugins,
+            'plugin_config': self.plugin_config,
         }
         orchify_broker.start_task(task_name, None, context=run_context)
         asyncio.run_coroutine_threadsafe(
@@ -186,6 +223,8 @@ class Agent:
             'agent_code': self.code,
             'turn_id': turn_id or '',
             'started_at': time.time(),
+            'enabled_plugins': self.enabled_plugins,
+            'plugin_config': self.plugin_config,
         }
         orchify_broker.start_task(task_name, current_task, context=run_context)
         
@@ -331,6 +370,7 @@ class Agent:
                 req_kwargs = {**self.llm_kwargs, **(llm_kwargs or {}), **req_overrides}
                 req_kwargs.pop('messages', None)
                 req_kwargs.pop('tools', None)
+                req_kwargs.pop('plugin_config', None)
 
                 extra_data = dict(self.extra_data or {})
                 run_extra = req_kwargs.pop('extra_data', None)
@@ -352,6 +392,7 @@ class Agent:
                     tools=tools_payload,
                     extra_data=extra_data,
                     scope=self.name,
+                    _enabled_plugins=self.enabled_plugins,
                     **req_kwargs,
                 )
                 try:

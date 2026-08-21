@@ -163,6 +163,8 @@ class LLMInterface:
         return middleware
 
     def _dispatch(self, kwargs: Dict[str, Any], scope: str = '*') -> AsyncGenerator[Response, None]:
+        enabled_plugins = kwargs.pop('_enabled_plugins', None)
+
         def core_dispatch(k: Dict[str, Any]) -> AsyncGenerator[Response, None]:
             k = {kk: vv for kk, vv in k.items() if kk != 'scope'}
             return self._core_request(**k)
@@ -170,6 +172,9 @@ class LLMInterface:
         chain: Callable = core_dispatch
         for mw in reversed(self.middlewares):
             if mw.matches(scope):
+                # filter by enabled plugins: skip middleware owned by disabled plugins
+                if enabled_plugins is not None and hasattr(mw, 'owner') and mw.owner and mw.owner not in enabled_plugins:
+                    continue
                 chain = partial(mw, next_request=chain)
         return chain(kwargs)
 
@@ -189,6 +194,7 @@ class LLMInterface:
         effort: Literal['minimal', 'low', 'medium', 'high', 'xhigh'] = 'medium',
         extra_data: Optional[dict] = None,
         scope: str = '*',
+        _enabled_plugins=None,
     ) -> AsyncGenerator[Response, None]:
         kwargs: Dict[str, Any] = {
             'messages': messages,
@@ -202,9 +208,11 @@ class LLMInterface:
             'effort': effort,
             'extra_data': extra_data,
             'scope': scope,
+            '_enabled_plugins': _enabled_plugins,
         }
         if not self.middlewares:
             kwargs.pop('scope', None)
+            kwargs.pop('_enabled_plugins', None)
             async for resp in self._core_request(**kwargs):
                 yield resp
             return

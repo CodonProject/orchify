@@ -5,7 +5,7 @@ from typing import Callable, Optional, Any, List, Dict, Set, Union
 
 from orchify.tool import Tool
 from orchify.broker import orchify_broker
-from orchify.llm.base import scope_matches
+from orchify.llm.base import scope_matches, Middleware
 
 
 _LIFECYCLE = {'on_load', 'on_unload'}
@@ -233,9 +233,15 @@ class Plugin:
 
     def middleware(self, mw, llm=None) -> None:
         '''Register an LLM middleware scoped to this plugin's `scope` (uses the
-        manager-provided llm or the attached agents' llm).'''
+        manager-provided llm or the attached agents' llm).
+        The middleware's `owner` attribute is set to this plugin's id so that
+        per-agent plugin filtering can skip it when the plugin is disabled.'''
         if llm is None:
             llm = self._llm
+        if not isinstance(mw, Middleware):
+            from orchify.llm.base import _FuncMiddleware
+            mw = _FuncMiddleware(mw)
+        mw.owner = self.id
         if llm is not None:
             llm.use(mw, scope=self.scope)
             return
@@ -248,6 +254,42 @@ class Plugin:
     def log(self, msg: str) -> None:
         '''Namespaced logging with this plugin's id.'''
         print(f'[{self.id}] {msg}', flush=True)
+
+    # ---------- plugin config ----------
+
+    def get_config(self, key: str = None, task_name: str = None):
+        '''
+        Read plugin configuration from the broker task context.
+
+        Args:
+            key: specific config key to retrieve. If None, returns the full
+                 config dict for this plugin.
+            task_name: the task/run name to look up. If None, attempts to
+                       find the currently active task for this plugin's agent.
+
+        Returns the config value, or None if not found.
+        '''
+        if task_name is None:
+            task_name = self._find_active_task()
+        if task_name is None:
+            return None
+        ctx = self.broker.get_run_context(task_name)
+        if ctx is None:
+            return None
+        cfg = ctx.get('plugin_config', {}).get(self.id)
+        if cfg is None:
+            return None
+        if key is None:
+            return cfg
+        return cfg.get(key)
+
+    def _find_active_task(self) -> Optional[str]:
+        '''Find the most recent active task for this plugin's scope.'''
+        for task_name, ctx in self.broker.run_contexts.items():
+            agent_name = ctx.get('agent_name', '')
+            if self.matches(agent_name):
+                return task_name
+        return None
 
     # ---------- cleanup ----------
 
