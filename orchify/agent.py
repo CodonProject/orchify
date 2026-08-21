@@ -1,14 +1,18 @@
-from typing import List, Dict, Any, Optional, Set, Union, AsyncGenerator, Literal
+from typing import List, Dict, Any, Optional, Set, Union, AsyncGenerator, Literal, TYPE_CHECKING
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
-from orchify.llm    import LLMInterface
-from orchify.tool   import Tool
-from orchify.event  import AgentEvent, ToolEvent, RuntimeEvent, ToolEventAssembler
-from orchify.utils  import safecode
-from orchify.env    import req_model
-from orchify.broker import orchify_broker
-from orchify.backend import orchify_web_backend
+from orchify.llm        import LLMInterface
+from orchify.tool       import Tool
+from orchify.event      import AgentEvent, ToolEvent, RuntimeEvent, ToolEventAssembler
+from orchify.utils      import safecode
+from orchify.env        import req_model
+from orchify.broker     import orchify_broker
+from orchify.backend    import orchify_web_backend
+from orchify.call_chain import CallChain
+
+if TYPE_CHECKING:
+    from orchify.group import Group
 
 import json
 import time
@@ -47,9 +51,9 @@ class Agent:
           - 'run': each run gets its own isolated message list built at run time.
             Safe for concurrent runs of the same agent; pass custom history via run(messages=...).
 
-        plugins: list of plugin names enabled for this agent. None = all plugins,
-          empty list = no plugins. Plugins not in this list will have their hooks
-          and middleware skipped for this agent's runs.
+        plugins: list of plugin names enabled for this agent. Default is empty list (no plugins).
+          Pass a list of plugin names to enable specific plugins.
+          None = no plugins (same as empty list).
 
         plugin_config: per-plugin configuration dict keyed by plugin name.
           Plugins read their config via Plugin.get_config(key). This config is
@@ -68,7 +72,8 @@ class Agent:
         self.messages_mode = messages_mode
 
         self.tools: Dict[str, Tool] = {t.name: t for t in (tools or [])}
-        self.enabled_plugins: Optional[Set[str]] = set(plugins) if plugins is not None else None
+        # Default: no plugins enabled unless explicitly passed
+        self.enabled_plugins: Set[str] = set(plugins) if plugins else set()
         self.plugin_config: Dict[str, Any] = dict(plugin_config or {})
 
         self.messages: List[Dict[str, Any]] = [
@@ -86,6 +91,10 @@ class Agent:
             'effort': effort,
         }
         self.extra_data: Dict[str, Any] = dict(extra_data or {})
+        
+        # Call chain tracking
+        self._call_chain: Optional[CallChain] = None
+        self._call_depth: int = 0
     
     def _build_run_messages(
         self,
@@ -114,7 +123,7 @@ class Agent:
         if not isinstance(tool, Tool):
             raise TypeError(f'register_tool() requires a Tool, got {type(tool)}')
         if not replace and tool.name in self.tools:
-            raise ValueError(f"Tool '{tool.name}' is already registered on agent '{self.name}'.")
+            raise ValueError(f"Tool \'{tool.name}\' is already registered on agent '{self.name}'.")
         self.tools[tool.name] = tool
 
     def remove_tool(self, name: str) -> bool:
@@ -122,27 +131,186 @@ class Agent:
         return self.tools.pop(name, None) is not None
 
     def enable_plugin(self, name: str) -> None:
-        '''Enable a plugin for this agent. If plugins were None (all), converts
-        to explicit mode with all registered plugins minus the disabled ones.'''
-        if self.enabled_plugins is None:
-            self._promote_to_explicit()
+        '''Enable a plugin for this agent.'''
         self.enabled_plugins.add(name)
 
     def disable_plugin(self, name: str) -> None:
-        '''Disable a plugin for this agent. If plugins were None (all), converts
-        to explicit mode with all registered plugins minus the disabled ones.'''
-        if self.enabled_plugins is None:
-            self._promote_to_explicit()
+        '''Disable a plugin for this agent.'''
         self.enabled_plugins.discard(name)
 
-    def _promote_to_explicit(self) -> None:
-        '''Convert from None (all) to an explicit set containing all registered plugins.'''
-        from orchify.plugin_manager import orchify_plugins
-        self.enabled_plugins = set(orchify_plugins.registered().keys())
-
     def set_plugins(self, plugins: Optional[List[str]]) -> None:
-        '''Set the list of enabled plugins. None = all (no filtering), empty = none.'''
-        self.enabled_plugins = set(plugins) if plugins is not None else None
+        '''Set the list of enabled plugins. None or empty = no plugins.'''
+        self.enabled_plugins = set(plugins) if plugins else set()
+
+    def _configure_with_tools(self, tools: List[Tool], extra_context: Optional[Dict[str, Any]] = None) -> None:
+        '''Configures the agent with additional tools and context for group collaboration.'''
+        for tool in tools:
+            if isinstance(tool, Tool):
+                self.register_tool(tool, replace=True)
+        
+        if extra_context:
+            context_str = '\n'.join([f'{k}: {v}' for k, v in extra_context.items()])
+            if self.system_prompt:
+                self.system_prompt += f'\n\nGroup Collaboration Context:\n{context_str}'
+            else:
+                self.system_prompt = f'Group Collaboration Context:\n{context_str}'
+
+    def call_agent(self, agent: 'Agent', user_input: str, **kwargs) -> str:
+        '''
+        Calls another Agent and tracks the call chain.
+        
+        Args:
+            agent: The target agent to call.
+            user_input: The input to send to the target agent.
+            **kwargs: Additional parameters for the target agent's run.
+            
+        Returns:
+            str: The turn_id of the target agent's execution.
+        '''
+        # Initialize call chain if not exists
+        if self._call_chain is None:
+            self._call_chain = CallChain(root_caller=f'Agent:{self.name}')
+        
+        # Add frame to call chain
+        self._call_chain.add_frame(
+            caller=f'Agent:{self.name}',
+            callee=f'Agent:{agent.name}',
+            call_type='agent',
+            input_data=user_input
+        )
+        
+        # Transfer call chain to target agent
+        agent._call_chain = self._call_chain
+        agent._call_depth = self._call_depth + 1
+        
+        # Emit call event
+        orchify_broker.emit(RuntimeEvent(
+            agent_name=self.name,
+            agent_code=self.code,
+            turn_id=kwargs.get('turn_id', ''),
+            event_type='agent:call',
+            payload={
+                'caller': self.name,
+                'callee': agent.name,
+                'call_type': 'agent',
+                'input': user_input,
+                'call_depth': self._call_depth
+            }
+        ))
+        
+        return agent.run(user_input, **kwargs)
+
+    def call_group(self, group: 'Group', user_input: str, **kwargs) -> str:
+        '''
+        Calls a Group and tracks the call chain.
+        
+        Args:
+            group: The target group to call.
+            user_input: The input to send to the group.
+            **kwargs: Additional parameters.
+            
+        Returns:
+            str: The turn_id of the group's execution.
+        '''
+        # Initialize call chain if not exists
+        if self._call_chain is None:
+            self._call_chain = CallChain(root_caller=f'Agent:{self.name}')
+        
+        # Add frame to call chain
+        self._call_chain.add_frame(
+            caller=f'Agent:{self.name}',
+            callee=f'Group:{group.name}',
+            call_type='group',
+            input_data=user_input
+        )
+        
+        # Emit call event
+        orchify_broker.emit(RuntimeEvent(
+            agent_name=self.name,
+            agent_code=self.code,
+            turn_id=kwargs.get('turn_id', ''),
+            event_type='agent:call',
+            payload={
+                'caller': self.name,
+                'callee': group.name,
+                'call_type': 'group',
+                'input': user_input,
+                'call_depth': self._call_depth
+            }
+        ))
+        
+        return group.run(user_input, **kwargs)
+
+    def get_call_chain(self) -> Optional[CallChain]:
+        '''Returns the current call chain for this agent.'''
+        return self._call_chain
+    
+    def get_call_chain_str(self) -> str:
+        '''Returns a human-readable string of the call chain.'''
+        if self._call_chain:
+            return self._call_chain.get_chain_str()
+        return f'Agent:{self.name} (no call chain)'
+
+    def as_tool(self, caller_agent: Optional['Agent'] = None) -> Tool:
+        '''Wraps this Agent into a Tool, with optional call chain tracking.
+
+        Args:
+            caller_agent: If provided, call chain tracking is set up so that
+                when this tool is executed, it registers itself in the caller's
+                call chain. Useful for composing agents via tools while
+                preserving full call-chain visibility.
+
+        Returns:
+            A Tool whose execute() runs this agent.
+        '''
+        agent_self = self
+        _caller = caller_agent
+
+        def agent_runner(**kwargs):
+            user_input = kwargs.get('input', kwargs.get('query', ''))
+
+            if _caller is not None:
+                if _caller._call_chain is None:
+                    _caller._call_chain = CallChain(root_caller=f'Agent:{_caller.name}')
+
+                _caller._call_chain.add_frame(
+                    caller=f'Agent:{_caller.name}',
+                    callee=f'Agent:{agent_self.name}',
+                    call_type='agent',
+                    input_data=user_input
+                )
+
+                agent_self._call_chain = _caller._call_chain
+                agent_self._call_depth = _caller._call_depth + 1
+
+                orchify_broker.emit(RuntimeEvent(
+                    agent_name=_caller.name,
+                    agent_code=_caller.code,
+                    turn_id=kwargs.get('turn_id', ''),
+                    event_type='agent:call',
+                    payload={
+                        'caller': _caller.name,
+                        'callee': agent_self.name,
+                        'call_type': 'agent',
+                        'input': user_input,
+                        'call_depth': _caller._call_depth
+                    }
+                ))
+
+            turn_id = agent_self.run(user_input, **kwargs)
+            return turn_id
+
+        agent_runner.__name__ = self.name
+        agent_runner.__doc__ = self.description or f'Call agent \'{self.name}\' to perform a task.'
+
+        from inspect import Parameter, Signature
+        params = [
+            Parameter(name='input', kind=Parameter.POSITIONAL_OR_KEYWORD, annotation=str),
+        ]
+        agent_runner.__signature__ = Signature(params)
+
+        tool = Tool(func=agent_runner, name=self.name, description=f'Agent: {self.name}')
+        return tool
 
     def run(
         self,
@@ -224,7 +392,7 @@ class Agent:
         except Exception:
             import traceback
             error_text = traceback.format_exc()
-            print(f"[Agent Error] task={task_name}: {error_text}", flush=True)
+            print(f'[Agent Error] task={task_name}: {error_text}', flush=True)
             orchify_broker.emit(RuntimeEvent(
                 agent_name=self.name,
                 agent_code=self.code,
@@ -528,7 +696,7 @@ class Agent:
                     denied = deny_map.get(tool_name)
                 if denied is not None:
                     # feedback-denied tool: skip execution, feed denial back
-                    result = f"[denied] {denied}"
+                    result = f'[denied] {denied}'
                     completed_results[tool_id] = (tool_name, result)
                     yield ToolEvent.build_call_finish(
                         agent_name=self.name,

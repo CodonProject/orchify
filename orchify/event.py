@@ -1,18 +1,19 @@
 from orchify.llm import Response
-from typing import Literal, Optional
+from typing import Literal, Optional, Any, TypeAlias
 from dataclasses import dataclass
 
 import json
 import time
 
 
-EVENT_TYPES = Literal[
+EVENT_TYPES: TypeAlias = Literal[
     'agent:start',
     'agent:reason:step',
     'agent:reason:finish',
     'agent:answer',
     'agent:finish',
     'agent:abort',
+    'agent:call',
     'tool:assembly:start',
     'tool:assembly:step',
     'tool:assembly:finish',
@@ -22,10 +23,17 @@ EVENT_TYPES = Literal[
     'run:next',
     'run:paused',
     'run:resumed',
-    'run:finish'
+    'run:finish',
+    'group:start',
+    'group:step',
+    'group:end',
+    'group:error',
+    'group:agent_call',
+    'group:call_agent',
+    'group:call_group',
 ]
 
-FEEDBACK_TYPES = Literal[
+FEEDBACK_TYPES: TypeAlias = Literal[
     'control:stop',
     'control:pause',
     'control:resume',
@@ -59,6 +67,7 @@ class BaseEvent:
         run_id: str = '',
         source: str = '',
         metadata: dict = None,
+        source_entity: Any = None,
     ):
         self.agent_name = agent_name
         self.agent_code = agent_code
@@ -71,6 +80,9 @@ class BaseEvent:
         self.source = source
         self.created_at = time.time()
         self.metadata = dict(metadata or {})
+        
+        # source_entity: the actual entity (Agent, Group, Plugin) that emitted this event
+        self.source_entity = source_entity
 
 
 class AgentEvent(BaseEvent):
@@ -309,4 +321,41 @@ class RuntimeEvent(BaseEvent):
         metadata: dict = None,
     ):
         super().__init__(agent_name, agent_code, turn_id, turn=turn, event_type=event_type, payload=payload, run_id=run_id, source=source, metadata=metadata)
+
+
+class GroupEvent(BaseEvent):
+    def __init__(
+        self,
+        agent_name: str,
+        agent_code: str,
+        turn_id: str,
+        event_type: EVENT_TYPES,
+        payload: dict = None,
+        turn: int = 1,
+        run_id: str = '',
+        source: str = 'group',
+        metadata: dict = None,
+        source_entity: Any = None,
+    ):
+        super().__init__(agent_name, agent_code, turn_id, turn=turn, event_type=event_type, payload=payload, run_id=run_id, source=source, metadata=metadata, source_entity=source_entity)
+        self.group_name = agent_name  # group_name is stored in agent_name for consistency
     
+    @staticmethod
+    def build_group_event(
+        group_name: str,
+        group_code: str,
+        turn_id: str,
+        event_type: EVENT_TYPES,
+        payload: dict = None,
+        run_id: str = '',
+        source_entity: Any = None,
+    ) -> 'GroupEvent':
+        return GroupEvent(
+            agent_name=group_name,
+            agent_code=group_code,
+            turn_id=turn_id,
+            event_type=event_type,
+            payload=payload,
+            run_id=run_id,
+            source_entity=source_entity,
+        )
