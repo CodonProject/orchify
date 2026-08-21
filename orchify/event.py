@@ -41,7 +41,6 @@ FEEDBACK_TYPES = Literal[
 @dataclass
 class EventFeedback:
     ftype: FEEDBACK_TYPES
-    comment: Optional[str] = None
     payload: dict = None
 
     def __post_init__(self):

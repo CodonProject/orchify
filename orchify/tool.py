@@ -12,8 +12,6 @@ class Tool:
         name: Optional[str] = None,
         description: Optional[str] = None,
         parameters: Optional[List[Dict[str, Any]]] = None,
-        is_agent_tool: bool = False,
-        is_group_tool: bool = False,
         cache: Optional[Any] = None
     ):
         '''
@@ -29,8 +27,6 @@ class Tool:
         self.name: str = name or func.__name__
         self.description: str = description or analysis.get('docstring', 'No description provided.')
         self.parameters: List[Dict[str, Any]] = parameters or analysis.get('parameters', [])
-        self.is_agent_tool = is_agent_tool
-        self.is_group_tool = is_group_tool
         self.cache = cache
 
         self._cache: Dict[str, tuple] = {}
@@ -147,8 +143,6 @@ def tool(
     name: Optional[str] = None,
     description: Optional[str] = None,
     parameters: Optional[List[Dict[str, Any]]] = None,
-    is_agent_tool: bool = False,
-    is_group_tool: bool = False,
     cache: Optional[Any] = None
 ):
     def decorator(func: Callable) -> Tool:
@@ -157,8 +151,6 @@ def tool(
             name=name,
             description=description,
             parameters=parameters,
-            is_agent_tool=is_agent_tool,
-            is_group_tool=is_group_tool,
             cache=cache
         )
     return decorator

@@ -179,11 +179,11 @@ class Plugin:
         return self.broker.event(event_type, **kwargs)
 
     def feedback(self, ftype: str, *, task_name: Optional[str] = None,
-                 turn_id: Optional[str] = None, comment: Optional[str] = None,
+                 turn_id: Optional[str] = None,
                  payload: Optional[dict] = None) -> bool:
         '''Convenience wrapper around broker.feedback() for the reverse control channel.'''
         return self.broker.feedback(ftype, task_name=task_name, turn_id=turn_id,
-                                    comment=comment, payload=payload)
+                                    payload=payload)
 
     def add_tool(self, tool: Tool, agent=None) -> Tool:
         '''Register an already-constructed Tool with this plugin; optionally attach to an agent.'''

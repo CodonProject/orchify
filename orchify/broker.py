@@ -189,7 +189,6 @@ class Broker:
         *,
         task_name: Optional[str] = None,
         turn_id: Optional[str] = None,
-        comment: Optional[str] = None,
         payload: dict = None,
     ) -> bool:
         '''
@@ -232,7 +231,7 @@ class Broker:
         if ftype == 'control:resume':
             return self._resume_run(task_name)
 
-        fb = EventFeedback(ftype=ftype, comment=comment, payload=payload)
+        fb = EventFeedback(ftype=ftype, payload=payload)
         with self._feedback_lock:
             self._feedback.setdefault(task_name, deque()).append(fb)
         return True
@@ -305,9 +304,8 @@ class Broker:
             self._feedback.pop(name, None)
         with self._pause_lock:
             event = self._pause_events.pop(name, None)
-            self._pause_loops.pop(name, None)
-        if event is not None:
-            loop = asyncio.get_event_loop()
+            loop = self._pause_loops.pop(name, None)
+        if event is not None and loop is not None:
             loop.call_soon_threadsafe(event.set)
 
 

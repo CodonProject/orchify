@@ -9,10 +9,11 @@ from orchify.backend import orchify_web_backend
 
 
 class OpenAICompat(LLMInterface):
-    def __init__(self, api_key: str = req_key(), base_url: str = req_url('https://api.openai.com/v1')):
+    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
         super().__init__()
-        self.api_key  = api_key
-        self.base_url = base_url
+        # resolved lazily so env vars set after import are honored
+        self.api_key  = api_key if api_key is not None else req_key()
+        self.base_url = base_url if base_url is not None else req_url('https://api.openai.com/v1')
         self.url = '/chat/completions'
 
     @property
@@ -90,7 +91,7 @@ class OpenAICompat(LLMInterface):
     async def _core_request(
         self,
         messages: list[dict],
-        model: str = req_model('gpt-4o'),
+        model: Optional[str] = None,
         tools: Optional[list[dict]] = None,
         temperature: float = 0.7,
         top_p: float = 1.0,
@@ -100,6 +101,7 @@ class OpenAICompat(LLMInterface):
         effort: Literal['minimal', 'low', 'medium', 'high', 'xhigh'] = 'medium',
         extra_data: Optional[dict] = None,
     ) -> AsyncGenerator[Response, None]:
+        model = model or req_model('gpt-4o')
         headers = {
             'Authorization': f'Bearer {self.api_key}',
             'Content-Type': 'application/json'
@@ -245,7 +247,7 @@ class OpenAICompat(LLMInterface):
                     error_detail = ""
             error_msg = f"HTTP Error '{e.response.status_code}': {e}"
             if error_detail:
-                error_msg += f'Response detail: {error_detail}'
+                error_msg += f' | Response detail: {error_detail}'
             raise httpx.HTTPStatusError(error_msg, request=e.request, response=e.response) from e
 
         # Yield the Final Response/Status

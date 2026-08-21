@@ -30,8 +30,6 @@ class FinalStatus:
     prompt_cache_miss_tokens: int = field(default=0)
     total_tokens: int = field(default=0)
 
-    is_abort: bool = field(default=False)
-
 
 @dataclass
 class Response:
@@ -198,11 +196,5 @@ class LLMInterface:
             'scope': scope,
             '_enabled_plugins': _enabled_plugins,
         }
-        if not self.middlewares:
-            kwargs.pop('scope', None)
-            kwargs.pop('_enabled_plugins', None)
-            async for resp in self._core_request(**kwargs):
-                yield resp
-            return
         async for resp in self._dispatch(kwargs, scope=scope):
             yield resp

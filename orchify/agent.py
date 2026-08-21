@@ -27,7 +27,7 @@ class Agent:
         llm: LLMInterface,
         system_prompt: str = '',
         tools: Optional[List[Tool]] = None,
-        model: str = req_model('gpt-4o'),
+        model: Optional[str] = None,
         messages_mode: Literal['agent', 'run'] = 'agent',
         *,
         plugins: Optional[List[str]] = None,
@@ -64,7 +64,7 @@ class Agent:
         self.code = safecode(length=4)
         self.llm = llm
         self.system_prompt = system_prompt
-        self.model = model
+        self.model = model or req_model('gpt-4o')
         self.messages_mode = messages_mode
 
         self.tools: Dict[str, Tool] = {t.name: t for t in (tools or [])}
@@ -77,7 +77,7 @@ class Agent:
         self.messages = [msg for msg in self.messages if msg]
 
         self.llm_kwargs: Dict[str, Any] = {
-            'model': model,
+            'model': self.model,
             'temperature': temperature,
             'top_p': top_p,
             'json_format': json_format,
