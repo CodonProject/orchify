@@ -133,7 +133,7 @@ class Plugin:
                 self._tools.append(tool)
                 agent = tmeta.get('agent')
                 if agent is not None:
-                    agent.register_tool(tool)
+                    agent.add_tool(tool)
                     self._attached_agents.add(agent)
                 continue
 
@@ -191,14 +191,14 @@ class Plugin:
             raise TypeError(f'add_tool() requires a Tool, got {type(tool)}')
         self._tools.append(tool)
         if agent is not None:
-            agent.register_tool(tool)
+            agent.add_tool(tool)
             self._attached_agents.add(agent)
         return tool
 
     def attach_tools(self, agent, replace: bool = True) -> Any:
         '''Attach every tool this plugin owns to the given Agent.'''
         for t in self._tools:
-            agent.register_tool(t, replace=replace)
+            agent.add_tool(t, replace=replace)
             self._attached_agents.add(agent)
         return agent
 

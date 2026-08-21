@@ -154,7 +154,7 @@ class Group:
                 else:
                     for tool in final_toolset:
                         if isinstance(tool, Tool):
-                            agent.register_tool(tool, replace=True)
+                            agent.add_tool(tool, replace=True)
             elif isinstance(agent, Group):
                 agent._wire_agents()
 

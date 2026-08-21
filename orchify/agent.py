@@ -118,10 +118,10 @@ class Agent:
 
         return base
 
-    def register_tool(self, tool: Tool, replace: bool = True) -> None:
+    def add_tool(self, tool: Tool, replace: bool = True) -> None:
         '''Attach a Tool to this agent. Raises if the name collides and replace=False.'''
         if not isinstance(tool, Tool):
-            raise TypeError(f'register_tool() requires a Tool, got {type(tool)}')
+            raise TypeError(f'add_tool() requires a Tool, got {type(tool)}')
         if not replace and tool.name in self.tools:
             raise ValueError(f"Tool \'{tool.name}\' is already registered on agent '{self.name}'.")
         self.tools[tool.name] = tool
@@ -146,7 +146,7 @@ class Agent:
         '''Configures the agent with additional tools and context for group collaboration.'''
         for tool in tools:
             if isinstance(tool, Tool):
-                self.register_tool(tool, replace=True)
+                self.add_tool(tool, replace=True)
         
         if extra_context:
             context_str = '\n'.join([f'{k}: {v}' for k, v in extra_context.items()])
