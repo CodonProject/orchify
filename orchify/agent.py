@@ -58,7 +58,7 @@ class Agent:
         self.messages_mode = messages_mode
         
         self.tools: Dict[str, Tool] = {t.name: t for t in (tools or [])}
-        
+
         self.messages: List[Dict[str, Any]] = [
             {'role': 'system', 'content': system_prompt} if system_prompt else {}
         ]
@@ -105,11 +105,23 @@ class Agent:
                 base.append(m)
 
         return base
-    
+
+    def register_tool(self, tool: Tool, replace: bool = True) -> None:
+        '''Attach a Tool to this agent. Raises if the name collides and replace=False.'''
+        if not isinstance(tool, Tool):
+            raise TypeError(f'register_tool() requires a Tool, got {type(tool)}')
+        if not replace and tool.name in self.tools:
+            raise ValueError(f"Tool '{tool.name}' is already registered on agent '{self.name}'.")
+        self.tools[tool.name] = tool
+
+    def remove_tool(self, name: str) -> bool:
+        '''Detach a Tool by name. Returns True if a tool was removed.'''
+        return self.tools.pop(name, None) is not None
+
     def run(
         self,
         user_input: str,
-        max_steps: int = 5,
+        max_steps: Union[int, Dict[str, Any]] = 5,
         turn_id: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
         **llm_kwargs
@@ -118,8 +130,23 @@ class Agent:
         Synchronously schedules the agent's task to be executed on the WebBackend asyncio loop.
         This provides a non-blocking synchronous entry point, avoiding OS thread creation per run.
 
+        For convenience, the second argument may also be a dict of run options
+        (max_steps / turn_id / messages / any LLM request kwargs):
+
+            agent.run('hi', {'max_steps': 3, 'temperature': 0.2})
+
         Returns the turn_id (str) for this run, which can be tracked via emitted events.
         '''
+        if isinstance(max_steps, dict):
+            opts = dict(max_steps)
+            max_steps = opts.pop('max_steps', 5)
+            if 'turn_id' in opts:
+                turn_id = opts.pop('turn_id')
+            if 'messages' in opts:
+                messages = opts.pop('messages')
+            llm_kwargs.update(opts)
+        if not isinstance(max_steps, int) or isinstance(max_steps, bool) or max_steps < 1:
+            raise ValueError(f'max_steps must be a positive integer, got {max_steps!r}')
         turn_id = turn_id or safecode(length=4)
         task_name = f'{self.name}#{self.code}_{safecode()}'
         run_context = {
@@ -324,6 +351,7 @@ class Agent:
                     model=req_kwargs.pop('model', self.model),
                     tools=tools_payload,
                     extra_data=extra_data,
+                    scope=self.name,
                     **req_kwargs,
                 )
                 try:

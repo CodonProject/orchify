@@ -4,7 +4,7 @@ import threading as td
 import asyncio
 from collections import deque
 from fnmatch import fnmatchcase
-from typing import Any, Callable, Optional, Literal
+from typing import Any, Callable, Optional, Literal, Union
 from typing import get_args
 
 
@@ -82,7 +82,8 @@ class Broker:
             return False
         if binding.agent_name is not None and event.agent_name != binding.agent_name:
             return False
-        if not fnmatchcase(event.event_type, binding.event_type):
+        types = binding.event_type if isinstance(binding.event_type, (tuple, list)) else (binding.event_type,)
+        if not any(fnmatchcase(event.event_type, t) for t in types):
             return False
         if binding.match is not None and not binding.match(event):
             return False
@@ -102,10 +103,12 @@ class Broker:
             if event.run_id and event.run_id in self.run_contexts:
                 event.metadata.setdefault('run_context', self.run_contexts[event.run_id])
 
-            candidates = [
-                b for b in self._all_hooks()
-                if not b.disposed and self._matches(b, event)
-            ]
+            candidates = []
+            seen = set()
+            for b in self._all_hooks():
+                if not b.disposed and b not in seen and self._matches(b, event):
+                    seen.add(b)
+                    candidates.append(b)
 
             for binding in candidates:
                 binding.count += 1
@@ -127,13 +130,14 @@ class Broker:
 
     def register_hook(
         self,
-        event_type: str,
+        event_type: Union[str, list, tuple, set],
         hook: Callable,
         turn_id: Optional[str] = None,
         mode: str = 'normal',
         agent_name: Optional[str] = None,
         match: Optional[Callable] = None,
-    ) -> None:
+        owner: str = '',
+    ) -> HookBinding:
         if not callable(hook):
             raise ValueError(f'Hook must be callable, got {type(hook)}')
         signature = inspect.signature(hook)
@@ -143,23 +147,54 @@ class Broker:
             raise ValueError("Hook mode 'agent' requires a turn_id so it can be destroyed on that run's finish.")
         if match is not None and not callable(match):
             raise ValueError(f'Match filter must be callable, got {type(match)}')
-        self.declare(event_type)
-        binding = HookBinding(hook, event_type, turn_id, mode, agent_name=agent_name, match=match)
-        self.hooks[event_type].append(binding)
+        types = tuple(event_type) if isinstance(event_type, (tuple, list, set)) else (event_type,)
+        if not types or not all(isinstance(t, str) for t in types):
+            raise ValueError(f'event_type must be a str or a list/tuple/set of strings, got {event_type!r}')
+        with self._emit_lock:
+            for et in types:
+                self.declare(et, owner=owner)
+            binding = HookBinding(hook, types[0] if len(types) == 1 else types, turn_id, mode,
+                                  agent_name=agent_name, match=match, owner=owner)
+            for et in types:
+                self.hooks[et].append(binding)
+        return binding
+
+    def remove_hooks(self, owner: str) -> int:
+        '''
+        Dispose and remove every hook binding owned by `owner` (typically a plugin).
+        Also cleans up non-builtin event types that were declared by the owner and
+        now have no remaining bindings. Returns the number of removed bindings.
+        '''
+        removed = 0
+        with self._emit_lock:
+            for event_type in list(self.hooks):
+                bindings = self.hooks[event_type]
+                kept = [b for b in bindings if b.owner != owner]
+                removed += len(bindings) - len(kept)
+                self.hooks[event_type] = kept
+            for event_type in list(self._event_owners):
+                if self._event_owners.get(event_type) == owner \
+                        and event_type not in BUILTIN_EVENT_TYPES \
+                        and not self.hooks.get(event_type):
+                    del self.hooks[event_type]
+                    del self._event_owners[event_type]
+        return removed
 
     def hook(
         self,
-        event_type: str = '*',
+        event_type: Union[str, list, tuple, set] = '*',
         turn_id: Optional[str] = None,
         mode: str = 'normal',
         once: bool = False,
         agent_name: Optional[str] = None,
         match: Optional[Callable] = None,
+        owner: str = '',
     ) -> Callable:
+        '''Decorator registering a hook. `event_type` may be a single string or a
+        list/tuple/set of strings; the hook fires for any of them.'''
         def decorator(func: Callable) -> Callable:
-            self.register_hook(event_type, func, turn_id=turn_id, mode='once' if once else mode,
-                               agent_name=agent_name, match=match)
-            return func
+            return self.register_hook(event_type, func, turn_id=turn_id, mode='once' if once else mode,
+                                      agent_name=agent_name, match=match, owner=owner)
         return decorator
 
     # ---------- plugin event factory ----------
