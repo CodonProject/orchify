@@ -16,7 +16,7 @@ class PluginManager:
     '''
     Registry + loader for Orchify plugins.
 
-        from orchify.plugin_manager import orchidb_plugins  # singleton
+        from orchify.plugin_manager import orchify_plugins  # singleton
 
         class MyPlugin(Plugin): ...
 
@@ -35,6 +35,7 @@ class PluginManager:
         self.llm = llm
         self.plugins: dict[str, Plugin] = {}
         self._order: list[str] = []
+        self._order_dirty: bool = True
         self._registry: dict[str, type] = {}
 
     # ---------- lifecycle events ----------
@@ -65,6 +66,7 @@ class PluginManager:
             raise PluginError(f"Plugin '{name}' is already registered.")
 
         self._registry[name] = cls
+        self._order_dirty = True
         if enabled:
             if instance is None:
                 instance = cls(broker=self.broker)
@@ -89,6 +91,7 @@ class PluginManager:
             self.unload(name)
         self._registry.pop(name, None)
         self.plugins.pop(name, None)
+        self._order_dirty = True
 
     def get(self, name: str) -> Plugin:
         if name not in self.plugins:
@@ -106,10 +109,15 @@ class PluginManager:
 
     @property
     def loaded(self) -> list[str]:
-        self._recompute_order()
+        self._ensure_order()
         return [n for n in self._order if self.plugins[n].loaded]
 
     # ---------- dependency ordering ----------
+
+    def _ensure_order(self) -> None:
+        if self._order_dirty:
+            self._recompute_order()
+            self._order_dirty = False
 
     def _recompute_order(self) -> None:
         names = list(self.plugins)
@@ -142,7 +150,7 @@ class PluginManager:
             return self.load_all()
         if name not in self.plugins:
             raise PluginError(f"Plugin '{name}' is not registered.")
-        self._recompute_order()
+        self._ensure_order()
         closure = self._dependency_closure(name)
         resolved = [n for n in self._order if n in closure]
         return [self._load_one(n) for n in resolved]
@@ -160,7 +168,7 @@ class PluginManager:
         return closure
 
     def load_all(self) -> List[Plugin]:
-        self._recompute_order()
+        self._ensure_order()
         return [self._load_one(n) for n in self._order]
 
     def _load_one(self, name: str) -> Plugin:
@@ -185,14 +193,14 @@ class PluginManager:
             'scope': inst.scope,
             'dependencies': list(inst.dependencies),
             'events': list(inst.events) if isinstance(inst.events, (list, tuple, set)) else [inst.events],
-            'hooks': [b.event_type for b in inst._bindings],
+            'hooks': [t for b in inst._bindings for t in b.event_type],
             'tools': [t.name for t in inst._tools],
         })
         return inst
 
     def unload(self, name: Optional[str] = None) -> List[str]:
         '''Unload one plugin or all loaded plugins (reverse dependency order). Returns unloaded names.'''
-        self._recompute_order()
+        self._ensure_order()
         if name is None:
             order = [n for n in reversed(self._order) if self.plugins[n].loaded]
         else:
@@ -255,9 +263,7 @@ class PluginManager:
                           and getattr(obj, '__module__', '') == module.__name__]
         registered = []
         for cand in candidates:
-            if isinstance(cand, type) and issubclass(cand, Plugin):
-                inst = self.register(cand)
-            elif isinstance(cand, Plugin):
+            if (isinstance(cand, type) and issubclass(cand, Plugin)) or isinstance(cand, Plugin):
                 inst = self.register(cand)
             else:
                 continue
@@ -265,58 +271,47 @@ class PluginManager:
                 registered.append(inst)
         return registered
 
-    def load_from_dir(self, path: str, *, auto_load: bool = True) -> List[Plugin]:
-        '''Import every *.py in a directory as plugin modules and register them.
-
+    def _import_modules(self, mod_names: List[str], sys_path: Optional[str] = None) -> None:
+        '''Import plugin modules, optionally with a temporary sys.path entry.
         A failing module is reported (plugin:error + a printed warning) but does
-        not abort the rest of the directory. Re-importing re-runs changed modules.
-        '''
-        files = self.discover(path)
-        path = os.path.abspath(path)
-        added = path not in sys.path
+        not abort the rest.'''
+        added = sys_path is not None and sys_path not in sys.path
         if added:
-            sys.path.insert(0, path)
+            sys.path.insert(0, sys_path)
         try:
-            for f in files:
-                mod_name = os.path.splitext(os.path.basename(f))[0]
-                self._import_module(mod_name, suppress_errors=True)
+            for mod_name in mod_names:
+                try:
+                    self._import_module(mod_name, suppress_errors=True)
+                except Exception as e:
+                    print(f'[plugin] skipped module {mod_name}: {e}', flush=True)
+                    self._emit('plugin:error', {'plugin': mod_name, 'action': 'import', 'error': str(e)})
         finally:
             if added:
-                sys.path.remove(path)
+                sys.path.remove(sys_path)
+
+    def load_from_dir(self, path: str, *, auto_load: bool = True) -> List[Plugin]:
+        '''Import every *.py in a directory as plugin modules and register them.
+        Re-importing re-runs changed modules.'''
+        files = self.discover(path)
+        mod_names = [os.path.splitext(os.path.basename(f))[0] for f in files]
+        self._import_modules(mod_names, sys_path=os.path.abspath(path))
         return self.load_all() if auto_load else []
 
     def load_from_file(self, path: str, *, auto_load: bool = True) -> List[Plugin]:
-        '''Import a single plugin file and register/load the plugins it defines.
-
-        Failures are reported (plugin:error + a printed warning) and return [].
-        '''
+        '''Import a single plugin file and register/load the plugins it defines.'''
         path = os.path.abspath(path)
         if not os.path.isfile(path):
             raise PluginError(f'Plugin file does not exist: {path}')
-        dir_name = os.path.dirname(path)
         mod_name = os.path.splitext(os.path.basename(path))[0]
-        added = dir_name not in sys.path
-        if added:
-            sys.path.insert(0, dir_name)
-        try:
-            try:
-                self._import_module(mod_name, suppress_errors=True)
-            except Exception as e:
-                print(f'[plugin] failed to import {path}: {e}', flush=True)
-                self._emit('plugin:error', {'plugin': path, 'action': 'import', 'error': str(e)})
-                return []
-        finally:
-            if added:
-                sys.path.remove(dir_name)
+        self._import_modules([mod_name], sys_path=os.path.dirname(path))
         return self.load_all() if auto_load else []
 
     def load_from_package(self, package: str, *, auto_load: bool = True) -> List[Plugin]:
         '''Import plugin modules from inside an installed package (e.g. 'app.plugins').'''
         pkg = importlib.import_module(package)
         pkg_dir = os.path.dirname(os.path.abspath(pkg.__file__))
-        for f in self.discover(pkg_dir):
-            mod_name = f'{package}.{os.path.splitext(os.path.basename(f))[0]}'
-            self._import_module(mod_name, suppress_errors=True)
+        mod_names = [f'{package}.{os.path.splitext(os.path.basename(f))[0]}' for f in self.discover(pkg_dir)]
+        self._import_modules(mod_names)
         return self.load_all() if auto_load else []
 
     def _import_module(self, mod_name: str, *, suppress_errors: bool = False) -> Optional[object]:

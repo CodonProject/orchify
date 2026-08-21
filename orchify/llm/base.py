@@ -32,18 +32,6 @@ class FinalStatus:
 
     is_abort: bool = field(default=False)
 
-    @property
-    def completion_token(self) -> int:
-        return self.completion_tokens
-
-    @property
-    def prompt_token(self) -> int:
-        return self.prompt_tokens
-
-    @property
-    def total_token(self) -> int:
-        return self.total_tokens
-
 
 @dataclass
 class Response:

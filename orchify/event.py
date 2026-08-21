@@ -27,7 +27,6 @@ EVENT_TYPES = Literal[
 
 FEEDBACK_TYPES = Literal[
     'control:stop',
-    'control:continue',
     'control:pause',
     'control:resume',
     'control:retry',
@@ -73,9 +72,6 @@ class BaseEvent:
         self.source = source
         self.created_at = time.time()
         self.metadata = dict(metadata or {})
-        self.metadata.setdefault('timestamp', self.created_at)
-        self.metadata.setdefault('run_id', run_id)
-        self.metadata.setdefault('source', source)
 
 
 class AgentEvent(BaseEvent):
@@ -137,52 +133,43 @@ class AgentEvent(BaseEvent):
         raise ValueError('Response must have either current_chunk or final_status.')
 
 
-class ToolEvent(BaseEvent):
-    
-    _seen_tools = set()       # (turn_id, tool_id)
-    _finished_tools = set()   # (turn_id, tool_id)
-    _last_args_len = {}
+class ToolEventAssembler:
+    '''
+    Incrementally converts streamed tool-call assembly chunks into ToolEvents.
 
-    def __init__(
+    One instance per response stream: dedup/progress state lives on the
+    instance, never shared across streams or runs.
+    '''
+
+    def __init__(self):
+        self._started = set()    # tool_ids that already emitted tool:assembly:start
+        self._finished = set()   # tool_ids whose arguments parsed as complete JSON
+        self._args_len = {}      # tool_id -> length of arguments already emitted
+
+    def build(
         self,
+        response: Response,
         agent_name: str,
         agent_code: str,
         turn_id: str,
-        event_type: EVENT_TYPES,
-        payload: dict = None,
-        tool_id: str = '',
-        tool_name: str = '',
-        chunk_arg: str = '',
-        turn: int = 1,
-        run_id: str = '',
-        source: str = 'tool',
-        metadata: dict = None,
-    ):
-        super().__init__(agent_name, agent_code, turn_id, turn=turn, event_type=event_type, payload=payload, run_id=run_id, source=source, metadata=metadata)
-        self.tool_id = tool_id
-        self.tool_name = tool_name
-        self.chunk_arg = chunk_arg
-        self.args: Optional[dict] = None
-    
-    @staticmethod
-    def build_from_resp(response: Response, agent_name: str, agent_code: str, turn_id: str, turn: int = 1) -> list['ToolEvent']:
-        if response.is_final: 
+        turn: int = 1
+    ) -> list['ToolEvent']:
+        if response.is_final:
             return []
-        if not response.current_chunk or not response.current_chunk.is_assembly_tool: 
+        if not response.current_chunk or not response.current_chunk.is_assembly_tool:
             return []
-        
+
         results = []
         total_tool_calls = response.current_chunk.total_tool_call or []
         for index, tool_call in enumerate(total_tool_calls):
-            
+
             tool_id = tool_call.get('id') or f"idx_{index}"
             tool_name = tool_call.get('function', {}).get('name', '')
             arguments = tool_call.get('function', {}).get('arguments', '')
-            state_key = (turn_id, tool_id)
-            
-            if state_key not in ToolEvent._seen_tools:
-                ToolEvent._seen_tools.add(state_key)
-                ToolEvent._last_args_len[state_key] = 0
+
+            if tool_id not in self._started:
+                self._started.add(tool_id)
+                self._args_len[tool_id] = 0
                 results.append(
                     ToolEvent(
                         agent_name=agent_name,
@@ -194,12 +181,13 @@ class ToolEvent(BaseEvent):
                         tool_name=tool_name
                     )
                 )
-                
-            if state_key in ToolEvent._finished_tools: continue
-            
-            last_len = ToolEvent._last_args_len.get(state_key, 0)
+
+            if tool_id in self._finished:
+                continue
+
+            last_len = self._args_len.get(tool_id, 0)
             chunk_arg = arguments[last_len:]
-            ToolEvent._last_args_len[state_key] = len(arguments)
+            self._args_len[tool_id] = len(arguments)
 
             parsed_args = None
             is_json_valid = False
@@ -223,7 +211,7 @@ class ToolEvent(BaseEvent):
                 )
 
             if is_json_valid:
-                ToolEvent._finished_tools.add(state_key)
+                self._finished.add(tool_id)
                 event = ToolEvent(
                     agent_name=agent_name,
                     agent_code=agent_code,
@@ -235,9 +223,31 @@ class ToolEvent(BaseEvent):
                 event.args = parsed_args
                 results.append(event)
 
-        
         return results
-    
+
+
+class ToolEvent(BaseEvent):
+    def __init__(
+        self,
+        agent_name: str,
+        agent_code: str,
+        turn_id: str,
+        event_type: EVENT_TYPES,
+        payload: dict = None,
+        tool_id: str = '',
+        tool_name: str = '',
+        chunk_arg: str = '',
+        turn: int = 1,
+        run_id: str = '',
+        source: str = 'tool',
+        metadata: dict = None,
+    ):
+        super().__init__(agent_name, agent_code, turn_id, turn=turn, event_type=event_type, payload=payload, run_id=run_id, source=source, metadata=metadata)
+        self.tool_id = tool_id
+        self.tool_name = tool_name
+        self.chunk_arg = chunk_arg
+        self.args: Optional[dict] = None
+
     @staticmethod
     def build_call_start(
         agent_name: str,

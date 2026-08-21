@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from orchify.llm    import LLMInterface
 from orchify.tool   import Tool
-from orchify.event  import AgentEvent, ToolEvent, RuntimeEvent
+from orchify.event  import AgentEvent, ToolEvent, RuntimeEvent, ToolEventAssembler
 from orchify.utils  import safecode
 from orchify.env    import req_model
 from orchify.broker import orchify_broker
@@ -39,7 +39,6 @@ class Agent:
         thinking: Literal['disabled', 'enabled', 'auto', 'disable', 'on', 'off', 'true', 'false'] = 'auto',
         effort: Literal['minimal', 'low', 'medium', 'high', 'xhigh'] = 'medium',
         extra_data: Optional[Dict[str, Any]] = None,
-        **llm_kwargs,
     ):
         '''
         messages_mode controls how conversation history is scoped per run:
@@ -57,8 +56,9 @@ class Agent:
           stored in the broker task context and never sent to the LLM API.
 
         LLM request params (temperature, top_p, json_format, max_tokens, thinking,
-        effort, extra_data, plus any other kwargs) are stored and forwarded to
-        llm.request() on every run. The same values passed to run() override them.
+        effort) are stored and forwarded to llm.request() on every run. The same
+        values passed to run() override them. Provider-specific fields belong in
+        extra_data.
         '''
         self.name = name
         self.code = safecode(length=4)
@@ -76,14 +76,6 @@ class Agent:
         ]
         self.messages = [msg for msg in self.messages if msg]
 
-        known: Dict[str, Any] = {}
-        extra: Dict[str, Any] = dict(extra_data or {})
-        for k, v in llm_kwargs.items():
-            if k in REQUEST_PARAMS:
-                known[k] = v
-            else:
-                extra[k] = v
-
         self.llm_kwargs: Dict[str, Any] = {
             'model': model,
             'temperature': temperature,
@@ -92,9 +84,8 @@ class Agent:
             'max_tokens': max_tokens,
             'thinking': thinking,
             'effort': effort,
-            **known,
         }
-        self.extra_data: Dict[str, Any] = extra
+        self.extra_data: Dict[str, Any] = dict(extra_data or {})
     
     def _build_run_messages(
         self,
@@ -184,7 +175,7 @@ class Agent:
             raise ValueError(f'max_steps must be a positive integer, got {max_steps!r}')
         turn_id = turn_id or safecode(length=4)
         task_name = f'{self.name}#{self.code}_{safecode()}'
-        run_context = {
+        orchify_broker.start_task(task_name, None, context={
             'task_name': task_name,
             'agent_name': self.name,
             'agent_code': self.code,
@@ -192,8 +183,7 @@ class Agent:
             'started_at': time.time(),
             'enabled_plugins': self.enabled_plugins,
             'plugin_config': self.plugin_config,
-        }
-        orchify_broker.start_task(task_name, None, context=run_context)
+        })
         asyncio.run_coroutine_threadsafe(
             self._async_thread_process(
                 user_input,
@@ -216,17 +206,7 @@ class Agent:
         messages: Optional[List[Dict[str, Any]]] = None,
         llm_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
-        current_task = asyncio.current_task()
-        run_context = {
-            'task_name': task_name,
-            'agent_name': self.name,
-            'agent_code': self.code,
-            'turn_id': turn_id or '',
-            'started_at': time.time(),
-            'enabled_plugins': self.enabled_plugins,
-            'plugin_config': self.plugin_config,
-        }
-        orchify_broker.start_task(task_name, current_task, context=run_context)
+        orchify_broker.start_task(task_name, asyncio.current_task())
         
         generator = self._run(
             user_input=user_input,
@@ -368,23 +348,20 @@ class Agent:
 
             def build_request():
                 req_kwargs = {**self.llm_kwargs, **(llm_kwargs or {}), **req_overrides}
-                req_kwargs.pop('messages', None)
-                req_kwargs.pop('tools', None)
-                req_kwargs.pop('plugin_config', None)
 
                 extra_data = dict(self.extra_data or {})
                 run_extra = req_kwargs.pop('extra_data', None)
                 if run_extra:
                     extra_data.update(run_extra)
-                for k, v in list(req_kwargs.items()):
-                    if k not in REQUEST_PARAMS:
-                        extra_data[k] = req_kwargs.pop(k)
+                for k in [k for k in req_kwargs if k not in REQUEST_PARAMS]:
+                    extra_data[k] = req_kwargs.pop(k)
                 return req_kwargs, extra_data
 
             final_status = None
             retries = 0
             while True:
                 req_kwargs, extra_data = build_request()
+                assembler = ToolEventAssembler()
 
                 response_gen = self.llm.request(
                     messages=working_messages,
@@ -410,7 +387,7 @@ class Agent:
                             chunk = response.current_chunk
                             if chunk:
                                 if chunk.is_assembly_tool:
-                                    tool_events = ToolEvent.build_from_resp(
+                                    tool_events = assembler.build(
                                         response,
                                         agent_name=self.name,
                                         agent_code=self.code,
@@ -499,9 +476,10 @@ class Agent:
 
             runs.append({
                 'step': step,
-                'status': final_status
+                'content': assistant_msg,
+                'tool_calls': final_status.tool_calls
             })
-            
+
             if not final_status.tool_calls: break
 
             loop = asyncio.get_running_loop()
@@ -613,12 +591,6 @@ class Agent:
                     'name': tool_name,
                     'content': result
                 })
-            
-            runs.append({
-                'step': step,
-                'content': assistant_msg,
-                'tool_calls': final_status.tool_calls
-            })
         
         yield RuntimeEvent(
             agent_name=self.name,

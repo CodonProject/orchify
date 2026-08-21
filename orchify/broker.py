@@ -1,16 +1,9 @@
-from orchify.event import BaseEvent, AgentEvent, ToolEvent, RuntimeEvent, EventFeedback, FEEDBACK_TYPES, EVENT_TYPES
-import inspect
+from orchify.event import BaseEvent, EventFeedback, FEEDBACK_TYPES
 import threading as td
 import asyncio
 from collections import deque
 from fnmatch import fnmatchcase
-from typing import Any, Callable, Optional, Literal, Union
-from typing import get_args
-
-
-BUILTIN_EVENT_TYPES = set(get_args(EVENT_TYPES)) | {'*'}
-
-HOOK_MODES = Literal['normal', 'once', 'agent']
+from typing import Any, Callable, Optional, Union, get_args
 
 
 class HookBinding:
@@ -19,7 +12,7 @@ class HookBinding:
     def __init__(
         self,
         func: Callable,
-        event_type: str,
+        event_type: tuple,
         turn_id: Optional[str],
         mode: str,
         agent_name: Optional[str] = None,
@@ -43,10 +36,7 @@ class HookBinding:
 
 class Broker:
     def __init__(self):
-        self.hooks: dict[str, list[HookBinding]] = {event_type: [] for event_type in get_args(EVENT_TYPES)}
-        self.hooks['*'] = []
-
-        self.requests: dict[str, td.Event] = {}
+        self.hooks: list[HookBinding] = []
         self.runs: dict[str, Any] = {}
         self.run_contexts: dict[str, dict] = {}
 
@@ -56,21 +46,9 @@ class Broker:
         self._pause_loops: dict[str, Any] = {}
         self._pause_lock = td.Lock()
 
-        self._event_owners: dict[str, str] = {}
-
         self._emit_lock = td.RLock()
 
-    # ---------- hook registration ----------
-
-    def declare(self, event_type: str, owner: str = '') -> None:
-        '''Dynamically register a custom event type (e.g. namespaced plugin types).'''
-        if event_type not in self.hooks:
-            self.hooks[event_type] = []
-        self._event_owners.setdefault(event_type, owner)
-
-    def _all_hooks(self):
-        for bindings in self.hooks.values():
-            yield from bindings
+    # ---------- emit ----------
 
     def _execute_hook(self, func: Callable, event: BaseEvent):
         try: func(event)
@@ -82,41 +60,32 @@ class Broker:
             return False
         if binding.agent_name is not None and event.agent_name != binding.agent_name:
             return False
-        types = binding.event_type if isinstance(binding.event_type, (tuple, list)) else (binding.event_type,)
-        if not any(fnmatchcase(event.event_type, t) for t in types):
+        if not any(fnmatchcase(event.event_type, t) for t in binding.event_type):
             return False
         if binding.match is not None and not binding.match(event):
             return False
         return True
-
-    # ---------- emit ----------
 
     def emit(self, event: BaseEvent) -> None:
         if not isinstance(event, BaseEvent):
             raise TypeError(f'emit() requires a BaseEvent, got {type(event)}')
 
         with self._emit_lock:
-            if event.event_type not in self.hooks:
-                self.hooks[event.event_type] = []
-
             # expose the run context to hooks via event metadata
-            if event.run_id and event.run_id in self.run_contexts:
-                event.metadata.setdefault('run_context', self.run_contexts[event.run_id])
-
-            # determine enabled plugins for this run (None = all enabled)
             enabled_plugins = None
             if event.run_id and event.run_id in self.run_contexts:
-                enabled_plugins = self.run_contexts[event.run_id].get('enabled_plugins')
+                ctx = self.run_contexts[event.run_id]
+                event.metadata.setdefault('run_context', ctx)
+                enabled_plugins = ctx.get('enabled_plugins')
 
             candidates = []
-            seen = set()
-            for b in self._all_hooks():
-                if not b.disposed and b not in seen and self._matches(b, event):
-                    # filter by enabled plugins: skip hooks owned by disabled plugins
-                    if enabled_plugins is not None and b.owner and b.owner not in enabled_plugins:
-                        continue
-                    seen.add(b)
-                    candidates.append(b)
+            for b in self.hooks:
+                if b.disposed or not self._matches(b, event):
+                    continue
+                # filter by enabled plugins: skip hooks owned by disabled plugins
+                if enabled_plugins is not None and b.owner and b.owner not in enabled_plugins:
+                    continue
+                candidates.append(b)
 
             for binding in candidates:
                 binding.count += 1
@@ -124,15 +93,11 @@ class Broker:
                 if binding.mode == 'once':
                     binding.disposed = True
 
-            if event.event_type == 'run:finish':
-                for et in list(self.hooks):
-                    self.hooks[et] = [
-                        b for b in self.hooks[et]
-                        if not b.disposed and not (b.mode == 'agent' and b.turn_id == event.turn_id)
-                    ]
-            else:
-                for et in list(self.hooks):
-                    self.hooks[et] = [b for b in self.hooks[et] if not b.disposed]
+            is_finish = event.event_type == 'run:finish'
+            self.hooks = [
+                b for b in self.hooks
+                if not b.disposed and not (is_finish and b.mode == 'agent' and b.turn_id == event.turn_id)
+            ]
 
     # ---------- registration API ----------
 
@@ -148,9 +113,6 @@ class Broker:
     ) -> HookBinding:
         if not callable(hook):
             raise ValueError(f'Hook must be callable, got {type(hook)}')
-        signature = inspect.signature(hook)
-        if len(signature.parameters) != 1 or list(signature.parameters.values())[0].annotation not in [BaseEvent, AgentEvent, ToolEvent, RuntimeEvent, inspect._empty]:
-            raise ValueError(f'Hook must accept a single argument of type BaseEvent, AgentEvent, ToolEvent, or RuntimeEvent, got {signature}')
         if mode == 'agent' and turn_id is None:
             raise ValueError("Hook mode 'agent' requires a turn_id so it can be destroyed on that run's finish.")
         if match is not None and not callable(match):
@@ -158,34 +120,18 @@ class Broker:
         types = tuple(event_type) if isinstance(event_type, (tuple, list, set)) else (event_type,)
         if not types or not all(isinstance(t, str) for t in types):
             raise ValueError(f'event_type must be a str or a list/tuple/set of strings, got {event_type!r}')
+        binding = HookBinding(hook, types, turn_id, mode, agent_name=agent_name, match=match, owner=owner)
         with self._emit_lock:
-            for et in types:
-                self.declare(et, owner=owner)
-            binding = HookBinding(hook, types[0] if len(types) == 1 else types, turn_id, mode,
-                                  agent_name=agent_name, match=match, owner=owner)
-            for et in types:
-                self.hooks[et].append(binding)
+            self.hooks.append(binding)
         return binding
 
     def remove_hooks(self, owner: str) -> int:
-        '''
-        Dispose and remove every hook binding owned by `owner` (typically a plugin).
-        Also cleans up non-builtin event types that were declared by the owner and
-        now have no remaining bindings. Returns the number of removed bindings.
-        '''
-        removed = 0
+        '''Dispose and remove every hook binding owned by `owner` (typically a plugin).
+        Returns the number of removed bindings.'''
         with self._emit_lock:
-            for event_type in list(self.hooks):
-                bindings = self.hooks[event_type]
-                kept = [b for b in bindings if b.owner != owner]
-                removed += len(bindings) - len(kept)
-                self.hooks[event_type] = kept
-            for event_type in list(self._event_owners):
-                if self._event_owners.get(event_type) == owner \
-                        and event_type not in BUILTIN_EVENT_TYPES \
-                        and not self.hooks.get(event_type):
-                    del self.hooks[event_type]
-                    del self._event_owners[event_type]
+            kept = [b for b in self.hooks if b.owner != owner]
+            removed = len(self.hooks) - len(kept)
+            self.hooks = kept
         return removed
 
     def hook(
@@ -220,7 +166,6 @@ class Broker:
         source: str = 'plugin',
         metadata: dict = None,
     ) -> BaseEvent:
-        self.declare(event_type)
         return BaseEvent(
             agent_name=agent_name,
             agent_code=agent_code,
@@ -235,16 +180,6 @@ class Broker:
 
     def get_run_context(self, name: str) -> Optional[dict]:
         return self.run_contexts.get(name)
-
-    def find_run_context(self, turn_id: str = None, agent_name: str = None) -> tuple[Optional[str], Optional[dict]]:
-        '''Find an active run context by turn_id or agent_name.
-        Returns (task_name, context) or (None, None).'''
-        for name, ctx in self.run_contexts.items():
-            if turn_id and ctx.get('turn_id') == turn_id:
-                return name, ctx
-            if agent_name and ctx.get('agent_name') == agent_name:
-                return name, ctx
-        return None, None
 
     # ---------- feedback (reverse control channel) ----------
 
@@ -264,7 +199,6 @@ class Broker:
 
         Supported types:
           - 'control:stop':           abort the run at the next checkpoint.
-          - 'control:continue':       no-op (reserved for flow control).
           - 'control:pause':          suspend the run until 'control:resume'.
           - 'control:resume':         wake a paused run (by task_name/turn_id).
           - 'control:retry':          payload={'kwargs': {...}, 'max_retries': n}
@@ -355,34 +289,9 @@ class Broker:
         loop.call_soon_threadsafe(event.set)
         return True
 
-    # ---------- request / run tracking ----------
+    # ---------- run tracking ----------
 
-    def start_req(self, code: str) -> td.Event | None:
-        if code in self.requests.keys(): return
-        event = td.Event()
-        self.requests[code] = event
-        return event
-
-    def stop_req(self, code: str) -> bool:
-        if not code in self.requests.keys(): return False
-        event: td.Event = self.requests[code]
-        event.set()
-        return True
-
-    def finish_req(self, code: str) -> bool:
-        if not code in self.requests.keys(): return False
-        self.requests.pop(code)
-        return True
-
-    def start_td(self, t: td.Thread):
-        self.runs[t.name] = t
-        if not t.is_alive(): t.start()
-
-    def finish_td(self, t: td.Thread):
-        if not t.name in self.runs.keys(): return
-        del self.runs[t.name]
-
-    def start_task(self, name: str, task: asyncio.Task, context: Optional[dict] = None):
+    def start_task(self, name: str, task: Any, context: Optional[dict] = None):
         self.runs[name] = task
         if context is not None:
             self.run_contexts[name] = context

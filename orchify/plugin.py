@@ -8,19 +8,11 @@ from orchify.broker import orchify_broker
 from orchify.llm.base import scope_matches, Middleware
 
 
-_LIFECYCLE = {'on_load', 'on_unload'}
-
-
 class Plugin:
     '''
     Base class for Orchify plugins.
 
-    Declare metadata as class attributes, then write hooks/tools as plain methods:
-    the framework auto-discovers them at load time in three styles:
-
-      Python规范（约定式）   -> 方法名 on_<snake_event> 自动注册为 hook
-           def on_run_start(self, event): ...          # run:start
-           def on_tool_call_start(self, event): ...    # tool:call:start
+    Declare metadata as class attributes, then write hooks/tools in two styles:
 
       显式声明式            -> 装饰器标记，方法保持普通方法，可继续被调用
            @Plugin.hook('agent:finish', agent_name='Agent')
@@ -34,10 +26,9 @@ class Plugin:
                @self.on('run:next')
                def _(e): ...
 
-    Custom event types declared via the `events` class attribute are declared
-    automatically. Lifecycle methods (on_load/on_unload) may be sync or async
-    (async ones run on the WebBackend loop). Everything the plugin registered is
-    cleaned up automatically on unload.
+    Lifecycle methods (on_load/on_unload) may be sync or async (async ones run
+    on the WebBackend loop). Everything the plugin registered is cleaned up
+    automatically on unload.
 
     `scope` restricts the plugin's hooks and middleware to certain agents:
       - '*' (default): every agent.
@@ -121,17 +112,13 @@ class Plugin:
 
     def _auto_register(self) -> None:
         pid = self.id
-        for et in (self.events if isinstance(self.events, (list, tuple, set)) else [self.events]):
-            if et:
-                self.broker.declare(et, owner=pid)
-
         scope_filter = self._scope_filter()
 
         for method_name, _ in inspect.getmembers(type(self), predicate=inspect.isfunction):
             bound = getattr(self, method_name, None)
 
             meta = getattr(bound, '__plugin_hook__', None)
-            if isinstance(meta, (dict,)):
+            if isinstance(meta, dict):
                 kwargs = {k: v for k, v in meta.items() if k != 'event_type'}
                 user_match = kwargs.get('match')
                 if scope_filter is not None:
@@ -141,7 +128,7 @@ class Plugin:
                 continue
 
             tmeta = getattr(bound, '__plugin_tool__', None)
-            if isinstance(tmeta, (dict,)):
+            if isinstance(tmeta, dict):
                 tool = Tool(func=bound, name=tmeta.get('name'), **tmeta.get('tool_kwargs', {}))
                 self._tools.append(tool)
                 agent = tmeta.get('agent')
@@ -149,14 +136,6 @@ class Plugin:
                     agent.register_tool(tool)
                     self._attached_agents.add(agent)
                 continue
-
-            if method_name.startswith('on_') and method_name not in _LIFECYCLE:
-                event_type = method_name[3:].replace('_', ':')
-                binding = self.broker.register_hook(
-                    event_type, bound, owner=pid,
-                    match=scope_filter,
-                )
-                self._bindings.append(binding)
 
     # ---------- lifecycle ----------
 
@@ -195,8 +174,7 @@ class Plugin:
         return decorator
 
     def event(self, event_type: str, **kwargs) -> Any:
-        '''Declare (if needed) and build a custom event owned by this plugin.'''
-        self.broker.declare(event_type, owner=self.id)
+        '''Build a custom event owned by this plugin.'''
         kwargs.setdefault('source', 'plugin')
         return self.broker.event(event_type, **kwargs)
 
