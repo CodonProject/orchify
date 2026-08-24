@@ -7,8 +7,9 @@ from .plugin_manager import PluginManager, PluginError, orchify_plugins
 from .group import Group, GroupEventBroker
 from .event import GroupEvent
 from .schema import Vote
+from .broker import orchify_broker
 
-__version__ = '0.0.1a2'
+__version__ = '0.0.1'
 
 __all__ = [
     'Agent',
@@ -26,4 +27,5 @@ __all__ = [
     'GroupEvent',
     'GroupEventBroker',
     'Vote',
+    'orchify_broker'
 ]

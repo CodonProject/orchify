@@ -1,54 +1,50 @@
-"""
-Orchify Install Script
-Usage: python install.py
-"""
-
-import sys
-import subprocess
 import os
+import shutil
+import subprocess
+import sys
 
-
-def install_package():
-    """Install orchify package."""
-    print("Installing orchify...")
+def clean() -> None:
+    '''
+    Cleans up the build, dist, and egg-info directories.
+    '''
+    dirs_to_remove = ['build', 'dist']
+    for root, dirs, _ in os.walk('.'):
+        for name in dirs:
+            if name.endswith('.egg-info'):
+                dirs_to_remove.append(os.path.join(root, name))
     
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    
+    for dir_path in dirs_to_remove:
+        if os.path.exists(dir_path):
+            print(f'Removing {dir_path}...')
+            shutil.rmtree(dir_path)
     try:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "-e", script_dir],
-            cwd=script_dir,
-        )
-        print("Successfully installed orchify!")
+        subprocess.run(['codon', 'clear'], check=True)
+    except: pass
+
+def build() -> None:
+    '''
+    Runs the setup.py sdist bdist_wheel command to build the package.
+    '''
+    print('Building package...')
+    try:
+        subprocess.run([sys.executable, 'setup.py', 'sdist', 'bdist_wheel'], check=True)
+        print('Build successful.')
     except subprocess.CalledProcessError as e:
-        print(f"Installation failed: {e}")
+        print(f'Build failed with error: {e}')
         sys.exit(1)
 
-
-def verify_installation():
-    """Verify that orchify can be imported."""
-    print("\nVerifying installation...")
-    
+def install() -> None:
+    '''
+    Installs the package from the built distribution.
+    '''
+    print('Installing package...')
     try:
-        import orchify
-        print(f"orchify {orchify.__version__} installed successfully")
-        print(f"Available exports: {', '.join(orchify.__all__)}")
-        return True
-    except ImportError as e:
-        print(f"Failed to import orchify: {e}")
-        return False
+        subprocess.run([sys.executable, '-m', 'pip', 'install', '.', '--no-build-isolation'], check=True)
+        print('Installation successful.')
+    except subprocess.CalledProcessError as e:
+        print(f'Installation failed with error: {e}')
+        sys.exit(1)
 
-
-def main():
-    install_package()
-    
-    if verify_installation():
-        print("\nInstallation complete! You can now use:")
-        print("  from orchify import Agent, Tool, Group")
-    else:
-        print("\nWarning: Package installed but verification failed.")
-        print("You may need to check your Python environment.")
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    install()
+    clean()
