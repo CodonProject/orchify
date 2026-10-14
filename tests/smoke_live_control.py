@@ -1,9 +1,3 @@
-'''Live smoke test for the control channel and the approval pool.
-
-Runs two short real conversations through OpenAICompat:
-  A. pause/resume mid-stream  (control:pause -> run:paused -> control:resume)
-  B. manual approval pool     (tool with require_approval=True, approved by a hook)
-'''
 import os
 import sys
 import threading
@@ -65,7 +59,6 @@ def test_pause_live():
     assert 'run:paused' in events, events
     assert 'run:resumed' in events, events
     assert events.index('run:paused') < events.index('run:resumed') < events.index('run:finish'), events
-    # scheme B: one run_id for the whole execution, turn_id is '<run_id>#<turn>'
     assert run_id and agent.last_run_id == run_id, (run_id, agent.last_run_id)
     assert records and all(r.run_id == run_id for r in records), \
         [(r.event_type, r.run_id) for r in records]
@@ -80,7 +73,11 @@ def test_approval_live():
     ran = []
 
     def read_secret() -> str:
-        """Read the secret value."""
+        '''Read the secret value.
+
+        Returns:
+            str: The secret, proving the tool actually ran.
+        '''
         ran.append(True)
         return 'SECRET-42'
 

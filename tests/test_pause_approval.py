@@ -1,11 +1,3 @@
-'''
-Offline tests for the pause/stop control channel and the approval pool.
-
-No network access is required: a scripted FakeLLM stands in for the provider.
-Run either way:
-    python tests/test_pause_approval.py
-    python -m pytest tests/test_pause_approval.py
-'''
 import os
 import sys
 import time
@@ -17,8 +9,6 @@ from orchify import Agent, Tool, tool, orchify_broker
 from orchify.llm import LLMInterface
 from orchify.llm.base import Chunk, FinalStatus, Response
 
-
-# ---------------------------------------------------------------- test helpers
 
 class FakeLLM(LLMInterface):
     '''
@@ -89,8 +79,9 @@ class Recorder:
             return [e for e in self.events if e.event_type == event_type]
 
     def close(self):
-        self.binding.disposed = True
-        orchify_broker.remove_hooks('')
+        binding, self.binding = self.binding, None
+        if binding is not None:
+            orchify_broker.remove_binding(binding)
 
 
 def wait_until(predicate, timeout=8.0):
@@ -111,8 +102,6 @@ def wait_finish(rec, timeout=8.0):
 def finish_payload(rec):
     return wait_finish(rec).payload
 
-
-# ---------------------------------------------------------------------- tests
 
 def test_configure_with_tools_is_idempotent_and_visible():
     '''Group context must not stack up, and must reach the LLM in agent mode.'''
@@ -172,13 +161,11 @@ def test_pause_mid_stream_and_lost_resume_race():
     rec = Recorder()
 
     def pause_on_first_chunk(event):
-        # fires mid-stream; the run must notice it before the stream ends
         orchify_broker.feedback('control:pause', run_id=event.run_id)
 
     rec.callbacks['agent:answer'] = pause_on_first_chunk
 
     def resume_immediately(event):
-        # the lost-resume race: reply to run:paused at once, from the run thread
         orchify_broker.feedback('control:resume', run_id=event.run_id)
 
     rec.callbacks['run:paused'] = resume_immediately
@@ -194,7 +181,6 @@ def test_pause_mid_stream_and_lost_resume_race():
     assert types.index('run:paused') < types.index('run:resumed') < types.index('run:finish'), types
     assert payload['stopped'] is False
     assert rec.of('run:resumed')[0].payload['status'] == 'resumed'
-    # the stream kept going after the pause rather than being restarted
     assert llm.calls and len(llm.calls) == 1, len(llm.calls)
     print('ok  mid-stream pause honoured; resume cannot be lost')
 
@@ -205,8 +191,6 @@ def test_pause_on_last_step():
     rec = Recorder()
 
     def pause_on_finish(event):
-        # fired from the model's final response of the last step -> the step has
-        # no tool calls, so without a final checkpoint the run would just finish
         orchify_broker.feedback('control:pause', run_id=event.run_id)
 
     rec.callbacks['agent:finish'] = pause_on_finish
@@ -263,7 +247,6 @@ def test_stop_while_paused_terminates():
 
     def pause_then_stop(event):
         orchify_broker.feedback('control:pause', run_id=event.run_id)
-        # give the run a moment to actually park, then stop it
         threading.Thread(
             target=lambda: (time.sleep(0.2),
                             orchify_broker.feedback('control:stop', run_id=event.run_id)),
@@ -580,9 +563,7 @@ def test_run_id_is_the_execution_handle():
 
     steps = sorted({e.turn for e in rec.events})
     assert steps == [1, 2], steps
-    # step 2 has its own turn label, distinct from step 1's
     assert rec.of('run:next')[0].turn_id == f'{run_id}#2'
-    # the run is no longer registered once it finished
     assert run_id not in orchify_broker.run_contexts, orchify_broker.run_contexts
     print('ok  run_id is the execution handle; turn_id is <run_id>#<turn>')
 
@@ -602,9 +583,7 @@ def test_feedback_addressing_and_run_id_aliases():
         if rec.paused:
             return
         rec.paused = True
-        # a pause addressed at a single turn_id must reach the run it belongs to
         assert orchify_broker.feedback('control:pause', turn_id=event.turn_id) is True
-        # an unknown handle must be refused, never guessed
         assert orchify_broker.feedback('control:pause', run_id='nope#1') is False
         assert orchify_broker.feedback('control:pause', turn_id='ghost#9') is False
 
@@ -619,10 +598,8 @@ def test_feedback_addressing_and_run_id_aliases():
 
     assert resolved and all(r == run_id for r in resolved), (resolved, run_id)
     assert orchify_broker.run_id_of_turn('ghost#9') is None
-    # the turn index is dropped together with the run
     assert orchify_broker.run_id_of_turn(f'{run_id}#1') is None, 'turn index must not outlive the run'
 
-    # explicit run_id, and turn_id as the legacy alias of it
     a = Agent(name='explicit', llm=FakeLLM([[final('x')]]))
     assert a.run('go', max_steps=1, run_id='my-run-1') == 'my-run-1'
     b = Agent(name='legacy', llm=FakeLLM([[final('y')]]))
@@ -649,7 +626,6 @@ def test_group_keeps_every_member_run_id():
     assert len(set(group.last_run_ids)) == 2, 'members must not share a run_id'
     assert group_run_id not in group.last_run_ids
 
-    # group events carry the group's own run identity...
     end = [e for e in group.broker.events if e.event_type == 'end'][0]
     assert end.run_id == group_run_id, end.run_id
     assert end.payload['agent_run_ids'] == group.last_run_ids
@@ -673,7 +649,6 @@ def test_round_robin_mode_removed():
     else:
         raise AssertionError("mode='round_robin' must raise ValueError")
 
-    # every remaining mode still constructs and wires its agents
     for mode in ('broadcast', 'manager_delegation', 'voting', 'competition'):
         member = Agent(name=f'm_{mode}', llm=FakeLLM([[final('x')]]))
         group = Group(name=f'g_{mode}', agents=[member], mode=mode)
@@ -706,7 +681,7 @@ def test_agent_run_guard_cancel_and_wait():
     agent = Agent(name='guard', llm=llm)
 
     rec.callbacks['agent:answer'] = lambda e: orchify_broker.feedback('control:pause', run_id=e.run_id)
-    rec.callbacks['run:paused'] = lambda e: None  # stay parked
+    rec.callbacks['run:paused'] = lambda e: None
 
     run_id = agent.run('go', max_steps=1)
     assert wait_until(lambda: bool(rec.of('run:paused'))), rec.types()
@@ -794,8 +769,6 @@ def test_group_voting_tally_and_run_guard():
     assert group_run_id.startswith('majority#'), group_run_id
     assert [v.agent_name for v in group.last_votes] == ['v1', 'v2', 'v3'], group.last_votes
     assert all(isinstance(v, Vote) for v in group.last_votes)
-    # 'Yes' and '  yes ' normalise to the same answer: that is the majority, and
-    # the first agent to reach it wins the tie-break.
     assert group.last_winner == 'v1', group.last_winner
     assert group.last_answer == 'Yes', group.last_answer
     assert group.is_running() is False
@@ -807,7 +780,6 @@ def test_group_voting_tally_and_run_guard():
     assert end.payload['answer'] == 'Yes', end.payload
     assert len(end.payload['votes']) == 3, end.payload
 
-    # a second overlapping run on the same instance is refused
     slow1 = Agent(name='s1', llm=FakeLLM([[{'content': 'x', 'delay': 0.4}, final('x')]]))
     slow2 = Agent(name='s2', llm=FakeLLM([[{'content': 'y', 'delay': 0.4}, final('y')]]))
     busy = Group(name='busy', agents=[slow1, slow2], mode='voting')
@@ -825,7 +797,6 @@ def test_group_voting_tally_and_run_guard():
     assert not worker.is_alive(), 'the first group run never finished'
     assert busy.is_running() is False
 
-    # vote_timeout=0 keeps the old fire-and-forget behaviour
     nowait = Group(name='nowait', agents=[Agent(name='n1', llm=FakeLLM([[final('a')]]))],
                    mode='voting', vote_timeout=0)
     nowait.run('go')
@@ -845,7 +816,6 @@ def test_run_done_handles_survive_and_reset():
     assert first is not None and first.is_set() is False
     assert orchify_broker.wait_run('unit#reuse', timeout=0.05) is False
 
-    # the second registration of the SAME run must not swap the waiter's handle
     orchify_broker.start_task('unit#reuse', None)
     assert orchify_broker.run_done_event('unit#reuse') is first, 'the handle must stay stable'
 
@@ -854,7 +824,6 @@ def test_run_done_handles_survive_and_reset():
     assert orchify_broker.wait_run('unit#reuse', timeout=0.05) is True
     assert orchify_broker.is_run_active('unit#reuse') is False
 
-    # a reused id starts from a clean handle again
     orchify_broker.start_task('unit#reuse', None)
     second = orchify_broker.run_done_event('unit#reuse')
     assert second is not first and second.is_set() is False
@@ -950,7 +919,6 @@ def test_llm_retry_helpers():
     assert _retry_delay(0, ValueError('x')) == 0.5
     assert _retry_delay(1, ValueError('x')) == 1.0
     assert _retry_delay(10, ValueError('x')) == 30.0, 'the backoff must be capped'
-    # a server-provided Retry-After wins over the exponential default
     assert _retry_delay(0, status_error(429, {'Retry-After': '2'})) == 2.0
 
     assert _read_int_env('ORCHIFY_LLM_MAX_RETRIES', 2) == 2
@@ -963,6 +931,11 @@ def test_llm_retry_helpers():
 
 
 def main():
+    '''Run every test in this file.
+
+    Returns:
+        int: 0 when all tests passed, 1 when any failed.
+    '''
     here = os.path.dirname(os.path.abspath(__file__))
     this = os.path.abspath(__file__)
     tests = [

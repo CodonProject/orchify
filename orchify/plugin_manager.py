@@ -6,6 +6,9 @@ from typing import List, Optional, Type, Union
 
 from orchify.plugin import Plugin
 from orchify.broker import orchify_broker
+from orchify.utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class PluginError(Exception):
@@ -13,23 +16,36 @@ class PluginError(Exception):
 
 
 class PluginManager:
-    '''
-    Registry + loader for Orchify plugins.
+    '''Registry and loader for Orchify plugins.
 
-        from orchify.plugin_manager import orchify_plugins  # singleton
+    Usage::
+
+        from orchify.plugin_manager import orchify_plugins
 
         class MyPlugin(Plugin): ...
 
         orchify_plugins.register(MyPlugin)
-        orchify_plugins.load('my_plugin')          # or load_all()
-        orchify_plugins.unload('my_plugin')
+        orchify_plugins.load('MyPlugin')
+        orchify_plugins.unload('MyPlugin')
 
-    Plugins are loaded in dependency order (topological sort over `dependencies`).
-    Lifecycle events `plugin:load` / `plugin:unload` / `plugin:error` are emitted
-    through the broker so other hooks/plugins can react.
+    Plugins are loaded in dependency order (a topological sort over each
+    plugin's ``dependencies``). The lifecycle events ``plugin:load``,
+    ``plugin:unload`` and ``plugin:error`` are emitted through the broker so
+    other hooks and plugins can react.
+
+    Attributes:
+        plugins (Dict[str, Plugin]): Registered plugins by id.
     '''
 
     def __init__(self, broker=None, llm=None):
+        '''Create an empty registry.
+
+        Args:
+            broker (Optional[Broker]): Broker handed to every plugin; defaults to
+                the shared ``orchify_broker``.
+            llm (Optional[LLMInterface]): LLM backend handed to plugins that
+                register their own provider or middleware.
+        '''
         from orchify.broker import orchify_broker as _default_broker
         self.broker = broker or _default_broker
         self.llm = llm
@@ -38,18 +54,25 @@ class PluginManager:
         self._order_dirty: bool = True
         self._registry: dict[str, type] = {}
 
-    # ---------- lifecycle events ----------
 
     def _emit(self, event_type: str, payload: dict) -> None:
         event = self.broker.event(event_type=event_type, payload=payload, source='plugin')
         self.broker.emit(event)
 
-    # ---------- registration ----------
 
     def register(self, plugin: Union[Type[Plugin], Plugin], *, enabled: bool = True) -> Optional[Plugin]:
-        '''
-        Register a Plugin subclass or instance. Returns the registered instance
-        (or None if disabled). Raises PluginError on duplicates.
+        '''Register a Plugin subclass or instance.
+
+        Args:
+            plugin (Union[Type[Plugin], Plugin]): The class or instance to register.
+            enabled (bool): When False the plugin is ignored entirely.
+
+        Returns:
+            Optional[Plugin]: The registered instance, or None when ``enabled`` is
+            False.
+
+        Raises:
+            PluginError: When the plugin has no id or that id is already registered.
         '''
         cls: Type[Plugin]
         instance: Optional[Plugin] = None
@@ -77,8 +100,15 @@ class PluginManager:
         return instance
 
     def configure(self, llm=None, broker=None) -> None:
-        '''Set the shared llm (and/or broker) used by all registered plugins.
-        Takes effect immediately and on subsequently registered plugins.'''
+        '''Set the shared LLM and/or broker used by plugins.
+
+        Takes effect immediately for registered plugins and is applied to plugins
+        registered later.
+
+        Args:
+            llm (Optional[LLMInterface]): LLM shared with every plugin.
+            broker (Optional[Broker]): Broker shared with every plugin.
+        '''
         if broker is not None:
             self.broker = broker
         self.llm = llm
@@ -94,11 +124,27 @@ class PluginManager:
         self._order_dirty = True
 
     def get(self, name: str) -> Plugin:
+        '''Return a registered plugin by id.
+
+        Args:
+            name (str): Plugin id.
+
+        Returns:
+            Plugin: The registered plugin.
+
+        Raises:
+            PluginError: When no plugin is registered under ``name``.
+        '''
         if name not in self.plugins:
             raise PluginError(f"Plugin '{name}' is not registered.")
         return self.plugins[name]
 
     def registered(self) -> dict[str, Plugin]:
+        '''Return a copy of the plugin registry.
+
+        Returns:
+            dict[str, Plugin]: Registered plugins keyed by id.
+        '''
         return dict(self.plugins)
 
     def attach(self, name: str, agent) -> None:
@@ -109,10 +155,14 @@ class PluginManager:
 
     @property
     def loaded(self) -> list[str]:
+        '''Return the ids of the currently loaded plugins.
+
+        Returns:
+            list[str]: Loaded plugin ids, in registration order.
+        '''
         self._ensure_order()
         return [n for n in self._order if self.plugins[n].loaded]
 
-    # ---------- dependency ordering ----------
 
     def _ensure_order(self) -> None:
         if self._order_dirty:
@@ -142,7 +192,6 @@ class PluginManager:
         for n in names:
             visit(n, ())
 
-    # ---------- load / unload ----------
 
     def load(self, name: Optional[str] = None) -> List[Plugin]:
         '''Load one plugin (with its dependencies) or all registered plugins.'''
@@ -168,6 +217,11 @@ class PluginManager:
         return closure
 
     def load_all(self) -> List[Plugin]:
+        '''Load every registered plugin in dependency order.
+
+        Returns:
+            List[Plugin]: The plugin instances that are loaded.
+        '''
         self._ensure_order()
         return [self._load_one(n) for n in self._order]
 
@@ -224,6 +278,11 @@ class PluginManager:
         return closure
 
     def unload_all(self) -> List[str]:
+        '''Unload every loaded plugin in reverse order.
+
+        Returns:
+            List[str]: The ids of the plugins that were unloaded.
+        '''
         return self.unload()
 
     def _unload_one(self, name: str) -> None:
@@ -235,7 +294,6 @@ class PluginManager:
             self._emit('plugin:error', {'plugin': name, 'action': 'unload', 'error': str(e)})
             raise PluginError(f"Failed to unload plugin '{name}': {e}") from e
 
-    # ---------- discovery / import ----------
 
     def discover(self, path: Union[str, List[str]], pattern: str = '*.py') -> List[str]:
         '''Scan a directory (or directories) for loadable plugin modules.'''
@@ -272,9 +330,16 @@ class PluginManager:
         return registered
 
     def _import_modules(self, mod_names: List[str], sys_path: Optional[str] = None) -> None:
-        '''Import plugin modules, optionally with a temporary sys.path entry.
-        A failing module is reported (plugin:error + a printed warning) but does
-        not abort the rest.'''
+        '''Import plugin modules, updating sys.path if needed.
+
+        A module that fails to import is reported (``plugin:error`` plus a warning)
+        but does not abort the remaining modules.
+
+        Args:
+            mod_names (List[str]): Module names to import.
+            sys_path (Optional[str]): Directory prepended to ``sys.path`` for the
+                duration of the import.
+        '''
         added = sys_path is not None and sys_path not in sys.path
         if added:
             sys.path.insert(0, sys_path)
@@ -283,15 +348,22 @@ class PluginManager:
                 try:
                     self._import_module(mod_name, suppress_errors=True)
                 except Exception as e:
-                    print(f'[plugin] skipped module {mod_name}: {e}', flush=True)
+                    logger.warning('[plugin] skipped module %s: %s', mod_name, e)
                     self._emit('plugin:error', {'plugin': mod_name, 'action': 'import', 'error': str(e)})
         finally:
             if added:
                 sys.path.remove(sys_path)
 
     def load_from_dir(self, path: str, *, auto_load: bool = True) -> List[Plugin]:
-        '''Import every *.py in a directory as plugin modules and register them.
-        Re-importing re-runs changed modules.'''
+        '''Import every ``*.py`` in a directory as plugins.
+
+        Args:
+            path (str): Directory to scan.
+            auto_load (bool): When True, load each plugin right after registering it.
+
+        Returns:
+            List[Plugin]: The plugins registered from the directory.
+        '''
         files = self.discover(path)
         mod_names = [os.path.splitext(os.path.basename(f))[0] for f in files]
         self._import_modules(mod_names, sys_path=os.path.abspath(path))
@@ -324,7 +396,7 @@ class PluginManager:
         except PluginError as e:
             if not suppress_errors:
                 raise
-            print(f'[plugin] skipped module {mod_name}: {e}', flush=True)
+            logger.warning('[plugin] skipped module %s: %s', mod_name, e)
             self._emit('plugin:error', {'plugin': mod_name, 'action': 'import', 'error': str(e)})
         return module
 

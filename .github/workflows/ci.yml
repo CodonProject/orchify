@@ -36,6 +36,12 @@ jobs:
       - name: Run the offline test suite
         run: python -m pytest -q
 
+      - name: Coverage report (informational, no gate)
+        if: matrix.python-version == '3.13'
+        run: |
+          python -m pytest -q --cov=orchify --cov-report=term-missing --cov-report=xml
+          python -c "import xml.etree.ElementTree as ET; r=ET.parse('coverage.xml').getroot(); print('line-rate', r.get('line-rate'))"
+
   build:
     name: build the distribution
     runs-on: ubuntu-latest

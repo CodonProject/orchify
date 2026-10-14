@@ -6,7 +6,7 @@ import time
 
 from .agent import Agent
 from .backend import orchify_web_backend
-from .call_chain import CallChain
+from .call_chain import CallChain, CallBlocked, plan_call
 from .schema import Vote
 from .tool import Tool
 from .utils import safecode
@@ -26,10 +26,9 @@ def _read_float_env(name: str) -> Optional[float]:
     return value if value > 0 else None
 
 
-# how long a 'voting' run waits for its members before tallying, unless
-# ORCHIFY_VOTE_TIMEOUT (or Group(vote_timeout=...)) says otherwise. 0 or a
-# negative value restores the old "dispatch and return" behaviour.
 DEFAULT_VOTE_TIMEOUT = 300.0
+
+DEFAULT_MAX_CALL_DEPTH = 8
 
 
 def _read_vote_timeout_env() -> Optional[float]:
@@ -43,13 +42,28 @@ def _read_vote_timeout_env() -> Optional[float]:
         return None
 
 
-class GroupEventBroker:
-    '''Simple event broker for collecting group events.
+def _read_max_call_depth_env() -> Optional[int]:
+    '''ORCHIFY_MAX_CALL_DEPTH as a non-negative int, else None.'''
+    raw = os.getenv('ORCHIFY_MAX_CALL_DEPTH')
+    if raw is None or raw.strip() == '':
+        return None
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
 
-    Unlike `orchify_broker.emit` (which may be called from a member's thread),
-    this one is locked: members running in parallel append to the same event
-    list, and callbacks are invoked on the emitting thread AFTER the lock is
-    released so a slow callback cannot block appends.
+
+class GroupEventBroker:
+    '''Collect the events emitted by a group and fan them out to callbacks.
+
+    Unlike ``orchify_broker.emit``, which may be called from a member's thread,
+    this broker is locked: parallel members append to the same event list, and
+    callbacks run on the emitting thread after the lock is released, so a slow
+    callback cannot block appends.
+
+    Attributes:
+        events (List[GroupEventBase]): Every event received, in emission order.
     '''
 
     def __init__(self):
@@ -58,6 +72,11 @@ class GroupEventBroker:
         self._lock = threading.RLock()
 
     def emit(self, event: GroupEventBase):
+        '''Append an event and notify the registered callbacks.
+
+        Args:
+            event (GroupEventBase): The event to record and forward.
+        '''
         with self._lock:
             self.events.append(event)
             callbacks = list(self._callbacks)
@@ -65,22 +84,50 @@ class GroupEventBroker:
             callback(event)
 
     def on_event(self, callback):
+        '''Register a callback invoked for every group event.
+
+        Args:
+            callback (Callable): Called with the event on the emitting thread.
+        '''
         with self._lock:
             self._callbacks.append(callback)
 
     def get_events_by_type(self, event_type: str) -> List[GroupEventBase]:
+        '''Return the recorded events of one type.
+
+        Args:
+            event_type (str): Event type to filter on.
+
+        Returns:
+            List[GroupEventBase]: Matching events, in emission order.
+        '''
         with self._lock:
             return [e for e in self.events if e.event_type == event_type]
 
 
 class Group:
-    '''
-    A team of Agents that can collaborate to accomplish complex tasks.
+    '''A team of Agents that collaborate on a task.
 
-    A Group contains a set of Agents. It automatically 'wires' them up so that
-    each Agent can see the other Agents in the team as expert tools to be called upon.
-    
-    Supports nested Groups for complex call chains like: Group -> Agent -> Group -> Agent
+    A Group owns a set of Agents (or nested Groups) and wires them together so
+    that every member sees the others as expert tools it can call. Nested groups
+    allow call chains such as Group -> Agent -> Group -> Agent.
+
+    Attributes:
+        name (str): Group name.
+        description (str): What the group is for.
+        agents (Dict[str, Union[Agent, Group]]): Members by name.
+        agent_sequence (List[Union[Agent, Group]]): Members in insertion order.
+        shared_tools (List[Tool]): Tools handed to every member.
+        mode (str): Collaboration mode: ``'broadcast'``, ``'manager_delegation'``,
+            ``'voting'`` or ``'competition'``.
+        code (str): Short random code that makes the group's run ids unique.
+        current_run_id (str): Run id of the active run.
+        last_run_ids (List[str]): Run ids of the members of the last run.
+        last_votes (List[Vote]): Votes collected by a ``'voting'`` run.
+        last_winner (Optional[str]): Name of the winning member.
+        last_answer (str): Answer produced by the last run.
+        allow_concurrent_runs (bool): Whether overlapping runs are permitted.
+        vote_timeout (float): Seconds a ``'voting'`` run waits for its members.
     '''
 
     def __init__(
@@ -94,26 +141,39 @@ class Group:
         *,
         allow_concurrent_runs: bool = False,
         vote_timeout: Optional[float] = None,
+        max_call_depth: Optional[int] = None,
     ):
-        '''Initializes an Agent Group.
+        '''Initialise a group of Agents.
 
         Args:
-            name (str): The name of the group.
-            agents (List[Agent]): A list of Agent or Group instances in the group.
-            description (Optional[str], optional): A description of the group's purpose.
-            manager_agent_name (str, optional): The name of the designated manager Agent.
-            shared_tools (Optional[List[Tool]], optional): A list of tools shared by the group.
-            mode (str, optional): The communication mode between Agents.
-                                  'broadcast': All Agents can call each other.
-                                  'manager_delegation': Only the manager can call other Agents.
-                                  'voting': All Agents answer, the majority answer wins.
-                                  'competition': All Agents compete, best answer wins.
-            allow_concurrent_runs (bool): refuse a second run() while one is in
-              flight (default). The group keeps `current_run_id`/`last_run_ids` on
-              the instance, so overlapping runs would clobber each other.
-            vote_timeout (float, optional): seconds a 'voting' run waits for its
-              members before tallying (defaults to ORCHIFY_VOTE_TIMEOUT; 0 or a
-              negative value dispatches without waiting, as older versions did).
+            name (str): Group name.
+            agents (List[Union[Agent, Group]]): Members of the group.
+            description (Optional[str]): Description of the group's purpose.
+            manager_agent_name (Optional[str]): Name of the designated manager
+                agent; defaults to the first member.
+            shared_tools (Optional[List[Tool]]): Tools shared by every member.
+            mode (str): Collaboration mode between the members:
+
+                * ``'broadcast'``: every member may call every other member.
+                * ``'manager_delegation'``: only the manager may call members.
+                * ``'voting'``: every member answers, the majority answer wins.
+                * ``'competition'``: every member competes, the best answer wins.
+            allow_concurrent_runs (bool): When False (the default) a second
+                ``run()`` is refused while one is in flight, because the group
+                keeps ``current_run_id``/``last_run_ids`` on the instance and
+                overlapping runs would clobber each other.
+            vote_timeout (Optional[float]): Seconds a ``'voting'`` run waits for
+                its members before tallying; defaults to
+                ``ORCHIFY_VOTE_TIMEOUT``. Zero or a negative value dispatches
+                without waiting, as older versions did.
+            max_call_depth (Optional[int]): How deep nested Group/Agent calls may
+                go before a call is refused; defaults to
+                ``ORCHIFY_MAX_CALL_DEPTH``, else 8. Zero disables the cap. A call
+                whose target is already on the call path is always refused as a
+                cycle.
+
+        Raises:
+            ValueError: When ``mode`` is not a known collaboration mode.
         '''
         self.name = name
         self.description = description or f'A group of agents named {name}.'
@@ -123,18 +183,13 @@ class Group:
         self.mode = mode
         self.broker = GroupEventBroker()
         self.code = safecode(length=4)
-        # run identity: the group's own execution, and the run_id of every member
-        # it has dispatched (members run under their OWN run_id)
         self.current_run_id: str = ''
         self.last_run_id: str = ''
         self.last_run_ids: List[str] = []
-        # voting results (filled by _run_voting)
         self.last_votes: List[Vote] = []
         self.last_winner: Optional[str] = None
         self.last_answer: str = ''
 
-        # one group run at a time per instance: concurrent runs would share
-        # current_run_id / last_run_ids / last_votes.
         self.allow_concurrent_runs = allow_concurrent_runs
         self._run_slot = threading.Lock()
         self._active_run_id: str = ''
@@ -143,9 +198,14 @@ class Group:
         if vote_timeout is None:
             vote_timeout = DEFAULT_VOTE_TIMEOUT
         self.vote_timeout = vote_timeout
-        
-        # 'round_robin' was removed: Agent.run() returns a run handle instead of
-        # the answer, so a group cannot chain members synchronously.
+
+        if max_call_depth is None:
+            max_call_depth = _read_max_call_depth_env()
+        if max_call_depth is None:
+            max_call_depth = DEFAULT_MAX_CALL_DEPTH
+        self.max_call_depth = max_call_depth
+        self._call_path: List[str] = []
+
         if mode == 'round_robin':
             raise ValueError(
                 "mode 'round_robin' was removed. Chain agents yourself with "
@@ -166,15 +226,25 @@ class Group:
             self.manager_agent = self.agents[manager_agent_name]
         elif self.agent_sequence:
             self.manager_agent = self.agent_sequence[0]
-        
+
         self._wire_agents()
+
+        try:
+            from .manager import orchify_manager
+            orchify_manager.register(self)
+        except Exception:
+            pass
 
     def _emit(self, event_type: str, payload: dict = None):
         '''Emit a group event.
 
-        Group events belong to the group's own run (`current_run_id`). A group is
-        a dispatcher, so it labels them turn 1: the LLM round trips happen inside
-        each member's own run.
+        Group events belong to the group's own run (``current_run_id``). A group
+        is a dispatcher, so its events are labelled turn 1: the LLM round trips
+        happen inside each member's own run.
+
+        Args:
+            event_type (str): Event type to emit.
+            payload (Optional[dict]): Event payload.
         '''
         run_id = self.current_run_id
         event = GroupEventBase.build_group_event(
@@ -218,7 +288,7 @@ class Group:
                 for other_name, other_agent_as_tool in all_agents_as_tools.items():
                     if agent.name != other_name:
                         final_toolset.append(other_agent_as_tool)
-            
+
             elif self.mode == 'voting':
                 extra_context['mode_description'] = 'You are part of a voting panel. Perform the task and provide a definitive final answer.'
 
@@ -238,18 +308,25 @@ class Group:
     def _agent_to_tool(self, agent: Agent) -> Tool:
         '''Converts an Agent to a Tool that can be called by other agents.'''
         group_self = self
-        
+
         def agent_runner(**kwargs):
+            '''Run the wrapped member agent.
+
+            Args:
+                **kwargs: Tool arguments; ``input`` (or ``query``) carries the
+                    request for the member.
+
+            Returns:
+                str: The member agent's run id.
+            '''
             user_input = kwargs.get('input', kwargs.get('query', ''))
-            
-            # Emit agent call event
+
             group_self._emit('agent_call', {
                 'group_name': group_self.name,
                 'agent_name': agent.name,
                 'input': user_input
             })
-            
-            # Also emit runtime event for the broker
+
             orchify_broker.emit(RuntimeEvent(
                 agent_name=group_self.name,
                 agent_code=group_self.code,
@@ -262,35 +339,35 @@ class Group:
                     'input': user_input
                 }
             ))
-            
+
             run_id = agent.run(user_input, **kwargs)
             return run_id
-        
+
         agent_runner.__name__ = agent.name
         agent_runner.__doc__ = f'Call agent \'{agent.name}\' to perform a task.'
-        
+
         from inspect import Parameter, Signature
         params = [
             Parameter(name='input', kind=Parameter.POSITIONAL_OR_KEYWORD, annotation=str),
         ]
         agent_runner.__signature__ = Signature(params)
-        
+
         tool = Tool(func=agent_runner, name=agent.name, description=f'Agent: {agent.name}')
         return tool
 
     def as_tool(self, caller_agent: Optional[Agent] = None) -> Tool:
-        '''Wraps the entire Group instance into a Tool, with optional call chain tracking.
+        '''Wrap this group in a Tool so that agents can call it.
 
         Args:
-            caller_agent: If provided, call chain tracking is set up so that
-                when this tool is executed, the caller's call chain records the
-                Group invocation. Useful for nested group compositions.
-
-        Raises:
-            ValueError: If no manager agent is defined for this group.
+            caller_agent (Optional[Agent]): When given, the caller's call chain
+                records the group invocation, which is what allows nested group
+                compositions.
 
         Returns:
-            A Tool whose execute() runs this group.
+            Tool: A tool whose execution runs this group.
+
+        Raises:
+            ValueError: When the group has no manager agent.
         '''
         if not self.manager_agent:
             raise ValueError('A manager agent must be defined to expose the group as a tool.')
@@ -299,9 +376,21 @@ class Group:
         _caller = caller_agent
 
         def group_runner(**kwargs):
+            '''Run this group for a tool call.
+
+            Args:
+                **kwargs: Tool arguments; ``input`` (or ``query``) carries the
+                    request for the group.
+
+            Returns:
+                str: The group's run id.
+            '''
             user_input = kwargs.get('input', kwargs.get('query', ''))
 
             if _caller is not None:
+                path = _caller._outgoing_path(f'Group:{group_self.name}')
+                group_self._call_path = path
+
                 if _caller._call_chain is None:
                     _caller._call_chain = CallChain(root_caller=f'Agent:{_caller.name}')
 
@@ -323,7 +412,7 @@ class Group:
                         'callee': group_self.name,
                         'call_type': 'group',
                         'input': user_input,
-                        'call_depth': _caller._call_depth
+                        'call_depth': max(0, len(path) - 1)
                     }
                 ))
 
@@ -343,21 +432,20 @@ class Group:
         return tool
 
     def run(self, user_input: str, run_id: Optional[str] = None, **kwargs) -> str:
-        '''
-        Runs the entire Group to perform a task.
-        The execution flow depends on the group's mode.
+        '''Run the group on a task.
+
+        The execution flow depends on the group's ``mode``.
 
         Args:
-            user_input: The input task for the group.
-            run_id: Optional handle for this group execution.
-            **kwargs: Additional parameters.
+            user_input (str): The task for the group.
+            run_id (Optional[str]): Handle for this group execution;
+                ``turn_id=`` is accepted as a legacy alias.
+            **kwargs: Extra arguments forwarded to the members.
 
         Returns:
-            str: The group's run_id. Members run under their OWN run_ids, which
-            are collected in `last_run_ids` so any single member can still be
-            stopped, paused or approved on its own.
-
-        `turn_id=` is accepted as a legacy alias of run_id.
+            str: The group's run id. Members run under their own run ids, which
+            are collected in ``last_run_ids`` so that any single member can still
+            be stopped, paused or approved on its own.
         '''
         run_id = run_id or kwargs.pop('turn_id', None) or f'{self.name}#{self.code}_{safecode()}'
 
@@ -388,7 +476,7 @@ class Group:
         })
 
         self._emit('start', {'mode': self.mode, 'input': user_input, 'run_id': run_id})
-        
+
         try:
             if self.mode == 'voting':
                 self._run_voting(user_input, **kwargs)
@@ -426,22 +514,22 @@ class Group:
         return self._run_slot.locked()
 
     def wait(self, run_id: Optional[str] = None, timeout: Optional[float] = None) -> bool:
-        '''
-        Block until the group's run finishes.
+        '''Block until a group run finishes.
 
         Args:
-            run_id: The run to wait for; defaults to the group's last run.
-            timeout: Seconds to wait; defaults to ORCHIFY_RUN_TIMEOUT (None waits
-                     forever).
+            run_id (Optional[str]): Run to wait for; defaults to the group's last
+                run.
+            timeout (Optional[float]): Seconds to wait; defaults to
+                ``ORCHIFY_RUN_TIMEOUT``, where None waits forever.
 
         Returns:
-            bool: True when the run had finished by the deadline, False otherwise
-            (also False for a run id this process never started).
+            bool: True when the run had finished by the deadline, False
+            otherwise, including for a run id this process never started.
 
         Raises:
-            ValueError: when there is no run to wait for.
-            RuntimeError: when called from the orchestrator loop thread, where
-                          blocking would stall every other run.
+            ValueError: When there is no run to wait for.
+            RuntimeError: When called from the orchestrator loop thread, where
+                blocking would stall every other run.
         '''
         target = run_id or self.last_run_id
         if not target:
@@ -469,11 +557,12 @@ class Group:
         return ' '.join(str(text or '').split()).strip().lower()
 
     def _can_block_for_votes(self) -> bool:
-        '''True when this thread may block until members finish.
+        '''Check whether this thread may block until members finish.
 
-        `vote_timeout` of 0 (or less) keeps the old fire-and-forget behaviour, and
-        the orchestrator loop thread must never block: it is the thread that
-        executes the members.
+        Returns:
+            bool: False when ``vote_timeout`` is 0 or less (the older
+            fire-and-forget behaviour), and False on the orchestrator loop
+            thread, which executes the members and must never block.
         '''
         if self.vote_timeout is None or self.vote_timeout <= 0:
             return False
@@ -496,7 +585,6 @@ class Group:
         if not counts:
             return
 
-        # majority; ties go to the answer that reached its count first
         winner_key = max(counts, key=lambda k: counts[k])
         for vote in votes:
             if self._normalize_vote(vote.vote) == winner_key:
@@ -512,7 +600,7 @@ class Group:
     def _run_voting(self, user_input: str, **kwargs) -> str:
         '''Runs the group in a parallel, voting-based fashion.'''
         self._emit('step', {'action': 'Starting voting execution'})
-        
+
         for agent in self.agent_sequence:
             run_id = agent.run(user_input, **kwargs)
             self.last_run_ids.append(run_id)
@@ -534,7 +622,7 @@ class Group:
     def _run_competition(self, user_input: str, **kwargs) -> str:
         '''Runs the group in a parallel, competition-based fashion.'''
         self._emit('step', {'action': 'Starting competition execution'})
-        
+
         for agent in self.agent_sequence:
             run_id = agent.run(user_input, **kwargs)
             self.last_run_ids.append(run_id)
@@ -542,7 +630,7 @@ class Group:
                 'action': f'Agent \'{agent.name}\' started competing',
                 'run_id': run_id
             })
-        
+
         return self.last_run_ids[0] if self.last_run_ids else ''
 
     def _run_manager_based(self, user_input: str, **kwargs) -> str:
@@ -550,7 +638,7 @@ class Group:
         self._emit('step', {
             'action': f'Delegating to manager \'{self.manager_agent.name}\''
         })
-        
+
         run_id = self.manager_agent.run(user_input, **kwargs)
         self.last_run_ids.append(run_id)
         return run_id
@@ -574,25 +662,65 @@ class Group:
                 self._extra_context = {}
             self._extra_context.update(extra_context)
 
-    def call_agent(self, agent: Agent, user_input: str, **kwargs) -> str:
-        '''
-        Calls an agent within or outside this group.
-        
+    def _outgoing_path(self, callee_label: str) -> List[str]:
+        '''Return the call path of a new outgoing call, or refuse it.
+
+        Depth and cycle checks live in ``call_chain.plan_call``; a blocked call is
+        reported as a ``run:call:blocked`` event before the error is re-raised.
+
         Args:
-            agent: The target agent to call.
-            user_input: The input to send to the agent.
-            **kwargs: Additional parameters.
-            
+            callee_label (str): Label of the agent or group being called.
+
         Returns:
-            str: The run_id of the agent's execution.
+            List[str]: The outgoing call path.
+
+        Raises:
+            CallBlocked: When the call would exceed the depth cap or form a cycle.
         '''
+        try:
+            return plan_call(
+                f'Group:{self.name}', self._call_path, callee_label, self.max_call_depth
+            )
+        except CallBlocked as blocked:
+            orchify_broker.emit(RuntimeEvent(
+                agent_name=self.name,
+                agent_code=self.code,
+                run_id=self.current_run_id,
+                turn_id='',
+                event_type='run:call:blocked',
+                payload={
+                    'reason': blocked.reason,
+                    'caller': blocked.caller,
+                    'callee': blocked.callee,
+                    'call_path': list(blocked.path or []),
+                    'call_depth': max(0, len(blocked.path or []) - 1),
+                    'max_call_depth': blocked.limit,
+                }
+            ))
+            raise
+
+    def call_agent(self, agent: Agent, user_input: str, **kwargs) -> str:
+        '''Call an agent inside or outside this group.
+
+        Args:
+            agent (Agent): Target agent.
+            user_input (str): Input for the agent.
+            **kwargs: Extra arguments forwarded to the agent.
+
+        Returns:
+            str: The agent's run id.
+        '''
+        path = self._outgoing_path(f'Agent:{agent.name}')
+        agent._call_path = path
+        agent._call_depth = max(0, len(path) - 1)
+
         self._emit('agent_call', {
             'caller': self.name,
             'callee': agent.name,
             'call_type': 'agent',
             'input': user_input
         })
-        
+
         orchify_broker.emit(RuntimeEvent(
             agent_name=self.name,
             agent_code=self.code,
@@ -605,28 +733,30 @@ class Group:
                 'input': user_input
             }
         ))
-        
+
         return agent.run(user_input, **kwargs)
 
     def call_group(self, group: 'Group', user_input: str, **kwargs) -> str:
-        '''
-        Calls another group (nested group call).
-        
+        '''Call another group (a nested group call).
+
         Args:
-            group: The target group to call.
-            user_input: The input to send to the group.
-            **kwargs: Additional parameters.
-            
+            group (Group): Target group.
+            user_input (str): Input for the group.
+            **kwargs: Extra arguments forwarded to the group.
+
         Returns:
-            str: The run_id of the group's execution.
+            str: The group's run id.
         '''
+        path = self._outgoing_path(f'Group:{group.name}')
+        group._call_path = path
+
         self._emit('group_call', {
             'caller': self.name,
             'callee': group.name,
             'call_type': 'group',
             'input': user_input
         })
-        
+
         orchify_broker.emit(RuntimeEvent(
             agent_name=self.name,
             agent_code=self.code,
@@ -639,21 +769,19 @@ class Group:
                 'input': user_input
             }
         ))
-        
+
         return group.run(user_input, **kwargs)
 
     def get_call_chain(self) -> List[str]:
-        '''
-        Returns the call chain structure of this group.
-        
+        '''Return this group's call chain as indented labels.
+
         Returns:
-            List[str]: A list representing the call hierarchy.
+            List[str]: The call hierarchy, starting with ``Group:<name>``.
         '''
         chain = [f'Group:{self.name}']
         for agent in self.agent_sequence:
             if isinstance(agent, Agent):
                 chain.append(f'  -> Agent:{agent.name}')
-                # Check if agent has sub-calls
                 if hasattr(agent, '_call_chain') and agent._call_chain:
                     for frame in agent._call_chain.frames:
                         chain.append(f'    -> {frame.callee}')
@@ -662,16 +790,15 @@ class Group:
                 for item in sub_chain:
                     chain.append(f'  -> {item}')
         return chain
-    
+
     def get_full_call_chain(self) -> CallChain:
-        '''
-        Returns a CallChain object with all nested calls.
-        
+        '''Return this group's call chain including nested calls.
+
         Returns:
             CallChain: The complete call chain.
         '''
         chain = CallChain(root_caller=f'Group:{self.name}')
-        
+
         for agent in self.agent_sequence:
             if isinstance(agent, Agent):
                 chain.add_frame(
@@ -679,7 +806,6 @@ class Group:
                     callee=f'Agent:{agent.name}',
                     call_type='agent'
                 )
-                # Include agent's sub-calls if any
                 if hasattr(agent, '_call_chain') and agent._call_chain:
                     for frame in agent._call_chain.frames:
                         chain.frames.append(frame)
@@ -689,8 +815,7 @@ class Group:
                     callee=f'Group:{agent.name}',
                     call_type='group'
                 )
-                # Include sub-group's chain
                 sub_chain = agent.get_full_call_chain()
                 chain.frames.extend(sub_chain.frames)
-        
+
         return chain

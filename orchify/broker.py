@@ -1,4 +1,5 @@
 from orchify.event import BaseEvent, EventFeedback, FEEDBACK_TYPES
+from orchify.utils import get_logger
 import threading as td
 import asyncio
 import uuid
@@ -9,9 +10,9 @@ from fnmatch import fnmatchcase
 from typing import Any, Callable, Optional, Union, get_args
 
 
-# Default polling interval (seconds) used while a run is parked on a pause or an
-# approval gate. The waiter must wake up periodically to observe control:stop,
-# so it can never be a bare `await event.wait()`. Override with ORCHIFY_POLL_INTERVAL.
+logger = get_logger(__name__)
+
+
 def _read_poll_interval() -> float:
     import os
     raw = os.getenv('ORCHIFY_POLL_INTERVAL')
@@ -26,18 +27,22 @@ def _read_poll_interval() -> float:
 
 POLL_INTERVAL = _read_poll_interval()
 
-# How many finished runs the broker remembers so that a caller may still wait on
-# (or inspect) a run that already ended. Bounded to keep long sessions flat.
 _MAX_REMEMBERED_RUNS = 4096
 
 
 def make_turn_id(run_id: str, turn: int) -> str:
-    '''
-    Build the stable id of one LLM turn inside a run.
+    '''Build the stable id of one LLM turn inside a run.
 
-    A turn is a single request/response round trip: `run_id` identifies the
-    execution, `turn` is its 1-based index. The resulting id is step-scoped and
-    resolves back to the run through Broker.run_id_of_turn().
+    A turn is a single request/response round trip: ``run_id`` identifies the
+    execution and ``turn`` is its 1-based index. The resulting id is step-scoped
+    and resolves back to the run through ``Broker.run_id_of_turn()``.
+
+    Args:
+        run_id (str): Run the turn belongs to.
+        turn (int): 1-based index of the turn inside the run.
+
+    Returns:
+        str: The turn id.
     '''
     return f'{run_id}#{turn}'
 
@@ -47,8 +52,7 @@ class ApprovalTimeout(Exception):
 
 
 class RunStopped(Exception):
-    '''
-    Raised by wait_approval() when the run is asked to stop while parked.
+    '''Raised by ``wait_approval()`` when the run is asked to stop while parked.
 
     The approval is resolved as a rejection first, so a stopped run can never
     leave a live entry behind in the pool.
@@ -57,18 +61,37 @@ class RunStopped(Exception):
 
 @dataclass
 class PendingApproval:
-    '''
-    One manual-confirmation request parked in the broker's approval pool.
+    '''One manual-confirmation request parked in the broker's approval pool.
 
-    Created by Broker.request_approval(); resolved through
-    Broker.resolve_approval() (or the approve()/reject() sugar). A resolved
-    entry stays in the pool so late readers can inspect the decision, and is
-    dropped by release_approval() / finish_task().
+    Created by ``Broker.request_approval()`` (or ``ask_question()``) and resolved
+    through ``Broker.resolve_approval()`` (or the ``approve()``/``reject()``/
+    ``answer_approval()`` sugar). A resolved entry stays in the pool so late
+    readers can inspect the decision, and is dropped by ``release_approval()`` or
+    ``finish_task()``.
 
-    `run_id` is the execution that asked (see the module docstring of
-    orchify.agent for the run/turn model); `turn_id` is the single LLM turn
+    ``run_id`` is the execution that asked; ``turn_id`` is the single LLM turn
     inside it that the request belongs to.
+
+    Attributes:
+        approval_id (str): Generated id (``a`` plus ten hex characters).
+        run_id (str): Run that parked on this request.
+        agent_name (str): Agent that asked.
+        agent_code (str): Code of that agent.
+        turn_id (str): LLM turn the request belongs to.
+        kind (str): ``'tool'`` for a tool gate, ``'question'`` for an open question.
+        tool_id (str): Model-assigned tool call id, when the request is a tool.
+        tool_name (str): Name of the tool being confirmed.
+        args (dict): Arguments the tool would be called with.
+        step (int): Agent step that parked.
+        timeout (Optional[float]): Seconds the waiter may park; None waits forever.
+        created_at (float): ``time.time()`` when the entry was created.
+        resolved (bool): True once a decision or answer arrived.
+        approved (Optional[bool]): The decision; None while unresolved.
+        reason (str): Rejection reason or timeout explanation.
+        timed_out (bool): True when nobody answered before ``timeout``.
+        answer (str): Free-text answer of a ``kind='question'`` entry.
     '''
+
     approval_id: str
     run_id: str
     agent_name: str = ''
@@ -85,6 +108,7 @@ class PendingApproval:
     approved: Optional[bool] = None
     reason: str = ''
     timed_out: bool = False
+    answer: str = ''
 
     def __post_init__(self):
         if self.args is None:
@@ -108,8 +132,24 @@ class PendingApproval:
                 f"tool={self.tool_name!r} run={self.run_id!r} {state}>")
 
 
-
 class HookBinding:
+    '''One registered hook: a callable plus its match rules.
+
+    Returned by ``Broker.register_hook()`` and ``Broker.hook()``; pass it to
+    ``Broker.remove_binding()`` to dispose exactly this binding.
+
+    Attributes:
+        func (Callable): Called with each matching event.
+        event_type (list[str]): Event globs the hook listens for.
+        turn_id (Optional[str]): Legacy alias of ``run_id``.
+        mode (str): ``'normal'``, ``'once'`` or ``'agent'``.
+        count (int): How many events the hook has received.
+        disposed (bool): True once the binding is retired.
+        agent_name (Optional[str]): Only fire for this agent.
+        match (Optional[Callable]): Extra predicate over the event.
+        owner (str): Owner id (usually a plugin) used by ``remove_hooks()``.
+    '''
+
     __slots__ = ('func', 'event_type', 'run_id', 'mode', 'count', 'disposed', 'agent_name', 'match', 'owner')
 
     def __init__(
@@ -143,6 +183,19 @@ class HookBinding:
 
 
 class Broker:
+    '''Shared registry for runs, hooks, feedback and approvals.
+
+    A single ``orchify_broker`` instance is created at import time and used by
+    every Agent, Group and plugin: agents register their run in it, hooks observe
+    the events it carries, plugins push control feedback through it, and callers
+    park on its approval pool. All public methods are thread-safe.
+
+    Attributes:
+        hooks (list[HookBinding]): Registered hook bindings.
+        runs (dict[str, Any]): Active runs, keyed by run id.
+        run_contexts (dict[str, dict]): Context dict of every active run.
+    '''
+
     def __init__(self):
         self.hooks: list[HookBinding] = []
         self.runs: dict[str, Any] = {}
@@ -154,8 +207,6 @@ class Broker:
         self._pause_loops: dict[str, Any] = {}
         self._pause_lock = td.Lock()
 
-        # turn_id -> run_id, so a caller holding a single turn can still address
-        # the run it belongs to. Populated by register_turn().
         self._turn_index: dict[str, str] = {}
         self._turn_lock = td.Lock()
 
@@ -166,20 +217,16 @@ class Broker:
 
         self._emit_lock = td.RLock()
 
-        # run_id -> threading.Event, set by finish_task(). This lets a plain
-        # caller thread block on a run (`wait_run`) instead of busy-waiting on
-        # `runs`. Finished entries are kept (bounded) so waiting on a run that
-        # already ended still returns True.
         self._run_done: dict[str, td.Event] = {}
         self._run_done_lock = td.Lock()
 
-    # ---------- emit ----------
 
     def _execute_hook(self, func: Callable, event: BaseEvent):
         try: func(event)
         except Exception as e:
             name = getattr(func, '__name__', None) or type(func).__name__
-            print(f"Error executing hook '{name}' for event '{event.event_type}': {e}")
+            logger.error("Error executing hook '%s' for event '%s': %s",
+                         name, event.event_type, e)
 
     def _matches(self, binding: HookBinding, event: BaseEvent) -> bool:
         if binding.run_id is not None and event.run_id != binding.run_id:
@@ -193,20 +240,24 @@ class Broker:
         return True
 
     def emit(self, event: BaseEvent) -> None:
-        '''
-        Deliver `event` to every matching hook.
+        '''Deliver an event to every matching hook.
 
-        Hook *selection* and bookkeeping (`count`, `once` disposal, pruning of
-        disposed/agent bindings) happen under `_emit_lock`; the hook callables
-        themselves run AFTER the lock is released, so a slow hook can no longer
-        stall hook registration or another run's emit() bookkeeping. Hooks for
-        one event still run in registration order, on the emitting thread.
+        Hook selection and bookkeeping (``count``, ``once`` disposal, pruning of
+        disposed and agent-scoped bindings) happen under ``_emit_lock``; the hook
+        callables themselves run after the lock is released, so a slow hook can no
+        longer stall hook registration or another run's bookkeeping. Hooks for one
+        event still run in registration order, on the emitting thread.
+
+        Args:
+            event (BaseEvent): The event to deliver.
+
+        Raises:
+            TypeError: When ``event`` is not a ``BaseEvent``.
         '''
         if not isinstance(event, BaseEvent):
             raise TypeError(f'emit() requires a BaseEvent, got {type(event)}')
 
         with self._emit_lock:
-            # expose the run context to hooks via event metadata
             enabled_plugins = None
             if event.run_id and event.run_id in self.run_contexts:
                 ctx = self.run_contexts[event.run_id]
@@ -217,7 +268,6 @@ class Broker:
             for b in self.hooks:
                 if b.disposed or not self._matches(b, event):
                     continue
-                # filter by enabled plugins: skip hooks owned by disabled plugins
                 if enabled_plugins is not None and b.owner and b.owner not in enabled_plugins:
                     continue
                 candidates.append(b)
@@ -233,11 +283,9 @@ class Broker:
                 if not b.disposed and not (is_finish and b.mode == 'agent' and b.run_id == event.run_id)
             ]
 
-        # Run the hooks outside the lock (candidates were snapshotted inside it).
         for binding in candidates:
             self._execute_hook(binding.func, event)
 
-    # ---------- registration API ----------
 
     def register_hook(
         self,
@@ -250,11 +298,22 @@ class Broker:
         owner: str = '',
         turn_id: Optional[str] = None,
     ) -> HookBinding:
-        '''
-        Bind a hook to events. `run_id` restricts it to one execution; hooks are
-        run-scoped (mode 'agent' hooks are disposed when that run finishes).
-        `turn_id` is accepted as a deprecated alias of `run_id` - it used to name
-        the run, and still resolves the same way.
+        '''Bind a hook to events.
+
+        Args:
+            event_type (Union[str, List[str], Tuple[str, ...], Set[str]]): Event glob
+                or globs to listen for.
+            hook (Callable): Called with each matching event.
+            run_id (Optional[str]): Restrict the hook to one execution; a hook bound
+                to a run is disposed when that run finishes.
+            mode (str): ``'normal'``, ``'once'`` or ``'agent'``.
+            agent_name (Optional[str]): Only fire for events of this agent.
+            match (Optional[Callable]): Extra predicate over the event.
+            owner (str): Owner id, used by ``remove_hooks()``.
+            turn_id (Optional[str]): Deprecated alias of ``run_id``.
+
+        Returns:
+            HookBinding: The binding, which can be passed to ``remove_binding()``.
         '''
         if run_id is None:
             run_id = turn_id
@@ -273,12 +332,39 @@ class Broker:
         return binding
 
     def remove_hooks(self, owner: str) -> int:
-        '''Dispose and remove every hook binding owned by `owner` (typically a plugin).
-        Returns the number of removed bindings.'''
+        '''Dispose and remove every hook binding of one owner.
+
+        Args:
+            owner (str): Owner id, typically a plugin name.
+
+        Returns:
+            int: Number of bindings removed.
+        '''
         with self._emit_lock:
             kept = [b for b in self.hooks if b.owner != owner]
             removed = len(self.hooks) - len(kept)
             self.hooks = kept
+        return removed
+
+    def remove_binding(self, binding: HookBinding) -> bool:
+        '''Dispose and remove one hook binding.
+
+        ``remove_hooks()`` is owner-based and would remove every binding of that
+        owner; this targets the exact binding a caller holds, which is what
+        ``OrchifyManager.close()`` uses to detach its global tap.
+
+        Args:
+            binding (HookBinding): The binding returned by ``register_hook()``.
+
+        Returns:
+            bool: True when the binding was present and removed.
+        '''
+        with self._emit_lock:
+            removed = False
+            if binding in self.hooks:
+                self.hooks.remove(binding)
+                removed = True
+        binding.disposed = True
         return removed
 
     def hook(
@@ -292,15 +378,35 @@ class Broker:
         owner: str = '',
         turn_id: Optional[str] = None,
     ) -> Callable:
-        '''Decorator registering a hook. `event_type` may be a single string or a
-        list/tuple/set of strings; the hook fires for any of them. `turn_id` is a
-        deprecated alias of `run_id`.'''
+        '''Decorator registering a hook.
+
+        Args:
+            event_type (Union[str, List[str], Tuple[str, ...], Set[str]]): Event glob
+                or globs; the hook fires for any of them.
+            run_id (Optional[str]): Restrict the hook to one execution.
+            mode (str): ``'normal'``, ``'once'`` or ``'agent'``.
+            once (bool): Shorthand for ``mode='once'``.
+            agent_name (Optional[str]): Only fire for events of this agent.
+            match (Optional[Callable]): Extra predicate over the event.
+            owner (str): Owner id, used by ``remove_hooks()``.
+            turn_id (Optional[str]): Deprecated alias of ``run_id``.
+
+        Returns:
+            Callable: A decorator that registers the function and returns it.
+        '''
         def decorator(func: Callable) -> Callable:
+            '''Register ``func`` and return it unchanged.
+
+            Args:
+                func (Callable): The hook implementation.
+
+            Returns:
+                Callable: ``func``, unchanged.
+            '''
             return self.register_hook(event_type, func, run_id=run_id, mode='once' if once else mode,
                                       agent_name=agent_name, match=match, owner=owner, turn_id=turn_id)
         return decorator
 
-    # ---------- plugin event factory ----------
 
     def event(
         self,
@@ -315,6 +421,22 @@ class Broker:
         source: str = 'plugin',
         metadata: dict = None,
     ) -> BaseEvent:
+        '''Build an event on behalf of a plugin.
+
+        Args:
+            event_type (str): Event type to emit.
+            agent_name (str): Name of the acting agent.
+            agent_code (str): Code of the acting agent.
+            turn_id (str): LLM turn the event belongs to.
+            turn (int): 1-based step index.
+            payload (Optional[dict]): Event payload.
+            run_id (str): Run the event belongs to.
+            source (str): Emitter label; defaults to ``'plugin'``.
+            metadata (Optional[dict]): Extra metadata carried by the event.
+
+        Returns:
+            BaseEvent: The event, ready to pass to ``emit()``.
+        '''
         return BaseEvent(
             agent_name=agent_name,
             agent_code=agent_code,
@@ -328,15 +450,23 @@ class Broker:
         )
 
     def get_run_context(self, run_id: str) -> Optional[dict]:
+        '''Return the context dict of a run.
+
+        Args:
+            run_id (str): The run id.
+
+        Returns:
+            Optional[dict]: The context of that run, or None when it is unknown.
+        '''
         return self.run_contexts.get(run_id)
 
-    # ---------- run / turn identity ----------
 
     def register_turn(self, turn_id: str, run_id: str) -> None:
-        '''
-        Record that `turn_id` (one LLM turn) belongs to `run_id` (one
-        execution), so feedback addressed at a single turn can still find the
-        run to deliver it to.
+        '''Record which run one LLM turn belongs to.
+
+        Args:
+            turn_id (str): The turn id (see ``make_turn_id``).
+            run_id (str): The run that turn belongs to.
         '''
         if not turn_id or not run_id:
             return
@@ -360,7 +490,6 @@ class Broker:
         '''run_ids of every execution currently registered.'''
         return list(self.run_contexts.keys())
 
-    # ---------- feedback (reverse control channel) ----------
 
     def feedback(
         self,
@@ -371,34 +500,42 @@ class Broker:
         task_name: Optional[str] = None,
         payload: dict = None,
     ) -> bool:
-        '''
-        Push feedback from a hook/plugin back into a running agent task.
+        '''Push feedback from a hook or plugin into a running task.
 
-        Target the run with `run_id` - the unique handle of one execution
-        (returned by Agent.run / Group.run, and carried as `event.run_id`).
-        `turn_id` addresses one LLM turn inside a run and resolves to its run;
-        `task_name` is a deprecated alias of `run_id`. Returns False if the
-        target run is not active, True once queued.
+        Target the run with ``run_id`` (the unique handle of one execution, returned
+        by ``Agent.run``/``Group.run`` and carried as ``event.run_id``). ``turn_id``
+        addresses one LLM turn inside a run and resolves to its run; ``task_name`` is
+        a deprecated alias of ``run_id``.
 
         Supported types:
-          - 'control:stop':           abort the run at the next checkpoint.
-          - 'control:pause':          suspend the run until 'control:resume'.
-          - 'control:resume':         wake a paused run.
-          - 'control:retry':          payload={'kwargs': {...}, 'max_retries': n}
-                                      re-issue the current request on failure with
-                                      the given request overrides.
-          - 'control:override_answer': payload={'content': str} answers directly,
-                                      skipping the LLM call for the next request.
-          - 'control:deny_tool':      payload={'tool_id'|'tool_name', 'reason'} blocks
-                                      the tool call and feeds the reason back as result.
-          - 'control:inject_tool_result': payload={'tool_id'|'tool_name', 'result'}
-                                      replaces a pending tool execution with the
-                                      given result.
-          - 'control:update_messages': payload={'op': 'append'|'truncate'|'replace',
-                                      'messages': [...], 'keep': n} mutates the
-                                      conversation history at the next checkpoint.
-          - 'control:switch_model':   payload={'model': str} overrides the model
-                                      for the next request.
+
+        * ``'control:stop'``: abort the run at the next checkpoint.
+        * ``'control:pause'``: suspend the run until ``'control:resume'``.
+        * ``'control:resume'``: wake a paused run.
+        * ``'control:retry'``: re-issue the current request after a failure with
+          ``payload={'kwargs': {...}, 'max_retries': n}``.
+        * ``'control:override_answer'``: answer directly with
+          ``payload={'content': str}``, skipping the next LLM call.
+        * ``'control:deny_tool'``: block a tool call and feed the reason back as its
+          result, with ``payload={'tool_id'|'tool_name', 'reason'}``.
+        * ``'control:inject_tool_result'``: replace a pending tool execution with
+          ``payload={'tool_id'|'tool_name', 'result'}``.
+        * ``'control:update_messages'``: mutate the conversation history at the next
+          checkpoint with ``payload={'op': 'append'|'truncate'|'replace',
+          'messages': [...], 'keep': n}``.
+        * ``'control:switch_model'``: override the model for the next request with
+          ``payload={'model': str}``.
+
+        Args:
+            ftype (str): One of the control types above.
+            run_id (Optional[str]): Target run.
+            turn_id (Optional[str]): Target turn, resolved to its run.
+            task_name (Optional[str]): Deprecated alias of ``run_id``.
+            payload (Optional[dict]): Type-specific data.
+
+        Returns:
+            bool: True once the message was queued, False when the target run is not
+            active.
         '''
         if ftype not in get_args(FEEDBACK_TYPES):
             raise ValueError(f"Invalid feedback type: '{ftype}'")
@@ -413,8 +550,6 @@ class Broker:
         if ftype == 'control:resume':
             if self._resume_run(target):
                 return True
-            # No waiter armed yet: the resume raced ahead of the park. Queue it as
-            # feedback so wait_resume() observes it the moment it parks.
             fb = EventFeedback(ftype='control:resume', payload=payload)
             with self._feedback_lock:
                 self._feedback.setdefault(target, deque()).append(fb)
@@ -426,9 +561,15 @@ class Broker:
         return True
 
     def drain_feedback(self, run_id: str, types: Optional[set] = None) -> list:
-        '''
-        Pop queued feedback for a run. If `types` is given, only items with an
-        ftype in that set are consumed; the rest stay queued for later checkpoints.
+        '''Pop queued feedback for a run.
+
+        Args:
+            run_id (str): The run id.
+            types (Optional[set]): When given, only items whose ``ftype`` is in the
+                set are consumed; the rest stay queued for later checkpoints.
+
+        Returns:
+            list: The consumed ``EventFeedback`` items.
         '''
         task_name = run_id
         with self._feedback_lock:
@@ -453,10 +594,17 @@ class Broker:
             return out
 
     def pop_feedback(self, run_id: str, types: Optional[set] = None) -> Optional[EventFeedback]:
-        '''Pop only the first queued feedback item whose ftype is in `types`.
+        '''Pop the first queued feedback item of the given types.
 
-        Unlike drain_feedback() this consumes at most one item and leaves every
+        Unlike ``drain_feedback()`` this consumes at most one item and leaves every
         other type queued, which is what a mid-stream checkpoint wants.
+
+        Args:
+            run_id (str): The run id.
+            types (Optional[set]): Accepted ``ftype`` values; None accepts any.
+
+        Returns:
+            Optional[EventFeedback]: The popped item, or None when none matched.
         '''
         task_name = run_id
         with self._feedback_lock:
@@ -472,12 +620,17 @@ class Broker:
             return None
 
     def arm_resume(self, run_id: str) -> bool:
-        '''
-        Pre-register the pause waiter for a run.
+        '''Pre-register the pause waiter for a run.
 
-        Call this BEFORE emitting 'run:paused' so that a 'control:resume' sent in
-        reaction to that event finds a waiter instead of racing past it (the
-        original lost-resume bug). Returns False when the run is already armed.
+        Call this before emitting ``run:paused`` so that a ``control:resume`` sent in
+        reaction to that event finds a waiter instead of racing past it (the original
+        lost-resume bug).
+
+        Args:
+            run_id (str): The run about to be parked.
+
+        Returns:
+            bool: True when a waiter was armed; False when one was already armed.
         '''
         loop = asyncio.get_running_loop()
         with self._pause_lock:
@@ -488,20 +641,23 @@ class Broker:
         return True
 
     async def wait_resume(self, run_id: str, timeout: Optional[float] = None) -> str:
-        '''
-        Park the current run until a 'control:resume' feedback arrives for it.
+        '''Park the current run until a ``control:resume`` arrives for it.
 
-        Used by the agent to suspend between steps (human-in-the-loop approval).
-        The waiter must already have been armed by arm_resume() so that a resume
-        arriving between the 'run:paused' event and this call is not lost.
+        Used by the agent to suspend between steps (human-in-the-loop). The waiter
+        must already have been armed by ``arm_resume()``, so a resume arriving
+        between the ``run:paused`` event and this call is not lost.
+
+        Args:
+            run_id (str): The parked run.
+            timeout (Optional[float]): Seconds to park; None waits until a decision
+                or a stop arrives.
 
         Returns:
-            'resumed'  - woken by control:resume.
-            'stopped'  - a control:stop arrived while parked.
-            'timeout'  - `timeout` seconds elapsed without a decision.
-
-        A timeout does NOT silently continue the run: the caller decides what
-        the run's final status is, so a paused task can never hang forever.
+            str: ``'resumed'`` when woken by ``control:resume``, ``'stopped'`` when a
+            ``control:stop`` arrived while parked, ``'timeout'`` when ``timeout``
+            elapsed without a decision. A timeout does not silently continue the run:
+            the caller decides the run's final status, so a paused task can never
+            hang forever.
         '''
         loop = asyncio.get_running_loop()
         with self._pause_lock:
@@ -513,7 +669,6 @@ class Broker:
         deadline = (time.monotonic() + float(timeout)) if timeout else None
         try:
             while True:
-                # a resume that raced ahead of the park is queued as feedback
                 if self.pop_feedback(run_id, {'control:resume'}) is not None:
                     return 'resumed'
                 if self.pop_feedback(run_id, {'control:stop'}) is not None:
@@ -538,7 +693,6 @@ class Broker:
         loop.call_soon_threadsafe(event.set)
         return True
 
-    # ---------- approval pool (manual confirmation) ----------
 
     def request_approval(
         self,
@@ -555,13 +709,28 @@ class Broker:
         agent_code: str = '',
         step: int = 1,
     ) -> PendingApproval:
-        '''
-        Register a manual-confirmation request in the approval pool.
+        '''Register a manual-confirmation request in the approval pool.
 
-        This is the synchronous half of the gate: the agent creates the entry,
-        emits 'run:approval:required' so a UI/hook can render it, then parks.
-        The decision comes back through resolve_approval() / approve() /
-        reject(), which may be called from any thread.
+        This is the synchronous half of the gate: the agent creates the entry, emits
+        ``run:approval:required`` so a UI or hook can render it, then parks. The
+        decision comes back through ``resolve_approval()``, ``approve()`` or
+        ``reject()``, which may be called from any thread.
+
+        Args:
+            run_id (str): Run that is parking.
+            kind (str): ``'tool'`` or ``'question'``.
+            tool_id (str): Model-assigned tool call id.
+            tool_name (str): Name of the tool being confirmed.
+            args (Optional[dict]): Arguments the tool would be called with.
+            approval_id (Optional[str]): Explicit id; generated when omitted.
+            timeout (Optional[float]): Seconds the waiter may park.
+            turn_id (str): LLM turn the request belongs to.
+            agent_name (str): Agent that asked.
+            agent_code (str): Code of that agent.
+            step (int): Agent step that parked.
+
+        Returns:
+            PendingApproval: The registered entry.
         '''
         approval = PendingApproval(
             approval_id=approval_id or f'a{uuid.uuid4().hex[:10]}',
@@ -581,6 +750,14 @@ class Broker:
         return approval
 
     def get_approval(self, approval_id: str) -> Optional[PendingApproval]:
+        '''Return an approval entry by id.
+
+        Args:
+            approval_id (str): The id returned by ``request_approval()``.
+
+        Returns:
+            Optional[PendingApproval]: The entry, or None when unknown or released.
+        '''
         with self._approval_lock:
             return self._approvals.get(approval_id)
 
@@ -610,12 +787,20 @@ class Broker:
         timed_out: bool = False,
         remove: bool = False,
     ) -> bool:
-        '''
-        Deliver a decision for a pending approval.
+        '''Deliver a decision for a pending approval.
 
-        Returns False when the id is unknown or was already decided, so a UI can
-        distinguish "nothing to do" from "decision accepted". Wakes the parked
-        task, which then proceeds (approved=False denies the action instead).
+        Args:
+            approval_id (str): The entry to resolve.
+            approved (bool): True to allow the action, False to deny it.
+            reason (str): Explanation fed back to the agent.
+            timed_out (bool): Mark the decision as a timeout rather than a refusal.
+            remove (bool): Drop the entry from the pool once resolved.
+
+        Returns:
+            bool: True when the decision was accepted; False when the id is unknown
+            or was already decided, which lets a UI tell "nothing to do" from
+            "decision accepted". Wakes the parked task, which then proceeds, or is
+            denied when ``approved`` is False.
         '''
         with self._approval_lock:
             approval = self._approvals.get(approval_id)
@@ -637,6 +822,90 @@ class Broker:
         '''Convenience wrapper: accept a pending approval.'''
         return self.resolve_approval(approval_id, True, reason=reason, remove=remove)
 
+    def ask_question(
+        self,
+        run_id: str,
+        question: str,
+        *,
+        tool_id: str = '',
+        tool_name: str = 'ask_user',
+        timeout: Optional[float] = None,
+        turn_id: str = '',
+        agent_name: str = '',
+        agent_code: str = '',
+        step: int = 1,
+    ) -> PendingApproval:
+        '''Register an open question (``kind='question'``) in the same pool.
+
+        Modelled as a ``PendingApproval`` so that waiting, timeouts, stop-while-parked
+        and the manager views are shared with tool approvals; the answer itself is
+        free text and lands in ``PendingApproval.answer`` through
+        ``answer_approval()``.
+
+        Args:
+            run_id (str): Run that is asking.
+            question (str): The question put to the human operator.
+            tool_id (str): Model-assigned tool call id.
+            tool_name (str): Name of the question tool.
+            timeout (Optional[float]): Seconds the waiter may park.
+            turn_id (str): LLM turn the question belongs to.
+            agent_name (str): Agent that asked.
+            agent_code (str): Code of that agent.
+            step (int): Agent step that parked.
+
+        Returns:
+            PendingApproval: The registered entry.
+        '''
+        return self.request_approval(
+            run_id,
+            kind='question',
+            tool_id=tool_id,
+            tool_name=tool_name,
+            args={'question': str(question)},
+            timeout=timeout,
+            turn_id=turn_id,
+            agent_name=agent_name,
+            agent_code=agent_code,
+            step=step,
+        )
+
+    def answer_approval(self, approval_id: str, answer: str, *, remove: bool = False) -> bool:
+        '''Deliver a free-text answer to a pending question.
+
+        Args:
+            approval_id (str): The question entry to answer.
+            answer (str): The free-text answer.
+            remove (bool): Drop the entry from the pool once answered.
+
+        Returns:
+            bool: True when the answer was accepted; False when the id is unknown or
+            the entry was already resolved, so a UI can tell "already answered" from
+            "answer accepted".
+        '''
+        with self._approval_lock:
+            approval = self._approvals.get(approval_id)
+            if approval is None or approval.resolved:
+                return False
+            approval.resolved = True
+            approval.approved = True
+            approval.answer = '' if answer is None else str(answer)
+            approval.reason = ''
+            approval.timed_out = False
+            event = self._approval_events.pop(approval_id, None)
+            loop = self._approval_loops.pop(approval_id, None)
+            if remove:
+                self._approvals.pop(approval_id, None)
+        if event is not None and loop is not None:
+            loop.call_soon_threadsafe(event.set)
+        return True
+
+    def pending_questions(self, run_id: Optional[str] = None) -> list:
+        '''Unresolved kind='question' entries, optionally filtered to one run.'''
+        with self._approval_lock:
+            return [a for a in self._approvals.values()
+                    if not a.resolved and a.kind == 'question'
+                    and (run_id is None or a.run_id == run_id)]
+
     def reject(self, approval_id: str, *, reason: str = 'denied', remove: bool = False) -> bool:
         '''Convenience wrapper: deny a pending approval.'''
         return self.resolve_approval(approval_id, False, reason=reason, remove=remove)
@@ -652,14 +921,25 @@ class Broker:
         timeout: Optional[float] = None,
         run_id: Optional[str] = None,
     ) -> PendingApproval:
-        '''
-        Park the current run until the approval is resolved.
+        '''Park the current run until the approval is resolved.
 
-        Registers this run's approval event BEFORE returning to the caller's
-        next await point, so a decision delivered immediately after the
-        'run:approval:required' event is never lost. Raises ApprovalTimeout
-        once `timeout` seconds elapse without a decision, and re-raises
-        KeyError if the entry was released out from under us.
+        Registers this run's approval event before returning to the caller's next
+        await point, so a decision delivered immediately after the
+        ``run:approval:required`` event is never lost.
+
+        Args:
+            approval_id (str): The entry to wait for.
+            timeout (Optional[float]): Seconds to wait; None waits forever.
+            run_id (Optional[str]): Run that is parking, so a ``control:stop`` can
+                interrupt the wait.
+
+        Returns:
+            PendingApproval: The resolved entry.
+
+        Raises:
+            ApprovalTimeout: When ``timeout`` seconds elapse without a decision.
+            RunStopped: When the run is asked to stop while parked.
+            KeyError: When the entry was released out from under the caller.
         '''
         loop = asyncio.get_running_loop()
         with self._approval_lock:
@@ -682,9 +962,6 @@ class Broker:
                 if approval.resolved:
                     return approval
                 if run_id and self.pop_feedback(run_id, {'control:stop'}) is not None:
-                    # A stop while parked resolves the request as a rejection and
-                    # surfaces the stop so the caller can end the run instead of
-                    # silently swallowing it.
                     self.resolve_approval(approval_id, False, reason='run stopped')
                     raise RunStopped(f'Run stopped while awaiting approval {approval_id!r}.')
                 if deadline is not None and time.monotonic() >= deadline:
@@ -698,22 +975,35 @@ class Broker:
                     self._approval_events.pop(approval_id, None)
                     self._approval_loops.pop(approval_id, None)
 
-    # ---------- run tracking ----------
 
     def start_task(self, run_id: str, task: Any, context: Optional[dict] = None):
+        '''Register a run before it starts executing.
+
+        Args:
+            run_id (str): The run id.
+            task (Any): The asyncio task driving the run.
+            context (Optional[dict]): Run context (agent name/code, started_at,
+                enabled plugins and plugin config) exposed to hooks and plugins. The
+                key ``enabled_plugins`` filters which plugin-owned hooks may fire.
+        '''
         self.runs[run_id] = task
         if context is not None:
             self.run_contexts[run_id] = context
         with self._run_done_lock:
-            # The same run is registered twice (Agent.run before dispatching, and
-            # _async_thread_process once the coroutine starts). A waiter may
-            # already hold the current event, so keep it unless the previous run
-            # under this id had already finished.
             existing = self._run_done.get(run_id)
             if existing is None or existing.is_set():
                 self._run_done[run_id] = td.Event()
 
     def finish_task(self, run_id: str):
+        '''Retire a run and release everything it parked on.
+
+        Removes the run, its context and its turn index, drops its queued feedback,
+        wakes any pause waiter, and releases every approval of the run so a parked
+        approval can never leak past the end of the run.
+
+        Args:
+            run_id (str): The run id; unknown ids are ignored.
+        '''
         if run_id in self.runs:
             del self.runs[run_id]
         if run_id in self.run_contexts:
@@ -741,7 +1031,6 @@ class Broker:
             done = self._run_done.get(run_id)
             if done is not None:
                 done.set()
-            # keep the finished handles bounded, oldest already-set first
             if len(self._run_done) > _MAX_REMEMBERED_RUNS:
                 for rid in [r for r, ev in self._run_done.items() if ev.is_set()]:
                     if len(self._run_done) <= _MAX_REMEMBERED_RUNS:
@@ -758,20 +1047,24 @@ class Broker:
             return self._run_done.get(run_id)
 
     def wait_run(self, run_id: str, timeout: Optional[float] = None) -> bool:
-        '''
-        Block the CALLING thread until `run_id` finishes.
+        '''Block the calling thread until a run finishes.
 
-        Returns True when the run is finished (including one that had already
-        finished), False for an unknown run or on timeout. Must not be called
-        from the orchestrator loop thread (that thread has to stay free to
-        execute the run itself) - use `Agent.wait()` which checks this.
+        Must not be called from the orchestrator loop thread: that thread has to stay
+        free to execute the run itself. Use ``Agent.wait()``, which checks this.
+
+        Args:
+            run_id (str): The run id.
+            timeout (Optional[float]): Seconds to wait; None waits forever.
+
+        Returns:
+            bool: True when the run is finished (including one that had already
+            finished), False for an unknown run id or on timeout.
         '''
         with self._run_done_lock:
             event = self._run_done.get(run_id)
         if event is None:
             return False
         return event.wait(timeout)
-
 
 
 orchify_broker = Broker()

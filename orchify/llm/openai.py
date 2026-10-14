@@ -10,7 +10,6 @@ from orchify.env import req_key, req_url, req_model
 from orchify.backend import orchify_web_backend
 
 
-# Transient failures worth retrying when nothing has been streamed yet.
 RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 _MAX_RETRY_DELAY = 30.0
 
@@ -59,15 +58,39 @@ def _retry_delay(attempt: int, exc: Exception) -> float:
 
 
 class OpenAICompat(LLMInterface):
+    '''LLM backend for any OpenAI-compatible chat API.
+
+    Reads ``API_KEY`` (or ``OPENAI_API_KEY``), ``BASE_URL`` and ``MODEL_ID``
+    from the environment and streams ``/chat/completions`` responses, mapping
+    provider SSE chunks onto :class:`Chunk` and :class:`FinalStatus`.
+
+    Attributes:
+        api_key (str): Bearer token sent with each request.
+        base_url (str): API base URL.
+        url (str): Path appended to ``base_url`` (``/chat/completions``).
+    '''
+
     def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
+        '''Create the backend.
+
+        Args:
+            api_key (Optional[str]): API key; defaults to ``API_KEY`` (or
+                ``OPENAI_API_KEY``) from the environment.
+            base_url (Optional[str]): API root; defaults to ``BASE_URL`` from the
+                environment, then to 'https://api.openai.com/v1'.
+        '''
         super().__init__()
-        # resolved lazily so env vars set after import are honored
         self.api_key  = api_key if api_key is not None else req_key()
         self.base_url = base_url if base_url is not None else req_url('https://api.openai.com/v1')
         self.url = '/chat/completions'
 
     @property
     def full_url(self) -> str:
+        '''Return the configured chat-completions URL.
+
+        Returns:
+            str: ``base_url`` with ``/chat/completions`` appended once.
+        '''
         return f'{self.base_url}{self.url}'
 
     def _build_payload(
@@ -83,7 +106,6 @@ class OpenAICompat(LLMInterface):
         effort: Literal['minimal', 'low', 'medium', 'high', 'xhigh'],
         extra_data: Optional[dict],
     ) -> dict:
-        # Normalize common shorthand for thinking flags before provider handling
         if isinstance(thinking, bool):
             thinking = 'enabled' if thinking else 'disabled'
         elif thinking in ('disable', 'off', 'false'):
@@ -101,7 +123,6 @@ class OpenAICompat(LLMInterface):
         if tools:
             data['tools'] = tools
 
-        # OpenAI reasoning models do not support temperature / top_p
         is_openai_reasoning = model.startswith(('o1', 'o3'))
         if not is_openai_reasoning:
             data['temperature'] = temperature
@@ -129,7 +150,6 @@ class OpenAICompat(LLMInterface):
             ds_thinking_type = 'adaptive' if thinking == 'auto' else thinking
             data['thinking'] = {'type': ds_thinking_type}
         else:
-            # Fallback for other providers: only set if explicitly enabled/disabled
             if thinking in ('enabled', 'disabled'):
                 data['thinking'] = {'type': thinking}
 
@@ -139,17 +159,25 @@ class OpenAICompat(LLMInterface):
         return data
 
     async def _resilient_lines(self, url: str, headers: dict, data: dict) -> AsyncGenerator[str, None]:
-        '''
-        Stream response lines, retrying transient failures.
+        '''Stream response lines, retrying transient failures.
 
-        A retry is safe only while NOTHING has been streamed yet (the caller has
-        seen no partial content): connect errors, timeouts before the first line
-        and error statuses such as 429/503 all qualify. A connection that dies
-        mid-answer is raised as-is, because the caller has already consumed part
-        of the answer and a silent replay could duplicate output.
+        A retry is safe only while nothing has been streamed yet (the caller has
+        seen no partial content): connect errors, timeouts before the first line and
+        error statuses such as 429 or 503 all qualify. A connection that dies
+        mid-answer is raised as-is, because the caller already consumed part of the
+        answer and a silent replay could duplicate output.
 
-        ORCHIFY_LLM_MAX_RETRIES (default 2) and ORCHIFY_LLM_RETRY_BACKOFF
-        (default 0.5s, exponential) control this; a Retry-After header wins.
+        ``ORCHIFY_LLM_MAX_RETRIES`` (default 2) and ``ORCHIFY_LLM_RETRY_BACKOFF``
+        (default 0.5 seconds, exponential) control this; a ``Retry-After`` header
+        wins over the backoff.
+
+        Args:
+            url (str): Chat-completions URL.
+            headers (dict): Request headers.
+            data (dict): JSON request body.
+
+        Yields:
+            str: Non-empty response lines from the stream.
         '''
         attempt = 0
         while True:
@@ -330,7 +358,6 @@ class OpenAICompat(LLMInterface):
                 error_msg += f' | Response detail: {error_detail}'
             raise httpx.HTTPStatusError(error_msg, request=e.request, response=e.response) from e
 
-        # Yield the Final Response/Status
         yield Response(
             current_chunk=None,
             final_status=FinalStatus(

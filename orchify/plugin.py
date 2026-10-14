@@ -6,37 +6,49 @@ from typing import Callable, Optional, Any, List, Dict, Set, Union
 from orchify.tool import Tool
 from orchify.broker import orchify_broker
 from orchify.llm.base import scope_matches, Middleware
+from orchify.utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class Plugin:
+    '''Base class for Orchify plugins.
+
+    Subclass it, declare metadata as class attributes, then declare hooks and
+    tools in either style.
+
+    Declarative, collected automatically when the plugin is loaded::
+
+        @Plugin.hook('agent:finish', agent_name='Agent')
+        def answer(self, event): ...
+
+        @Plugin.tool('web_search', agent=agent)
+        def search(self, query: str) -> str: ...
+
+    Imperative, registered dynamically from ``on_load``::
+
+        def on_load(self):
+            @self.on('run:next')
+            def _(event): ...
+
+    The lifecycle hooks ``on_load`` and ``on_unload`` may be sync or async;
+    async ones run on the shared WebBackend loop. Everything the plugin
+    registered is removed automatically when it is unloaded.
+
+    Attributes:
+        name (str): Plugin id; defaults to the class name.
+        version (str): Free-form version string.
+        description (str): Human-readable summary.
+        dependencies (List[str]): Plugin names that must be loaded first.
+        tags (List[str]): Free-form tags.
+        events (List[str]): Event types the plugin is interested in.
+        scope (Any): Restricts the plugin's hooks and middleware to matching
+            agents: ``'*'`` (every agent), ``'agent'`` (any named agent),
+            ``'agent:name'`` (only that agent), a list of the above, or a
+            callable that receives the agent name and returns a truthy value
+            when it matches.
     '''
-    Base class for Orchify plugins.
 
-    Declare metadata as class attributes, then write hooks/tools in two styles:
-
-      显式声明式            -> 装饰器标记，方法保持普通方法，可继续被调用
-           @Plugin.hook('agent:finish', agent_name='Agent')
-           def answer(self, event): ...
-
-           @Plugin.tool('web_search', agent=agent)     # agent 给定时自动挂载
-           def search(self, query: str) -> str: ...
-
-      命令式（进阶）        -> 在 on_load 里动态注册
-           def on_load(self):
-               @self.on('run:next')
-               def _(e): ...
-
-    Lifecycle methods (on_load/on_unload) may be sync or async (async ones run
-    on the WebBackend loop). Everything the plugin registered is cleaned up
-    automatically on unload.
-
-    `scope` restricts the plugin's hooks and middleware to certain agents:
-      - '*' (default): every agent.
-      - 'agent':       any named agent.
-      - 'agent:name':  only the agent named `name`.
-      - list:          any of the above at once.
-      - callable(name): dynamic check on the agent name; return truthy to match.
-    '''
     name: str = ''
     version: str = '0.0.1'
     description: str = ''
@@ -46,6 +58,12 @@ class Plugin:
     scope: Union[str, List[str], Callable[[str], bool]] = '*'
 
     def __init__(self, broker=None):
+        '''Bind the plugin to a broker and initialise its per-instance state.
+
+        Args:
+            broker (Optional[Broker]): Broker the plugin hooks into and pushes
+                feedback through; defaults to the shared ``orchify_broker``.
+        '''
         self.broker = broker or orchify_broker
         self.loaded: bool = False
         self.state: Dict[str, Any] = {}
@@ -62,7 +80,6 @@ class Plugin:
         '''Stable plugin identifier used for ownership tracking (defaults to class name).'''
         return self.name or self.__class__.__name__
 
-    # ---------- scope ----------
 
     def matches(self, agent) -> bool:
         '''Whether this plugin's scope includes the given Agent (or agent name string).'''
@@ -77,18 +94,38 @@ class Plugin:
             return None
         return lambda event: scope_matches(self.scope, event.agent_name)
 
-    # ---------- declarative markers (class-level decorators) ----------
 
     @staticmethod
     def hook(event_type: Union[str, List[str]] = '*', *, run_id: Optional[str] = None,
              turn_id: Optional[str] = None,
              mode: str = 'normal', once: bool = False,
              agent_name: Optional[str] = None, match: Optional[Callable] = None) -> Callable:
-        '''Mark a method to be registered as a hook when the plugin loads.
-        `event_type` may be a single string or a list of strings. `run_id` binds
-        the hook to one execution (removed when that run finishes); `turn_id` is
-        a legacy alias.'''
+        '''Mark a method as a hook to register when the plugin loads.
+
+        Args:
+            event_type (Union[str, List[str]]): Event type or types to listen for.
+                Defaults to ``'*'`` (every event).
+            run_id (Optional[str]): Bind the hook to a single run; the hook is
+                removed when that run finishes.
+            turn_id (Optional[str]): Legacy alias of ``run_id``.
+            mode (str): ``'normal'``, ``'once'`` or ``'agent'`` (bound to one run).
+            once (bool): Shorthand for ``mode='once'``.
+            agent_name (Optional[str]): Only fire for events from this agent.
+            match (Optional[Callable]): Extra predicate receiving the event; the
+                hook runs only when it returns a truthy value.
+
+        Returns:
+            Callable: A decorator that records the method and returns it unchanged.
+        '''
         def decorator(func: Callable) -> Callable:
+            '''Record ``func`` as a plugin hook.
+
+            Args:
+                func (Callable): The hook implementation.
+
+            Returns:
+                Callable: ``func``, unchanged.
+            '''
             func.__plugin_hook__ = dict(
                 event_type=event_type, run_id=run_id, turn_id=turn_id,
                 mode='once' if once else mode, agent_name=agent_name, match=match,
@@ -98,20 +135,34 @@ class Plugin:
 
     @staticmethod
     def tool(name: Optional[str] = None, *, agent=None, **kwargs) -> Callable:
-        '''Mark a method to be collected as a Tool when the plugin loads.
+        '''Mark a method as a Tool to collect when the plugin loads.
 
-        `agent=` attaches the tool to that Agent immediately; otherwise use
-        `attach_tools(agent)` or `orchify_plugins.attach('name', agent)` later.
-        Remaining kwargs are forwarded to Tool(func=..., name=..., **kwargs).
+        Args:
+            name (Optional[str]): Tool name; defaults to the method name.
+            agent (Optional[Agent]): Attach the tool to this agent immediately.
+                Otherwise attach it later with ``attach_tools()`` or
+                ``orchify_plugins.attach('plugin_name', agent)``.
+            **kwargs: Forwarded to :class:`Tool` (description, parameters, cache,
+                cache_size, timeout, require_approval, ask_question).
+
+        Returns:
+            Callable: A decorator that records the method and returns it unchanged.
         '''
         def decorator(func: Callable) -> Callable:
+            '''Record ``func`` as a Tool of this plugin.
+
+            Args:
+                func (Callable): The tool implementation.
+
+            Returns:
+                Callable: ``func``, unchanged.
+            '''
             meta = getattr(func, '__plugin_tool__', {}) if hasattr(func, '__plugin_tool__') else {}
             meta.update(name=name, agent=agent, tool_kwargs=kwargs)
             func.__plugin_tool__ = meta
             return func
         return decorator
 
-    # ---------- auto-discovery ----------
 
     def _auto_register(self) -> None:
         pid = self.id
@@ -140,7 +191,6 @@ class Plugin:
                     self._attached_agents.add(agent)
                 continue
 
-    # ---------- lifecycle ----------
 
     def on_load(self) -> None:
         '''Additional imperative setup, called after declarative auto-registration.'''
@@ -156,14 +206,36 @@ class Plugin:
             return future.result()
         return func()
 
-    # ---------- imperative helpers (usable inside on_load) ----------
 
     def on(self, event_type: Union[str, List[str]] = '*', *, run_id: Optional[str] = None,
            turn_id: Optional[str] = None, mode: str = 'normal', once: bool = False,
            agent_name: Optional[str] = None, match: Optional[Callable] = None) -> Callable:
-        '''Register a hook tracked by this plugin (auto-removed on unload).
-        `event_type` may be a single string or a list of strings.'''
+        '''Register a hook tracked by this plugin.
+
+        Registered hooks are removed automatically when the plugin is unloaded.
+
+        Args:
+            event_type (Union[str, List[str]]): Event type or types to listen for.
+                Defaults to ``'*'``.
+            run_id (Optional[str]): Bind the hook to a single run.
+            turn_id (Optional[str]): Legacy alias of ``run_id``.
+            mode (str): ``'normal'``, ``'once'`` or ``'agent'``.
+            once (bool): Shorthand for ``mode='once'``.
+            agent_name (Optional[str]): Only fire for events from this agent.
+            match (Optional[Callable]): Extra predicate receiving the event.
+
+        Returns:
+            Callable: A decorator that registers the hook and returns it unchanged.
+        '''
         def decorator(func: Callable) -> Callable:
+            '''Register ``func`` as a hook owned by this plugin.
+
+            Args:
+                func (Callable): The hook implementation.
+
+            Returns:
+                Callable: ``func``, unchanged.
+            '''
             binding = self.broker.register_hook(
                 event_type, func,
                 run_id=run_id,
@@ -185,9 +257,18 @@ class Plugin:
     def feedback(self, ftype: str, *, run_id: Optional[str] = None,
                  turn_id: Optional[str] = None, task_name: Optional[str] = None,
                  payload: Optional[dict] = None) -> bool:
-        '''Convenience wrapper around broker.feedback() for the reverse control channel.
+        '''Queue a control message on the reverse channel.
 
-        Target the run with `run_id` (see Agent.run's return value).
+        Args:
+            ftype (str): Control type from ``FEEDBACK_TYPES``, e.g. ``'control:stop'``
+                or ``'control:resume'``.
+            run_id (Optional[str]): Target run id, as returned by ``Agent.run``.
+            turn_id (Optional[str]): Legacy alias of ``run_id``.
+            task_name (Optional[str]): Deprecated alias of ``run_id``.
+            payload (Optional[dict]): Control-specific data.
+
+        Returns:
+            bool: True when the broker accepted the message.
         '''
         return self.broker.feedback(ftype, run_id=run_id, turn_id=turn_id,
                                     task_name=task_name, payload=payload)
@@ -229,10 +310,18 @@ class Plugin:
         self._attached_agents.clear()
 
     def middleware(self, mw, llm=None) -> None:
-        '''Register an LLM middleware scoped to this plugin's `scope` (uses the
-        manager-provided llm or the attached agents' llm).
-        The middleware's `owner` attribute is set to this plugin's id so that
-        per-agent plugin filtering can skip it when the plugin is disabled.'''
+        '''Register an LLM middleware scoped to this plugin.
+
+        The middleware is installed on the given LLM (or on the plugin's attached
+        agents' LLM) with ``owner`` set to this plugin's id, so per-agent plugin
+        filtering skips it while the plugin is disabled.
+
+        Args:
+            mw (Union[Middleware, Callable]): Middleware instance, or a plain
+                ``(kwargs, next_request)`` async callable.
+            llm (Optional[LLMInterface]): LLM to register on; defaults to the
+                plugin's shared LLM.
+        '''
         if llm is None:
             llm = self._llm
         if not isinstance(mw, Middleware):
@@ -250,22 +339,22 @@ class Plugin:
 
     def log(self, msg: str) -> None:
         '''Namespaced logging with this plugin's id.'''
-        print(f'[{self.id}] {msg}', flush=True)
+        logger.info('[%s] %s', self.id, msg)
 
-    # ---------- plugin config ----------
 
     def get_config(self, key: str = None, run_id: str = None, task_name: str = None):
-        '''
-        Read plugin configuration from the broker run context.
+        '''Read this plugin's configuration from the active run.
 
         Args:
-            key: specific config key to retrieve. If None, returns the full
-                 config dict for this plugin.
-            run_id: the run to look up (see Agent.run). If None, attempts to
-                    find the currently active run for this plugin's agent.
-            task_name: deprecated alias of run_id.
+            key (str): Configuration key to read. When None, the full config dict
+                for this plugin is returned.
+            run_id (str): Run to look up, as returned by ``Agent.run``. When None,
+                the plugin's currently active run is used.
+            task_name (str): Deprecated alias of ``run_id``.
 
-        Returns the config value, or None if not found.
+        Returns:
+            Any: The requested value, the whole config dict, or None when no
+            configuration is available for the run.
         '''
         run_id = run_id or task_name
         if run_id is None:
@@ -290,7 +379,6 @@ class Plugin:
                 return run_id
         return None
 
-    # ---------- cleanup ----------
 
     def cleanup(self) -> None:
         '''Full teardown: lifecycle, hooks, tools. Called by the PluginManager.'''

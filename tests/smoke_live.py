@@ -1,9 +1,3 @@
-'''Live smoke test: one short real run through OpenAICompat.
-
-Verifies the streaming path end to end after the pause/approval changes:
-event ordering, answer content, usage accounting, and clean run:finish.
-Costs one tiny request against the model configured in .env.
-'''
 import sys
 import time
 import os

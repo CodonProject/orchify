@@ -6,21 +6,6 @@ import json
 import time
 
 
-# ---------------------------------------------------------------------------
-# Run / turn identity (see also broker.make_turn_id)
-#
-#   run_id  : one Agent.run()/Group.run() execution. Unique, stable, returned by
-#             run() and carried on EVERY event. This is what feedback targets.
-#   turn    : the 1-based LLM round trip inside a run (a "step").
-#   turn_id : one turn, formatted '<run_id>#<turn>'. Fine-grained label, e.g.
-#             for tracing a single request; resolvable back to its run via
-#             Broker.run_id_of_turn().
-#
-# So a run contains many turns. Feedback must address the run (run_id), never a
-# turn, because a turn ends as soon as its response is consumed.
-# ---------------------------------------------------------------------------
-
-
 EVENT_TYPES: TypeAlias = Literal[
     'agent:start',
     'agent:reason:step',
@@ -36,10 +21,14 @@ EVENT_TYPES: TypeAlias = Literal[
     'tool:call:finish',
     'run:start',
     'run:next',
+    'run:queued',
+    'run:dequeued',
     'run:paused',
     'run:resumed',
     'run:approval:required',
     'run:approval:resolved',
+    'run:budget:exceeded',
+    'run:call:blocked',
     'run:finish',
     'group:start',
     'group:step',
@@ -65,6 +54,13 @@ FEEDBACK_TYPES: TypeAlias = Literal[
 
 @dataclass
 class EventFeedback:
+    '''One control message queued for a run.
+
+    Attributes:
+        ftype (FEEDBACK_TYPES): The control command, e.g. ``'control:pause'``.
+        payload (dict): Command-specific data; never ``None``.
+    '''
+
     ftype: FEEDBACK_TYPES
     payload: dict = None
 
@@ -73,6 +69,22 @@ class EventFeedback:
 
 
 class BaseEvent:
+    '''Base class of every event emitted by a run.
+
+    Attributes:
+        agent_name (str): Name of the emitting agent or group.
+        agent_code (str): Short code of the emitting agent or group.
+        turn_id (str): Turn identifier the event belongs to.
+        turn (int): Step number inside the run.
+        event_type (EVENT_TYPES): Event name, e.g. ``'agent:answer'``.
+        payload (dict): Event-specific data.
+        run_id (str): Run that produced the event, when known.
+        source (str): Origin of the event, e.g. ``'agent'`` or ``'plugin'``.
+        created_at (float): Unix timestamp of creation.
+        metadata (dict): Arbitrary caller-supplied metadata.
+        source_entity (Any): Object that emitted the event, when available.
+    '''
+
     def __init__(
         self,
         agent_name: str,
@@ -86,6 +98,20 @@ class BaseEvent:
         metadata: dict = None,
         source_entity: Any = None,
     ):
+        '''Create an event.
+
+        Args:
+            agent_name (str): Name of the emitting agent or group.
+            agent_code (str): Short code of the emitting agent or group.
+            turn_id (str): Turn identifier the event belongs to.
+            event_type (EVENT_TYPES): Type of the event.
+            turn (int): 1-based step index inside the run.
+            payload (Optional[dict]): Event payload; defaults to an empty dict.
+            run_id (str): Run the event belongs to.
+            source (str): Emitter label, for example 'agent' or 'plugin'.
+            metadata (Optional[dict]): Extra metadata carried by the event.
+            source_entity (Any): Object that emitted the event, when available.
+        '''
         self.agent_name = agent_name
         self.agent_code = agent_code
         self.turn_id = turn_id
@@ -97,12 +123,17 @@ class BaseEvent:
         self.source = source
         self.created_at = time.time()
         self.metadata = dict(metadata or {})
-        
-        # source_entity: the actual entity (Agent, Group, Plugin) that emitted this event
+
         self.source_entity = source_entity
 
 
 class AgentEvent(BaseEvent):
+    '''Streaming text event of an agent turn.
+
+    Attributes:
+        content (str): Text of the reasoning step, answer or final message.
+    '''
+
     def __init__(
         self,
         agent_name: str,
@@ -118,9 +149,26 @@ class AgentEvent(BaseEvent):
     ):
         super().__init__(agent_name, agent_code, turn_id, turn=turn, event_type=event_type, payload=payload, run_id=run_id, source=source, metadata=metadata)
         self.content = content
-    
+
     @staticmethod
     def build_from_resp(response: Response, agent_name: str, agent_code: str, turn_id: str, turn: int = 1) -> 'AgentEvent':
+        '''Build the agent event for one streamed response chunk.
+
+        Args:
+            response (Response): Streamed response; either a chunk or the final status.
+            agent_name (str): Name of the emitting agent.
+            agent_code (str): Short code of the emitting agent.
+            turn_id (str): Turn identifier the event belongs to.
+            turn (int): Step number inside the run. Defaults to 1.
+
+        Returns:
+            AgentEvent: ``agent:finish`` for the final status, ``agent:reason:finish``
+            at the end of reasoning, otherwise ``agent:reason:step`` or
+            ``agent:answer``.
+
+        Raises:
+            ValueError: If the response carries neither a chunk nor a final status.
+        '''
         if response.is_final:
             return AgentEvent(
                 agent_name=agent_name,
@@ -137,7 +185,7 @@ class AgentEvent(BaseEvent):
                     'total_tokens': response.final_status.total_tokens,
                 }
             )
-        
+
         if response.current_chunk.is_cot_end:
             return AgentEvent(
                 agent_name=agent_name,
@@ -147,7 +195,7 @@ class AgentEvent(BaseEvent):
                 content=response.current_chunk.content,
                 payload={}
             )
-        
+
         if not response.current_chunk.is_assembly_tool:
             return AgentEvent(
                 agent_name=agent_name,
@@ -157,22 +205,26 @@ class AgentEvent(BaseEvent):
                 content=response.current_chunk.content,
                 payload={}
             )
-        
+
         raise ValueError('Response must have either current_chunk or final_status.')
 
 
 class ToolEventAssembler:
-    '''
-    Incrementally converts streamed tool-call assembly chunks into ToolEvents.
+    '''Incrementally convert streamed tool-call chunks into tool events.
 
-    One instance per response stream: dedup/progress state lives on the
-    instance, never shared across streams or runs.
+    One instance per response stream: dedup and progress state lives on the
+    instance and is never shared across streams or runs.
+
+    Attributes:
+        _started (set): Tool-call ids whose assembly already started.
+        _finished (set): Tool-call ids whose arguments parsed as complete JSON.
+        _args_len (dict): Length of the arguments already reported per call.
     '''
 
     def __init__(self):
-        self._started = set()    # tool_ids that already emitted tool:assembly:start
-        self._finished = set()   # tool_ids whose arguments parsed as complete JSON
-        self._args_len = {}      # tool_id -> length of arguments already emitted
+        self._started = set()
+        self._finished = set()
+        self._args_len = {}
 
     def build(
         self,
@@ -182,6 +234,19 @@ class ToolEventAssembler:
         turn_id: str,
         turn: int = 1
     ) -> list['ToolEvent']:
+        '''Build the tool events for one streamed chunk.
+
+        Args:
+            response (Response): The streamed response chunk.
+            agent_name (str): Name of the emitting agent.
+            agent_code (str): Short code of the emitting agent.
+            turn_id (str): Turn identifier the events belong to.
+            turn (int): Step number inside the run. Defaults to 1.
+
+        Returns:
+            list[ToolEvent]: Zero or more ``tool:assembly:start``/``step``/``finish``
+            events, in stream order.
+        '''
         if response.is_final:
             return []
         if not response.current_chunk or not response.current_chunk.is_assembly_tool:
@@ -255,6 +320,15 @@ class ToolEventAssembler:
 
 
 class ToolEvent(BaseEvent):
+    '''Event describing one tool call or one streamed assembly chunk.
+
+    Attributes:
+        tool_id (str): Provider id of the tool call.
+        tool_name (str): Name of the tool.
+        chunk_arg (str): Raw argument fragment, only on assembly steps.
+        args (Optional[dict]): Parsed arguments once they are complete.
+    '''
+
     def __init__(
         self,
         agent_name: str,
@@ -286,6 +360,20 @@ class ToolEvent(BaseEvent):
         args: Optional[dict] = None,
         turn: int = 1
     ) -> 'ToolEvent':
+        '''Build a ``tool:call:start`` event.
+
+        Args:
+            agent_name (str): Name of the emitting agent.
+            agent_code (str): Short code of the emitting agent.
+            turn_id (str): Turn identifier the event belongs to.
+            tool_id (str): Provider id of the tool call.
+            tool_name (str): Name of the tool.
+            args (Optional[dict]): Parsed call arguments.
+            turn (int): Step number inside the run. Defaults to 1.
+
+        Returns:
+            ToolEvent: The start event.
+        '''
         event = ToolEvent(
             agent_name=agent_name,
             agent_code=agent_code,
@@ -297,7 +385,7 @@ class ToolEvent(BaseEvent):
         )
         event.args = args
         return event
-    
+
     @staticmethod
     def build_call_finish(
         agent_name: str,
@@ -309,6 +397,22 @@ class ToolEvent(BaseEvent):
         payload: dict = None,
         turn: int = 1
     ) -> 'ToolEvent':
+        '''Build a ``tool:call:finish`` event.
+
+        Args:
+            agent_name (str): Name of the emitting agent.
+            agent_code (str): Short code of the emitting agent.
+            turn_id (str): Turn identifier the event belongs to.
+            tool_id (str): Provider id of the tool call.
+            tool_name (str): Name of the tool.
+            result (str): Result text handed back to the model.
+            payload (Optional[dict]): Extra data merged into the payload; a
+                ``'result'`` key is added when missing.
+            turn (int): Step number inside the run. Defaults to 1.
+
+        Returns:
+            ToolEvent: The finish event.
+        '''
         event_payload = payload or {}
         if 'result' not in event_payload:
             event_payload['result'] = result
@@ -325,6 +429,12 @@ class ToolEvent(BaseEvent):
 
 
 class RuntimeEvent(BaseEvent):
+    '''Generic lifecycle event emitted by the runtime.
+
+    Used for ``run:*`` events and for control feedback, so every listener can
+    observe runs without touching internals.
+    '''
+
     def __init__(
         self,
         agent_name: str,
@@ -341,18 +451,14 @@ class RuntimeEvent(BaseEvent):
 
 
 class ApprovalEvent(BaseEvent):
-    '''
-    Emitted around a manual-approval gate.
+    '''Approval-pool event for one tool call or human question.
 
-    payload for 'run:approval:required':
-        {'approval_id', 'kind', 'tool_id', 'tool_name', 'args', 'step', 'timeout'}
-    payload for 'run:approval:resolved':
-        {'approval_id', 'kind', 'tool_id', 'tool_name', 'approved', 'reason',
-         'timed_out', 'step'}
-
-    The decision itself is delivered through orchify_broker.resolve_approval()
-    (or the convenience parent methods below); the event only carries the
-    identifier and context needed for a UI to render the prompt.
+    Attributes:
+        approval_id (str): Id of the pending approval in the broker pool.
+        kind (str): ``'tool'`` for a confirmation gate, ``'question'`` for an
+            open question.
+        tool_id (str): Provider id of the gated tool call.
+        tool_name (str): Name of the gated tool.
     '''
 
     @staticmethod
@@ -368,6 +474,24 @@ class ApprovalEvent(BaseEvent):
         step: int = 1,
         timeout: Optional[float] = None,
     ) -> 'ApprovalEvent':
+        '''Build the ``run:approval:required`` event.
+
+        Args:
+            agent_name (str): Name of the parking agent.
+            agent_code (str): Short code of the parking agent.
+            turn_id (str): Turn identifier the event belongs to.
+            approval_id (str): Id of the pending approval.
+            kind (str): ``'tool'`` or ``'question'``. Defaults to ``'tool'``.
+            tool_id (str): Provider id of the gated tool call.
+            tool_name (str): Name of the gated tool.
+            args (Optional[dict]): Arguments of the gated call, or the question text.
+            step (int): Step number inside the run. Defaults to 1.
+            timeout (Optional[float]): Seconds the agent will wait before failing
+                closed, when configured.
+
+        Returns:
+            ApprovalEvent: The required event.
+        '''
         event = ApprovalEvent(
             agent_name=agent_name,
             agent_code=agent_code,
@@ -403,7 +527,28 @@ class ApprovalEvent(BaseEvent):
         reason: str = '',
         timed_out: bool = False,
         step: int = 1,
+        answer: str = '',
     ) -> 'ApprovalEvent':
+        '''Build the ``run:approval:resolved`` event.
+
+        Args:
+            agent_name (str): Name of the parking agent.
+            agent_code (str): Short code of the parking agent.
+            turn_id (str): Turn identifier the event belongs to.
+            approval_id (str): Id of the pending approval.
+            kind (str): ``'tool'`` or ``'question'``. Defaults to ``'tool'``.
+            tool_id (str): Provider id of the gated tool call.
+            tool_name (str): Name of the gated tool.
+            approved (bool): Whether the user approved it.
+            reason (str): Explanation shown to the model.
+            timed_out (bool): Whether the wait expired instead of being decided.
+            step (int): Step number inside the run. Defaults to 1.
+            answer (str): Free text of a ``kind='question'`` entry; empty for a tool
+                approval.
+
+        Returns:
+            ApprovalEvent: The resolved event.
+        '''
         event = ApprovalEvent(
             agent_name=agent_name,
             agent_code=agent_code,
@@ -417,6 +562,7 @@ class ApprovalEvent(BaseEvent):
                 'tool_name': tool_name,
                 'approved': bool(approved),
                 'reason': reason,
+                'answer': answer,
                 'timed_out': bool(timed_out),
                 'step': step,
             },
@@ -429,6 +575,13 @@ class ApprovalEvent(BaseEvent):
 
 
 class GroupEvent(BaseEvent):
+    '''Event emitted by a Group run.
+
+    Attributes:
+        group_name (str): Name of the emitting group (also stored as
+            ``agent_name``).
+    '''
+
     def __init__(
         self,
         agent_name: str,
@@ -443,8 +596,8 @@ class GroupEvent(BaseEvent):
         source_entity: Any = None,
     ):
         super().__init__(agent_name, agent_code, turn_id, turn=turn, event_type=event_type, payload=payload, run_id=run_id, source=source, metadata=metadata, source_entity=source_entity)
-        self.group_name = agent_name  # group_name is stored in agent_name for consistency
-    
+        self.group_name = agent_name
+
     @staticmethod
     def build_group_event(
         group_name: str,
@@ -455,6 +608,20 @@ class GroupEvent(BaseEvent):
         run_id: str = '',
         source_entity: Any = None,
     ) -> 'GroupEvent':
+        '''Build a group event.
+
+        Args:
+            group_name (str): Name of the emitting group.
+            group_code (str): Short code of the emitting group.
+            turn_id (str): Turn identifier the event belongs to.
+            event_type (EVENT_TYPES): Event name, e.g. ``'group:end'``.
+            payload (Optional[dict]): Event-specific data.
+            run_id (str): Run that produced the event, when known.
+            source_entity (Any): Group instance that emitted the event.
+
+        Returns:
+            GroupEvent: The built event.
+        '''
         return GroupEvent(
             agent_name=group_name,
             agent_code=group_code,

@@ -1,14 +1,11 @@
 import asyncio
 import os
 import threading
+import time
 from typing import AsyncGenerator, Any, Dict, Optional
 import httpx
 
 
-# Request timeout for the shared HTTP client. Without one, a stalled provider
-# hangs the whole run forever and the only escape is a control:stop.
-# ORCHIFY_HTTP_TIMEOUT accepts seconds (applied to every phase), or 0 / none /
-# off to disable the timeout entirely.
 DEFAULT_HTTP_TIMEOUT = httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=60.0)
 
 
@@ -30,17 +27,15 @@ def _read_http_timeout():
 
 
 class WebBackend:
-    '''
-    WEB Backend running an asyncio event loop in a dedicated background thread.
+    '''Web backend owning an asyncio event loop on a background thread.
 
-    Provides a thread-safe way to make asynchronous HTTP requests with streaming
-    capabilities using a shared httpx.AsyncClient.
+    Agent runs, HTTP requests and plugin coroutines are submitted to
+    ``_loop``, so the library can stream responses without blocking the caller.
+    One shared ``httpx.AsyncClient`` is reused for every request.
     '''
 
     def __init__(self) -> None:
-        '''
-        Initializes the WebBackend and starts the background loop.
-        '''
+        '''Initialize the backend and start its background thread.'''
         self._loop = asyncio.new_event_loop()
         self._client: Optional[httpx.AsyncClient] = None
         self.timeout = _read_http_timeout()
@@ -52,28 +47,47 @@ class WebBackend:
         self._thread.start()
 
     def _run_loop(self) -> None:
-        '''
-        Target function for the background thread running the event loop.
-        '''
+        '''Run the private event loop until ``shutdown()`` stops it.'''
         asyncio.set_event_loop(self._loop)
         self._client = httpx.AsyncClient(timeout=self.timeout)
-        self._loop.run_forever()
+        try:
+            self._loop.run_forever()
+        finally:
+            client, self._client = self._client, None
+            if client is not None:
+                try:
+                    self._loop.run_until_complete(client.aclose())
+                except Exception:
+                    pass
 
     async def _cleanup(self) -> None:
-        '''
-        Closes the AsyncClient.
-        '''
-        if self._client:
-            await self._client.aclose()
+        '''Close the shared ``httpx.AsyncClient``.'''
+        client, self._client = self._client, None
+        if client is not None:
+            await client.aclose()
 
     def shutdown(self) -> None:
+        '''Stop the event loop and join the background thread.
+
+        The shared client is closed before the loop is stopped, so the cleanup
+        coroutine always runs to completion instead of being destroyed pending.
+        Safe to call repeatedly and right after construction.
         '''
-        Stops the event loop and joins the background thread.
-        '''
-        if self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._cleanup(), self._loop)
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            self._thread.join()
+        loop = self._loop
+        if not loop.is_running() and self._thread.is_alive():
+            deadline = time.monotonic() + 5.0
+            while (not loop.is_running() and self._thread.is_alive()
+                   and time.monotonic() < deadline):
+                time.sleep(0.01)
+        if loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(self._cleanup(), loop)
+            try:
+                future.result(timeout=5)
+            except Exception:
+                pass
+            loop.call_soon_threadsafe(loop.stop)
+        if self._thread.is_alive():
+            self._thread.join(timeout=5)
 
     async def post_stream_async(
         self,
@@ -81,8 +95,7 @@ class WebBackend:
         headers: Dict[str, str],
         json_data: Dict[str, Any]
     ) -> AsyncGenerator[str, None]:
-        '''
-        Makes an asynchronous streaming POST request.
+        '''Open a streaming POST request.
 
         Args:
             url (str): Target HTTP URL.
@@ -94,8 +107,6 @@ class WebBackend:
         '''
         async with self._client.stream('POST', url, headers=headers, json=json_data) as response:
             if response.status_code >= 400:
-                # Read the error body so raise_for_status() details survive the
-                # stream context (and so callers can see Retry-After / messages).
                 await response.aread()
             response.raise_for_status()
             async for line in response.aiter_lines():
