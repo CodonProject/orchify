@@ -7,6 +7,7 @@ from orchify.tool       import Tool
 from orchify.event      import AgentEvent, ToolEvent, RuntimeEvent, ToolEventAssembler, ApprovalEvent
 from orchify.utils      import safecode, get_logger
 from orchify.env        import req_model
+from orchify.errors     import RunAlreadyActive, RunFailed, RunTimeout, UnknownRun, WaitOnLoopThread
 from orchify.broker     import orchify_broker, ApprovalTimeout, RunStopped, POLL_INTERVAL, make_turn_id
 from orchify.backend    import orchify_web_backend
 from orchify.call_chain import CallChain, CallBlocked, plan_call
@@ -253,6 +254,7 @@ class Agent:
         self.require_approval = require_approval
         self.last_run_id: str = ''
         self.last_answer: str = ''
+        self.last_error: str = ''
         self.allow_concurrent_runs = allow_concurrent_runs
         self._run_slot = threading.Lock()
         self._active_run_id: str = ''
@@ -765,13 +767,15 @@ class Agent:
             raise ValueError(f'max_steps must be a positive integer, got {max_steps!r}')
         run_id = run_id or turn_id or f'{self.name}#{self.code}_{safecode()}'
         if not self.allow_concurrent_runs and not self._run_slot.acquire(blocking=False):
-            raise RuntimeError(
+            raise RunAlreadyActive(
                 f"Agent '{self.name}' is already running "
                 f"(run_id={self._active_run_id!r}). An Agent keeps its messages "
                 f"and last_run_id on the instance, so overlapping runs would "
                 f"clobber each other: wait for the current run (Agent.wait()), "
                 f"stop it (Agent.cancel()), use a separate Agent instance, or "
-                f"construct this one with allow_concurrent_runs=True."
+                f"construct this one with allow_concurrent_runs=True.",
+                run_id=self._active_run_id,
+                owner=self.name,
             )
         self._active_run_id = run_id
         self.last_run_id = run_id
@@ -828,19 +832,21 @@ class Agent:
             finished), False for an unknown run or on timeout.
 
         Raises:
-            RuntimeError: When called from the orchestrator loop thread, which has
-                to stay free to execute the run itself.
+            UnknownRun: When there is no run to wait for.
+            WaitOnLoopThread: When called from the orchestrator loop thread, which
+                has to stay free to execute the run itself.
         '''
         target = run_id or self.last_run_id
         if not target:
-            raise ValueError('wait() needs a run_id (this agent has not run yet).')
+            raise UnknownRun('wait() needs a run_id (this agent has not run yet).', owner=self.name)
         if timeout is None:
             timeout = _read_timeout_env('ORCHIFY_RUN_TIMEOUT')
         if threading.current_thread() is orchify_web_backend._thread:
-            raise RuntimeError(
+            raise WaitOnLoopThread(
                 'Agent.wait() would deadlock: it is being called from the '
                 'orchestrator loop thread, which must run the target itself. '
-                'Use the broker\'s run:finish hook instead.'
+                'Await Agent.arun() or Agent.aask() instead, or use the '
+                'broker\'s run:finish hook.'
             )
         return orchify_broker.wait_run(target, timeout=timeout)
 
@@ -861,6 +867,176 @@ class Agent:
             return False
         return orchify_broker.feedback('control:stop', run_id=target)
 
+    @classmethod
+    def from_env(
+        cls,
+        name: str,
+        *,
+        llm: Optional[LLMInterface] = None,
+        system_prompt: str = '',
+        tools: Optional[List[Tool]] = None,
+        **kwargs: Any,
+    ) -> 'Agent':
+        '''Build an agent straight from the environment.
+
+        Uses ``MODEL_ID`` (default ``gpt-4o``) and, unless ``llm`` is given, an
+        ``OpenAICompat`` client reading ``API_KEY`` / ``BASE_URL``.
+
+        Args:
+            name (str): Agent name.
+            llm (Optional[LLMInterface]): Alternative LLM client; built from the
+                environment when omitted.
+            system_prompt (str): System prompt for the agent.
+            tools (Optional[List[Tool]]): Tools the agent starts with.
+            **kwargs (Any): Any other ``Agent`` argument.
+
+        Returns:
+            Agent: The configured agent.
+        '''
+        if llm is None:
+            from orchify.llm.openai import OpenAICompat
+            llm = OpenAICompat()
+        return cls(name=name, llm=llm, system_prompt=system_prompt, tools=tools, **kwargs)
+
+    def reset(self, messages: Optional[List[Dict[str, Any]]] = None) -> None:
+        '''Forget the conversation history and the last run's outcome.
+
+        Args:
+            messages (Optional[List[Dict[str, Any]]]): Replacement history; by
+                default the history goes back to just the system prompt.
+        '''
+        if messages is not None:
+            self.messages[:] = [dict(message) for message in messages]
+        else:
+            system = {'role': 'system', 'content': self.system_prompt} if self.system_prompt else None
+            self.messages[:] = [system] if system else []
+        self.last_answer = ''
+        self.last_error = ''
+        if not self.is_running():
+            self.last_run_id = ''
+
+    def _run_and_await_finish(
+        self,
+        user_input: str,
+        timeout: Optional[float] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        '''Start a run, wait for it, and read the event that ended it.
+
+        The terminal event is taken from the broker's outcome registry instead of
+        a ``run:finish`` hook, so a run that finishes before this method starts
+        waiting is still reported correctly: the broker records the outcome while
+        the event is emitted, and waiting after the fact is harmless.
+
+        Args:
+            user_input (str): The user message that starts the run.
+            timeout (Optional[float]): Seconds to wait; resolved from
+                ``ORCHIFY_RUN_TIMEOUT`` when not given.
+            **kwargs (Any): Any ``run()`` argument.
+
+        Returns:
+            Dict[str, Any]: ``run_id``, ``timeout``, ``finished`` and ``event``
+            (the ``run:finish`` or ``agent:abort`` record, when one exists).
+        '''
+        run_id = self.run(user_input, **kwargs)
+        outcome: Dict[str, Any] = {'run_id': run_id, 'timeout': timeout}
+        try:
+            outcome['finished'] = self.wait(run_id, timeout=timeout)
+        finally:
+            outcome['event'] = orchify_broker.run_outcome(run_id)
+        return outcome
+
+    def _outcome_answer(self, outcome: Dict[str, Any]) -> str:
+        '''Check how a run ended and return its answer.
+
+        Args:
+            outcome (Dict[str, Any]): Result of ``_run_and_await_finish()``.
+
+        Returns:
+            str: The answer the run produced.
+
+        Raises:
+            RunFailed: When the run aborted with an error.
+            RunTimeout: When the run missed its deadline; the run is asked to stop
+                before the error is raised.
+        '''
+        run_id = str(outcome.get('run_id', ''))
+        record = outcome.get('event')
+        if record is not None and record.get('event_type') == 'agent:abort':
+            error = str((record.get('payload') or {}).get('error', '')) or self.last_error
+            detail = error.strip().splitlines()[-1] if error.strip() else 'no traceback'
+            raise RunFailed(
+                f"Agent '{self.name}' run {run_id} failed: {detail}",
+                run_id=run_id,
+                error=error,
+            )
+        if not outcome.get('finished'):
+            self.cancel(run_id)
+            raise RunTimeout(
+                f"Agent '{self.name}' run {run_id} did not finish in time and was asked to stop.",
+                run_id=run_id,
+                timeout=outcome.get('timeout'),
+            )
+        if record is not None:
+            answer = (record.get('payload') or {}).get('answer')
+            if answer is not None:
+                return str(answer)
+        return self.last_answer
+
+    def ask(self, user_input: str, *, timeout: Optional[float] = None, **kwargs: Any) -> str:
+        '''Run a task and return its answer: ``run()`` + ``wait()`` in one call.
+
+        Args:
+            user_input (str): The user message that starts the run.
+            timeout (Optional[float]): Seconds to wait; resolved from
+                ``ORCHIFY_RUN_TIMEOUT`` when not given (None = wait forever).
+            **kwargs (Any): Any ``run()`` argument, such as ``max_steps``.
+
+        Returns:
+            str: The answer the run produced.
+
+        Raises:
+            WaitOnLoopThread: When called on the orchestrator loop thread; await
+                ``aask()`` there instead.
+            RunFailed: When the run aborted with an error.
+            RunTimeout: When the run missed its deadline; the run is asked to stop
+                before the error is raised.
+        '''
+        if threading.current_thread() is orchify_web_backend._thread:
+            raise WaitOnLoopThread(
+                "Agent.ask() cannot block on the orchestrator loop thread, because that "
+                "thread executes the run: await agent.aask() instead."
+            )
+        return self._outcome_answer(self._run_and_await_finish(user_input, timeout, **kwargs))
+
+    async def aask(self, user_input: str, *, timeout: Optional[float] = None, **kwargs: Any) -> str:
+        '''Async form of ``ask()``.
+
+        Args:
+            user_input (str): The user message that starts the run.
+            timeout (Optional[float]): Seconds to wait.
+            **kwargs (Any): Any ``run()`` argument.
+
+        Returns:
+            str: The answer the run produced.
+        '''
+        return await asyncio.to_thread(self.ask, user_input, timeout=timeout, **kwargs)
+
+    async def arun(self, user_input: str, *, timeout: Optional[float] = None, **kwargs: Any) -> str:
+        '''Async form of ``run()``: start a run and await its finish.
+
+        Args:
+            user_input (str): The user message that starts the run.
+            timeout (Optional[float]): Seconds to wait.
+            **kwargs (Any): Any ``run()`` argument.
+
+        Returns:
+            str: The ``run_id`` of the finished run.
+        '''
+        outcome = await asyncio.to_thread(self._run_and_await_finish, user_input, timeout, **kwargs)
+        self._outcome_answer(outcome)
+        return str(outcome.get('run_id', ''))
+
     async def _async_thread_process(
         self,
         user_input: str,
@@ -870,6 +1046,7 @@ class Agent:
         llm_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         orchify_broker.start_task(run_id, asyncio.current_task())
+        self.last_error = ''
 
         run_gate = get_run_gate()
         gate_held = False
@@ -948,6 +1125,7 @@ class Agent:
         except Exception:
             import traceback
             error_text = traceback.format_exc()
+            self.last_error = error_text
             logger.error('[Agent Error] run=%s: %s', run_id, error_text)
             orchify_broker.emit(RuntimeEvent(
                 agent_name=self.name,

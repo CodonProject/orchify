@@ -30,7 +30,10 @@ dependencies = [
 dynamic = ["version"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "pytest-cov>=4"]
+dev = ["pytest>=7", "pytest-cov>=4", "mypy>=1.8", "build>=1.0", "twine>=5"]
+
+[project.scripts]
+orchify = "orchify.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/YizhouLi/orchify"
@@ -38,8 +41,20 @@ Homepage = "https://github.com/YizhouLi/orchify"
 [tool.setuptools]
 packages = ["orchify", "orchify.llm"]
 
+[tool.setuptools.package-data]
+orchify = ["py.typed"]
+
 [tool.setuptools.dynamic]
 version = { attr = "orchify.__version__" }
+
+[tool.mypy]
+python_version = "3.9"
+files = ["orchify"]
+ignore_missing_imports = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+show_error_codes = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

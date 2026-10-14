@@ -299,7 +299,8 @@ class ToolEventAssembler:
                         event_type='tool:assembly:step',
                         tool_id=tool_call.get('id', ''),
                         tool_name=tool_name,
-                        chunk_arg=chunk_arg
+                        chunk_arg=chunk_arg,
+                        turn=turn
                     )
                 )
 
@@ -311,7 +312,8 @@ class ToolEventAssembler:
                     turn_id=turn_id,
                     event_type='tool:assembly:finish',
                     tool_id=tool_call.get('id', ''),
-                    tool_name=tool_name
+                    tool_name=tool_name,
+                    turn=turn
                 )
                 event.args = parsed_args
                 results.append(event)

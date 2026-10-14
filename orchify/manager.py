@@ -230,6 +230,26 @@ class OrchifyManager:
         '''False when ORCHIFY_MANAGER_ENABLED=0: no tap, no registry.'''
         return self._enabled
 
+    def set_enabled(self, enabled: bool) -> bool:
+        '''Turn event collection on or off at runtime.
+
+        Args:
+            enabled (bool): True collects events again, False detaches the tap.
+
+        Returns:
+            bool: The resulting state, which is the requested one.
+        '''
+        enabled = bool(enabled)
+        with self._lock:
+            self._enabled = enabled
+            if enabled:
+                self._closed = False
+        if enabled:
+            self._ensure_tap()
+        else:
+            self.close()
+        return enabled
+
     @property
     def history_capacity(self) -> int:
         '''Capacity of the finished-run history.
@@ -319,6 +339,21 @@ class OrchifyManager:
                 sink.close()
             except Exception:
                 pass
+
+    def set_sink(self, path: Optional[str]) -> str:
+        '''Point the JSONL sink at another path.
+
+        Args:
+            path (Optional[str]): New append path; None or '' disables file IO.
+
+        Returns:
+            str: The path now in use ('' when disabled).
+        '''
+        self._close_sink()
+        with self._sink_lock:
+            self._sink_path = str(path or '')
+            self._sink_written = 0
+        return self._sink_path
 
     def replay(self, path: Optional[str] = None, **kwargs) -> List[dict]:
         '''Read back the sink file (defaults to this manager's sink). See read_sink().'''

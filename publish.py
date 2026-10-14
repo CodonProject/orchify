@@ -1,15 +1,30 @@
+import glob
+import os
 import subprocess
 import sys
-from install import clean, build
+
+from install import build, clean
 
 def publish() -> None:
     '''
-    Uploads the built package to PyPI using twine.
-    Assumes TWINE_USERNAME and TWINE_PASSWORD are set in the environment or a .pypirc file is configured.
+    Uploads every file in dist/ to PyPI with twine.
+
+    Expects TWINE_USERNAME and TWINE_PASSWORD in the environment, or a
+    configured .pypirc file.
+
+    Raises:
+        SystemExit: When dist/ is empty or the upload fails.
     '''
-    print('Publishing package...')
+    packages = sorted(glob.glob(os.path.join('dist', '*')))
+    if not packages:
+        print('Nothing to publish in dist/; run the build first.')
+        sys.exit(1)
+    print(f'Publishing {len(packages)} file(s)...')
     try:
-        subprocess.run([sys.executable, '-m', 'twine', 'upload', 'dist/*'], check=True)
+        subprocess.run(
+            [sys.executable, '-m', 'twine', 'upload', *packages, '--non-interactive'],
+            check=True,
+        )
         print('Publish successful.')
     except subprocess.CalledProcessError as e:
         print(f'Publish failed with error: {e}')

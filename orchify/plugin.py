@@ -177,7 +177,8 @@ class Plugin:
                 user_match = kwargs.get('match')
                 if scope_filter is not None:
                     kwargs['match'] = (lambda e, m=user_match: (m(e) if m else True) and scope_filter(e))
-                binding = self.broker.register_hook(meta['event_type'], bound, owner=pid, **kwargs)
+                binding = self.broker.register_hook(meta['event_type'], bound, owner=pid,
+                                                    plugin=True, **kwargs)
                 self._bindings.append(binding)
                 continue
 
@@ -244,6 +245,7 @@ class Plugin:
                 agent_name=agent_name,
                 match=match,
                 owner=self.id,
+                plugin=True,
             )
             self._bindings.append(binding)
             return func

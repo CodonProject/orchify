@@ -330,7 +330,7 @@ class OpenAICompat(LLMInterface):
                     cot_ended = True
 
                 if is_cot_end:
-                    yield make_chunk(is_cot=False, content="")
+                    yield make_chunk(is_cot=False, content="", is_cot_end=True)
                     is_cot_end = False
 
                 if cot_chunk:

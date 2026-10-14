@@ -1,4 +1,4 @@
-from typing import List, Dict, Union, Optional, Any
+from typing import List, Dict, Union, Optional, Any, Callable
 
 import os
 import threading
@@ -7,6 +7,7 @@ import time
 from .agent import Agent
 from .backend import orchify_web_backend
 from .call_chain import CallChain, CallBlocked, plan_call
+from .errors import RunAlreadyActive, RunFailed, RunTimeout, UnknownRun, WaitOnLoopThread
 from .schema import Vote
 from .tool import Tool
 from .utils import safecode
@@ -54,6 +55,65 @@ def _read_max_call_depth_env() -> Optional[int]:
     return value if value >= 0 else None
 
 
+class GroupCallback:
+    '''A removable callback registration on a ``GroupEventBroker``.
+
+    Attributes:
+        broker (GroupEventBroker): The broker the callback is registered on.
+        callback (Callable[[GroupEventBase], Any]): The registered callback.
+    '''
+
+    def __init__(self, broker: 'GroupEventBroker', callback: Callable[[GroupEventBase], Any]) -> None:
+        '''Create a handle for a registered callback.
+
+        Args:
+            broker (GroupEventBroker): Broker holding the callback.
+            callback (Callable[[GroupEventBase], Any]): Registered callback.
+        '''
+        self.broker = broker
+        self.callback = callback
+
+    @property
+    def active(self) -> bool:
+        '''Whether the callback is still registered.
+
+        Returns:
+            bool: True while the broker still knows the callback.
+        '''
+        with self.broker._lock:
+            return any(registered is self.callback for registered in self.broker._callbacks)
+
+    def close(self) -> bool:
+        '''Unregister the callback.
+
+        Returns:
+            bool: True when the callback was still registered.
+        '''
+        return self.broker.remove_event(self.callback)
+
+    def __enter__(self) -> 'GroupCallback':
+        '''Return this handle when entering a ``with`` block.
+
+        Returns:
+            GroupCallback: This handle.
+        '''
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        '''Unregister the callback when leaving a ``with`` block.
+
+        Args:
+            exc_type (Any): Exception type, when one was raised.
+            exc (Any): Exception instance, when one was raised.
+            tb (Any): Traceback, when one was raised.
+
+        Returns:
+            bool: False, so exceptions keep propagating.
+        '''
+        self.close()
+        return False
+
+
 class GroupEventBroker:
     '''Collect the events emitted by a group and fan them out to callbacks.
 
@@ -83,14 +143,35 @@ class GroupEventBroker:
         for callback in callbacks:
             callback(event)
 
-    def on_event(self, callback):
+    def on_event(self, callback: Callable[[GroupEventBase], Any]) -> 'GroupCallback':
         '''Register a callback invoked for every group event.
 
         Args:
-            callback (Callable): Called with the event on the emitting thread.
+            callback (Callable[[GroupEventBase], Any]): Called with the event on
+                the emitting thread.
+
+        Returns:
+            GroupCallback: Handle whose ``close()`` unregisters the callback.
         '''
         with self._lock:
             self._callbacks.append(callback)
+        return GroupCallback(self, callback)
+
+    def remove_event(self, callback: Callable[[GroupEventBase], Any]) -> bool:
+        '''Unregister a callback.
+
+        Args:
+            callback (Callable[[GroupEventBase], Any]): Callback to remove.
+
+        Returns:
+            bool: True when the callback was registered.
+        '''
+        with self._lock:
+            for index, registered in enumerate(self._callbacks):
+                if registered is callback:
+                    del self._callbacks[index]
+                    return True
+        return False
 
     def get_events_by_type(self, event_type: str) -> List[GroupEventBase]:
         '''Return the recorded events of one type.
@@ -434,7 +515,10 @@ class Group:
     def run(self, user_input: str, run_id: Optional[str] = None, **kwargs) -> str:
         '''Run the group on a task.
 
-        The execution flow depends on the group's ``mode``.
+        The execution flow depends on the group's ``mode``. A ``'voting'`` group
+        blocks until its members settle so that the winner can be tallied, unless
+        ``vote_timeout`` is 0 or the call happens on the orchestrator loop thread;
+        ``await arun()`` does the same waiting without occupying a thread.
 
         Args:
             user_input (str): The task for the group.
@@ -446,16 +530,53 @@ class Group:
             str: The group's run id. Members run under their own run ids, which
             are collected in ``last_run_ids`` so that any single member can still
             be stopped, paused or approved on its own.
+
+        Raises:
+            RunAlreadyActive: When the group is already running and
+                ``allow_concurrent_runs`` is False.
+        '''
+        run_id = self._start_run(user_input, run_id=run_id, **kwargs)
+        failed: Optional[BaseException] = None
+        try:
+            if self.mode == 'voting' and self._can_block_for_votes():
+                self._wait_for_votes()
+        except BaseException as exc:
+            failed = exc
+        self._finish_run(run_id, failed)
+        if failed is not None:
+            raise failed
+        return run_id
+
+    def _start_run(self, user_input: str, run_id: Optional[str] = None, **kwargs) -> str:
+        '''Register a run and dispatch its members without waiting for them.
+
+        The run stays registered until ``_finish_run`` is called, which is what
+        ``run()`` does right away and ``arun()`` does after awaiting the members.
+
+        Args:
+            user_input (str): The task for the group.
+            run_id (Optional[str]): Handle for this group execution;
+                ``turn_id=`` is accepted as a legacy alias.
+            **kwargs: Extra arguments forwarded to the members.
+
+        Returns:
+            str: The run id of the started run.
+
+        Raises:
+            RunAlreadyActive: When the group is already running and
+                ``allow_concurrent_runs`` is False.
         '''
         run_id = run_id or kwargs.pop('turn_id', None) or f'{self.name}#{self.code}_{safecode()}'
 
         if not self.allow_concurrent_runs and not self._run_slot.acquire(blocking=False):
-            raise RuntimeError(
+            raise RunAlreadyActive(
                 f"Group '{self.name}' is already running (run_id={self._active_run_id or self.last_run_id}). "
                 "A Group keeps current_run_id/last_run_ids/last_votes on the instance, so overlapping "
                 "runs would clobber each other: wait for the current run (Group.wait()), stop it "
                 "(Group.cancel()), use a separate Group instance, or construct this one with "
-                "allow_concurrent_runs=True."
+                "allow_concurrent_runs=True.",
+                run_id=self._active_run_id or self.last_run_id,
+                owner=self.name,
             )
 
         self._active_run_id = run_id
@@ -484,18 +605,30 @@ class Group:
                 self._run_competition(user_input, **kwargs)
             else:
                 self._run_manager_based(user_input, **kwargs)
-
-            self._emit('end', {
-                'run_id': run_id,
-                'agent_run_ids': list(self.last_run_ids),
-                'votes': [{'agent_name': v.agent_name, 'vote': v.vote, 'reason': v.reason} for v in self.last_votes],
-                'winner': self.last_winner,
-                'answer': self.last_answer,
-            })
-            return run_id
-        except Exception as e:
-            self._emit('error', {'message': str(e)})
+        except BaseException as exc:
+            self._finish_run(run_id, exc)
             raise
+        return run_id
+
+    def _finish_run(self, run_id: str, error: Optional[BaseException] = None) -> None:
+        '''Emit the terminal event of a run and release its resources.
+
+        Args:
+            run_id (str): The run to close.
+            error (Optional[BaseException]): Failure to report as a group
+                ``'error'`` event; the run is reported as ended otherwise.
+        '''
+        try:
+            if error is None:
+                self._emit('end', {
+                    'run_id': run_id,
+                    'agent_run_ids': list(self.last_run_ids),
+                    'votes': [{'agent_name': v.agent_name, 'vote': v.vote, 'reason': v.reason} for v in self.last_votes],
+                    'winner': self.last_winner,
+                    'answer': self.last_answer,
+                })
+            else:
+                self._emit('error', {'message': str(error)})
         finally:
             orchify_broker.finish_task(run_id)
             self.current_run_id = ''
@@ -527,20 +660,20 @@ class Group:
             otherwise, including for a run id this process never started.
 
         Raises:
-            ValueError: When there is no run to wait for.
-            RuntimeError: When called from the orchestrator loop thread, where
+            UnknownRun: When there is no run to wait for.
+            WaitOnLoopThread: When called from the orchestrator loop thread, where
                 blocking would stall every other run.
         '''
         target = run_id or self.last_run_id
         if not target:
-            raise ValueError(f"Group '{self.name}' has no run to wait for; pass run_id=... .")
+            raise UnknownRun(f"Group '{self.name}' has no run to wait for; pass run_id=... .", owner=self.name)
         if timeout is None:
             timeout = _read_float_env('ORCHIFY_RUN_TIMEOUT')
         if threading.current_thread() is orchify_web_backend._thread:
-            raise RuntimeError(
+            raise WaitOnLoopThread(
                 "Group.wait() would deadlock: it is being called from the orchestrator loop "
                 "thread, which is the thread that executes the run. Wait from your own "
-                "thread, or use the 'run:finish' hook instead."
+                "thread, await Group.arun()/Group.aask(), or use the 'run:finish' hook instead."
             )
         return orchify_broker.wait_run(target, timeout=timeout)
 
@@ -550,6 +683,199 @@ class Group:
         if not target:
             return False
         return orchify_broker.feedback('control:stop', run_id=target)
+
+    def reset(self) -> None:
+        '''Forget the last run's ids, votes, winner and answer.'''
+        self.last_run_ids = []
+        self.last_votes = []
+        self.last_winner = None
+        self.last_answer = ''
+        if not self.is_running():
+            self.last_run_id = ''
+            self.current_run_id = ''
+
+    def _wait_members(self, timeout: Optional[float] = None) -> bool:
+        '''Wait for the member runs of the last group run to settle.
+
+        Args:
+            timeout (Optional[float]): Seconds to wait in total; None waits
+                forever.
+
+        Returns:
+            bool: True when every member run had finished by the deadline.
+        '''
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for member_run_id in list(self.last_run_ids):
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if not orchify_broker.wait_run(member_run_id, timeout=remaining):
+                return False
+        return True
+
+    def _member_answer(self) -> str:
+        '''Return the answer of the last run.
+
+        A ``'voting'`` run stores its winner's answer on the group, while a
+        ``'broadcast'``/``'competition'`` run only stores its members' run ids,
+        so the members are inspected as a fallback.
+
+        Returns:
+            str: The answer, or ``''`` when no member produced one.
+        '''
+        if self.last_answer:
+            return self.last_answer
+        members = list(self.agents.values())
+        for run_id in reversed(self.last_run_ids):
+            for member in members:
+                if isinstance(member, Group):
+                    if run_id == member.last_run_id or run_id in member.last_run_ids:
+                        answer = member._member_answer()
+                        if answer:
+                            return answer
+                elif str(getattr(member, 'last_run_id', '')) == run_id:
+                    answer = str(getattr(member, 'last_answer', '') or '')
+                    if answer:
+                        return answer
+        return ''
+
+    def ask(self, user_input: str, *, timeout: Optional[float] = None, **kwargs: Any) -> str:
+        '''Run the group on a task and return its answer.
+
+        Args:
+            user_input (str): The task for the group.
+            timeout (Optional[float]): Seconds to wait for the members; defaults
+                to ``ORCHIFY_RUN_TIMEOUT``, where None waits forever.
+            **kwargs (Any): Extra arguments forwarded to the members.
+
+        Returns:
+            str: The answer produced by the run.
+
+        Raises:
+            WaitOnLoopThread: When called on the orchestrator loop thread; await
+                ``aask()`` there instead.
+            RunTimeout: When a member run missed the deadline; the run is asked
+                to stop before the error is raised.
+            RunFailed: When a member run aborted with an error.
+        '''
+        if threading.current_thread() is orchify_web_backend._thread:
+            raise WaitOnLoopThread(
+                "Group.ask() cannot block on the orchestrator loop thread, because that "
+                "thread executes the run: await group.aask() instead."
+            )
+        run_id = self.run(user_input, **kwargs)
+        if not self._wait_members(timeout):
+            self.cancel()
+            raise RunTimeout(
+                f"Group '{self.name}' run {run_id} did not finish in time and was asked to stop.",
+                run_id=run_id,
+                timeout=timeout,
+            )
+        return self._ensure_answer(run_id)
+
+    def _ensure_answer(self, run_id: str) -> str:
+        '''The answer of the last run, or a typed failure when a member errored.
+
+        Args:
+            run_id (str): The group run the answer belongs to.
+
+        Returns:
+            str: The answer produced by the run, possibly ``''``.
+
+        Raises:
+            RunFailed: When no member produced an answer and one of them recorded
+                a ``last_error``.
+        '''
+        answer = self._member_answer()
+        if not answer:
+            for member in self.agents.values():
+                error = str(getattr(member, 'last_error', '') or '')
+                if error:
+                    raise RunFailed(
+                        f"Group '{self.name}' run {run_id} failed; see the member's last_error for the traceback.",
+                        run_id=run_id,
+                        error=error,
+                    )
+        return answer
+
+    async def aask(self, user_input: str, *, timeout: Optional[float] = None, **kwargs: Any) -> str:
+        '''Async form of ``ask()``.
+
+        The members are awaited with ``await``, so no worker thread is occupied
+        while the run is in flight and the call is safe on the orchestrator loop
+        thread.
+
+        Args:
+            user_input (str): The task for the group.
+            timeout (Optional[float]): Seconds to wait for the members.
+            **kwargs (Any): Extra arguments forwarded to the members.
+
+        Returns:
+            str: The answer produced by the run.
+
+        Raises:
+            RunTimeout: When a member run missed the deadline; the run is asked
+                to stop before the error is raised.
+            RunFailed: When a member run aborted with an error.
+        '''
+        run_id = await self.arun(user_input, timeout=timeout, **kwargs)
+        return self._ensure_answer(run_id)
+
+    async def arun(self, user_input: str, *, timeout: Optional[float] = None, **kwargs: Any) -> str:
+        '''Async form of ``run()``: start a run and await its members.
+
+        Unlike ``run()``, the waiting happens with ``await`` instead of blocking a
+        worker thread, so this is safe to call on the orchestrator loop thread. A
+        ``'voting'`` group always tallies its members here, because the caller
+        explicitly awaited them; ``vote_timeout`` only bounds the synchronous
+        ``run()``.
+
+        Args:
+            user_input (str): The task for the group.
+            timeout (Optional[float]): Seconds to wait for the members; None
+                waits forever.
+            **kwargs (Any): Extra arguments forwarded to the members.
+
+        Returns:
+            str: The group's run id.
+
+        Raises:
+            RunTimeout: When a member run missed the deadline; the run is asked
+                to stop before the error is raised.
+        '''
+        run_id = self._start_run(user_input, **kwargs)
+        failed: Optional[BaseException] = None
+        try:
+            if not await self._await_members(timeout):
+                self.cancel(run_id)
+                raise RunTimeout(
+                    f"Group '{self.name}' run {run_id} did not finish in time and was asked to stop.",
+                    run_id=run_id,
+                    timeout=timeout,
+                )
+            if self.mode == 'voting':
+                self._collect_votes()
+        except BaseException as exc:
+            failed = exc
+        self._finish_run(run_id, failed)
+        if failed is not None:
+            raise failed
+        return run_id
+
+    async def _await_members(self, timeout: Optional[float] = None) -> bool:
+        '''Await the member runs of the last group run without blocking a thread.
+
+        Args:
+            timeout (Optional[float]): Seconds to wait in total; None waits
+                forever.
+
+        Returns:
+            bool: True when every member run had finished by the deadline.
+        '''
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for member_run_id in list(self.last_run_ids):
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if not await orchify_broker.await_run(member_run_id, timeout=remaining):
+                return False
+        return True
 
     @staticmethod
     def _normalize_vote(text: Any) -> str:
@@ -597,8 +923,25 @@ class Group:
             'votes': [{'agent_name': v.agent_name, 'vote': v.vote} for v in votes],
         })
 
+    def _wait_for_votes(self) -> None:
+        '''Block this thread until the voting members settle, then tally them.
+
+        Only called from the synchronous ``run()`` and only on a thread that is
+        allowed to block; ``vote_timeout`` bounds the wait.
+        '''
+        deadline = time.monotonic() + float(self.vote_timeout or 0)
+        for member_run_id in list(self.last_run_ids):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not orchify_broker.wait_run(member_run_id, timeout=remaining):
+                break
+        self._collect_votes()
+
     def _run_voting(self, user_input: str, **kwargs) -> str:
-        '''Runs the group in a parallel, voting-based fashion.'''
+        '''Start every member of a voting group without waiting for them.
+
+        The votes are tallied by ``_wait_for_votes`` (synchronous ``run()``) or by
+        ``arun()`` after it awaited the members.
+        '''
         self._emit('step', {'action': 'Starting voting execution'})
 
         for agent in self.agent_sequence:
@@ -608,14 +951,6 @@ class Group:
                 'action': f'Agent \'{agent.name}\' started voting',
                 'run_id': run_id
             })
-
-        if self._can_block_for_votes():
-            deadline = time.monotonic() + self.vote_timeout
-            for member_run_id in list(self.last_run_ids):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or not orchify_broker.wait_run(member_run_id, timeout=remaining):
-                    break
-            self._collect_votes()
 
         return self.last_run_ids[0] if self.last_run_ids else ''
 

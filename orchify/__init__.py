@@ -5,13 +5,19 @@ from .llm import Middleware, OpenAICompat
 from .tool import Tool, tool
 from .plugin import Plugin
 from .plugin_manager import PluginManager, PluginError, orchify_plugins
-from .group import Group, GroupEventBroker
+from .group import Group, GroupEventBroker, GroupCallback
 from .event import GroupEvent, ApprovalEvent
 from .schema import Vote
 from .broker import (orchify_broker, PendingApproval, ApprovalTimeout, RunStopped,
                      POLL_INTERVAL, make_turn_id)
+from .errors import (OrchifyError, RunAlreadyActive, RunTimeout, RunFailed,
+                     UnknownRun, WaitOnLoopThread)
 from .gate import gate_stats
 from .manager import OrchifyManager, orchify_manager, RUN_STATUSES, read_sink
+from .config import OrchifyConfig, config, configure
+from .api import (on, off, console, ConsoleLoop, approvals, pending_approvals,
+                  questions, approve, reject, answer, status, report, runs, run,
+                  history)
 from .utils import get_logger, configure_logging
 
 __version__ = '0.0.1'
@@ -34,6 +40,7 @@ __all__ = [
     'Group',
     'GroupEvent',
     'GroupEventBroker',
+    'GroupCallback',
     'ApprovalEvent',
     'PendingApproval',
     'ApprovalTimeout',
@@ -44,6 +51,30 @@ __all__ = [
     'OrchifyManager',
     'RUN_STATUSES',
     'read_sink',
+    'OrchifyError',
+    'RunAlreadyActive',
+    'RunTimeout',
+    'RunFailed',
+    'UnknownRun',
+    'WaitOnLoopThread',
+    'OrchifyConfig',
+    'config',
+    'configure',
+    'on',
+    'off',
+    'console',
+    'ConsoleLoop',
+    'approvals',
+    'pending_approvals',
+    'questions',
+    'approve',
+    'reject',
+    'answer',
+    'status',
+    'report',
+    'runs',
+    'run',
+    'history',
     'gate_stats',
     'get_tool_executor',
     'shutdown_tool_executor',

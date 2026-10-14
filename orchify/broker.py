@@ -27,7 +27,29 @@ def _read_poll_interval() -> float:
 
 POLL_INTERVAL = _read_poll_interval()
 
+_TERMINAL_EVENT_TYPES = ('run:finish', 'agent:abort')
+
 _MAX_REMEMBERED_RUNS = 4096
+
+DEFAULT_RUN_OUTCOME_LIMIT = 256
+
+
+def _read_run_outcome_limit() -> int:
+    '''Read how many finished-run outcomes the broker remembers.
+
+    Returns:
+        int: ``ORCHIFY_RUN_OUTCOME_LIMIT`` when it is a non-negative integer,
+            otherwise ``DEFAULT_RUN_OUTCOME_LIMIT``. Zero disables the registry.
+    '''
+    import os
+    raw = os.getenv('ORCHIFY_RUN_OUTCOME_LIMIT')
+    if raw is None or str(raw).strip() == '':
+        return DEFAULT_RUN_OUTCOME_LIMIT
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_RUN_OUTCOME_LIMIT
+    return value if value >= 0 else DEFAULT_RUN_OUTCOME_LIMIT
 
 
 def make_turn_id(run_id: str, turn: int) -> str:
@@ -148,9 +170,12 @@ class HookBinding:
         agent_name (Optional[str]): Only fire for this agent.
         match (Optional[Callable]): Extra predicate over the event.
         owner (str): Owner id (usually a plugin) used by ``remove_hooks()``.
+        plugin (bool): True for a hook registered by a plugin, which makes it
+            subject to the enabled-plugin filter.
     '''
 
-    __slots__ = ('func', 'event_type', 'run_id', 'mode', 'count', 'disposed', 'agent_name', 'match', 'owner')
+    __slots__ = ('func', 'event_type', 'run_id', 'mode', 'count', 'disposed', 'agent_name', 'match',
+                 'owner', 'plugin')
 
     def __init__(
         self,
@@ -161,6 +186,7 @@ class HookBinding:
         agent_name: Optional[str] = None,
         match: Optional[Callable] = None,
         owner: str = '',
+        plugin: bool = False,
     ):
         self.func = func
         self.event_type = event_type
@@ -171,6 +197,7 @@ class HookBinding:
         self.agent_name = agent_name
         self.match = match
         self.owner = owner
+        self.plugin = bool(plugin)
 
     @property
     def turn_id(self) -> Optional[str]:
@@ -220,6 +247,100 @@ class Broker:
         self._run_done: dict[str, td.Event] = {}
         self._run_done_lock = td.Lock()
 
+        self._run_outcome_limit = _read_run_outcome_limit()
+        self._run_outcomes: dict[str, dict] = {}
+        self._run_outcomes_lock = td.Lock()
+
+    def record_run_outcome(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: Optional[dict] = None,
+    ) -> Optional[dict]:
+        '''Remember the terminal event of a run so late callers can read it.
+
+        ``emit()`` calls this for every event in ``_TERMINAL_EVENT_TYPES``, which
+        removes the race that made ``Agent.ask()`` depend on catching a
+        ``run:finish`` hook: a run that ends before the caller starts waiting
+        still leaves its outcome behind. The registry keeps the most recent
+        ``ORCHIFY_RUN_OUTCOME_LIMIT`` runs (default 256, 0 disables it).
+
+        Args:
+            run_id (str): Run the outcome belongs to.
+            event_type (str): Terminal event type ('run:finish' or 'agent:abort').
+            payload (Optional[dict]): Event payload, usually carrying 'answer',
+                'stopped' or 'error'.
+
+        Returns:
+            Optional[dict]: The stored record, or None when the registry is
+                disabled or no run id was given.
+        '''
+        if not run_id or not self._run_outcome_limit:
+            return None
+        record = {
+            'run_id': run_id,
+            'event_type': event_type,
+            'payload': dict(payload or {}),
+            'created_at': time.time(),
+        }
+        with self._run_outcomes_lock:
+            existing = self._run_outcomes.pop(run_id, None)
+            if existing is not None:
+                record['created_at'] = existing.get('created_at', record['created_at'])
+            self._run_outcomes[run_id] = record
+            while len(self._run_outcomes) > self._run_outcome_limit:
+                oldest = next(iter(self._run_outcomes))
+                if oldest == run_id and len(self._run_outcomes) == 1:
+                    break
+                self._run_outcomes.pop(oldest, None)
+        return record
+
+    def run_outcome(self, run_id: str) -> Optional[dict]:
+        '''Return the remembered terminal event of a run.
+
+        Args:
+            run_id (str): Run to look up.
+
+        Returns:
+            Optional[dict]: The record built by ``record_run_outcome()``, or None
+                when the run is unknown, still running or already evicted.
+        '''
+        if not run_id:
+            return None
+        with self._run_outcomes_lock:
+            record = self._run_outcomes.get(run_id)
+            return dict(record) if record is not None else None
+
+    def run_outcomes(self) -> list:
+        '''List the remembered terminal outcomes, oldest first.
+
+        Returns:
+            list[dict]: One record per remembered run.
+        '''
+        with self._run_outcomes_lock:
+            return [dict(record) for record in self._run_outcomes.values()]
+
+    def clear_run_outcome(self, run_id: str) -> bool:
+        '''Forget the terminal outcome of a run.
+
+        Args:
+            run_id (str): Run to forget.
+
+        Returns:
+            bool: True when a record was dropped.
+        '''
+        with self._run_outcomes_lock:
+            return self._run_outcomes.pop(run_id, None) is not None
+
+    @property
+    def run_outcome_limit(self) -> int:
+        '''Return how many finished-run outcomes the registry keeps.
+
+        Returns:
+            int: Configured bound (0 means the registry is disabled).
+        '''
+        return self._run_outcome_limit
+
 
     def _execute_hook(self, func: Callable, event: BaseEvent):
         try: func(event)
@@ -248,6 +369,10 @@ class Broker:
         longer stall hook registration or another run's bookkeeping. Hooks for one
         event still run in registration order, on the emitting thread.
 
+        A hook registered by a plugin (``plugin=True``) fires only while that
+        plugin is enabled for the run; hooks registered by the application always
+        fire, whatever their owner id.
+
         Args:
             event (BaseEvent): The event to deliver.
 
@@ -256,6 +381,9 @@ class Broker:
         '''
         if not isinstance(event, BaseEvent):
             raise TypeError(f'emit() requires a BaseEvent, got {type(event)}')
+
+        if event.event_type in _TERMINAL_EVENT_TYPES:
+            self.record_run_outcome(event.run_id, event.event_type, event.payload)
 
         with self._emit_lock:
             enabled_plugins = None
@@ -268,7 +396,7 @@ class Broker:
             for b in self.hooks:
                 if b.disposed or not self._matches(b, event):
                     continue
-                if enabled_plugins is not None and b.owner and b.owner not in enabled_plugins:
+                if enabled_plugins is not None and b.plugin and b.owner and b.owner not in enabled_plugins:
                     continue
                 candidates.append(b)
 
@@ -297,6 +425,7 @@ class Broker:
         match: Optional[Callable] = None,
         owner: str = '',
         turn_id: Optional[str] = None,
+        plugin: bool = False,
     ) -> HookBinding:
         '''Bind a hook to events.
 
@@ -311,6 +440,8 @@ class Broker:
             match (Optional[Callable]): Extra predicate over the event.
             owner (str): Owner id, used by ``remove_hooks()``.
             turn_id (Optional[str]): Deprecated alias of ``run_id``.
+            plugin (bool): True when a plugin registers this hook, which subjects
+                it to the enabled-plugin filter in ``emit()``.
 
         Returns:
             HookBinding: The binding, which can be passed to ``remove_binding()``.
@@ -326,7 +457,8 @@ class Broker:
         types = tuple(event_type) if isinstance(event_type, (tuple, list, set)) else (event_type,)
         if not types or not all(isinstance(t, str) for t in types):
             raise ValueError(f'event_type must be a str or a list/tuple/set of strings, got {event_type!r}')
-        binding = HookBinding(hook, types, run_id, mode, agent_name=agent_name, match=match, owner=owner)
+        binding = HookBinding(hook, types, run_id, mode, agent_name=agent_name, match=match,
+                              owner=owner, plugin=plugin)
         with self._emit_lock:
             self.hooks.append(binding)
         return binding
@@ -377,6 +509,7 @@ class Broker:
         match: Optional[Callable] = None,
         owner: str = '',
         turn_id: Optional[str] = None,
+        plugin: bool = False,
     ) -> Callable:
         '''Decorator registering a hook.
 
@@ -390,6 +523,7 @@ class Broker:
             match (Optional[Callable]): Extra predicate over the event.
             owner (str): Owner id, used by ``remove_hooks()``.
             turn_id (Optional[str]): Deprecated alias of ``run_id``.
+            plugin (bool): True when a plugin registers this hook.
 
         Returns:
             Callable: A decorator that registers the function and returns it.
@@ -404,7 +538,8 @@ class Broker:
                 Callable: ``func``, unchanged.
             '''
             return self.register_hook(event_type, func, run_id=run_id, mode='once' if once else mode,
-                                      agent_name=agent_name, match=match, owner=owner, turn_id=turn_id)
+                                      agent_name=agent_name, match=match, owner=owner, turn_id=turn_id,
+                                      plugin=plugin)
         return decorator
 
 
@@ -1065,6 +1200,33 @@ class Broker:
         if event is None:
             return False
         return event.wait(timeout)
+
+    async def await_run(self, run_id: str, timeout: Optional[float] = None) -> bool:
+        '''Await a run without blocking the calling thread.
+
+        The completion flag is a thread event, so it is polled with
+        ``asyncio.sleep`` from the caller's loop instead of a blocking wait. Use
+        this from async code (``await`` a group's members) and ``wait_run`` from
+        synchronous code.
+
+        Args:
+            run_id (str): The run id.
+            timeout (Optional[float]): Seconds to wait; None waits forever.
+
+        Returns:
+            bool: True when the run is finished (including one that had already
+            finished), False for an unknown run id or on timeout.
+        '''
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            event = self.run_done_event(run_id)
+            if event is None:
+                return False
+            if event.is_set():
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(POLL_INTERVAL)
 
 
 orchify_broker = Broker()

@@ -2,42 +2,113 @@
 
 A Python framework for building LLM-powered AI agent orchestration systems.
 
+## Contents
+
+- [Installation](#installation)
+- [Command Line](#command-line)
+- [Quick Start](#quick-start)
+- [With Tools](#with-tools)
+- [Examples](#examples)
+- [Environment Variables](#environment-variables)
+- [Configuration in Code](#configuration-in-code)
+- [Timeouts, Retries and Cancellation](#timeouts-retries-and-cancellation)
+- [Budgets, Gates and Call Depth](#budgets-gates-and-call-depth)
+- [Event Monitoring](#event-monitoring)
+- [Subscribing from Your Code](#subscribing-from-your-code)
+- [Runs and Turns](#runs-and-turns)
+- [Waiting for a Run](#waiting-for-a-run)
+- [Groups](#groups)
+- [Pause/Resume/Stop](#pauseresumestop)
+- [Manual Approval Pool](#manual-approval-pool)
+- [Open Questions (`ask_user`)](#open-questions-ask_user)
+- [Terminal Console](#terminal-console)
+- [Errors](#errors)
+- [Async Tools and the Result Cache](#async-tools-and-the-result-cache)
+- [Global Manager](#global-manager)
+- [Logging](#logging)
+- [Testing Your Agents](#testing-your-agents)
+- [Tests](#tests)
+
 ## Installation
 
 ```bash
 pip install -e .
 ```
 
+## Command Line
+
+Installing the package also adds an `orchify` console script; from a checkout,
+`python -m orchify` reaches the same entry point:
+
+```bash
+orchify version         # orchify and Python versions
+orchify doctor          # python, dependencies, credentials, backend, gates, plugins
+orchify doctor --json   # the same report as JSON; exits 1 when a check fails
+orchify doctor --live   # also probes the provider's /models endpoint over HTTP
+orchify demo            # offline walkthrough: scripted answer, tool call, approval
+orchify demo --live     # one real answer through the provider in .env
+```
+
+`doctor` reports each check as `ok`, `warn` or `fail` and exits non-zero only
+for a `fail`. It never contacts the network unless you pass `--live`, so it is
+safe to run anywhere, and it warns when an installed copy of orchify shadows the
+checkout you are standing in.
+
 ## Quick Start
 
+One call asks the question and returns the answer:
+
 ```python
-from orchify import Agent, OpenAICompat
+from orchify import Agent
 
-llm = OpenAICompat()
-agent = Agent(name="MyAgent", llm=llm, system_prompt="You are a helpful assistant.")
+agent = Agent.from_env(
+    name="MyAgent",
+    system_prompt="You are a helpful assistant.",
+)
 
-agent.run(user_input="Hello!")
+print(agent.ask("Hello!"))
 ```
+
+`Agent.from_env()` reads `API_KEY`/`OPENAI_API_KEY`, `BASE_URL` and `MODEL_ID` for
+you; pass `llm=OpenAICompat(...)` instead when you want to build the client
+yourself. `ask()` starts a run and blocks until it finishes, so it must not be
+called from the orchestrator loop thread — use `await agent.aask(...)` there.
+`run()`/`arun()` give you the raw run handle when you want to monitor or stop a
+run yourself.
 
 ## With Tools
 
 ```python
-from orchify import Agent, OpenAICompat, tool
+from orchify import Agent, tool
 
 @tool(cache=True)
 def get_weather(city: str) -> str:
     """Get weather for a city."""
     return f"Weather in {city}: Sunny, 25°C"
 
-llm = OpenAICompat()
-agent = Agent(
+agent = Agent.from_env(
     name="WeatherBot",
-    llm=llm,
     system_prompt="You are a weather assistant.",
-    tools=[get_weather]
+    tools=[get_weather],
 )
 
-agent.run(user_input="What's the weather in Tokyo?")
+print(agent.ask("What's the weather in Tokyo?"))
+```
+
+## Examples
+
+Runnable scripts live in `examples/`:
+
+| Script | What it shows |
+| --- | --- |
+| `examples/quickstart.py` | One `ask()` call against your provider. |
+| `examples/tools.py` | A tool whose schema comes from its signature and docstring. |
+| `examples/approval_console.py` | `console()` approving risky tool calls in the terminal. |
+| `examples/group_vote.py` | A `mode='voting'` panel and its winner. |
+| `examples/offline_demo.py` | The whole flow with `orchify.testing.FakeLLM` — no API key needed. |
+
+```bash
+python examples/offline_demo.py
 ```
 
 ## Environment Variables
@@ -79,6 +150,42 @@ Optional runtime tuning (all have safe defaults):
 | `ORCHIFY_MANAGER_SINK` | unset (no file IO) | Path of a JSONL file every event and finished run is appended to; replay with `orchify.manager.read_sink()`. |
 | `ORCHIFY_LOG_ECHO` | `1` | Echo library diagnostics to stdout; `0` leaves them to your own logging config. |
 | `ORCHIFY_LOG_LEVEL` | `INFO` | Level of the `orchify` logger (an invalid value falls back to `INFO`). |
+
+## Configuration in Code
+
+`configure()` sets the same knobs as the environment variables at runtime, for
+every part of the library that reads them:
+
+```python
+from orchify import config, configure, gate_stats
+
+configure(
+    max_call_depth=4,
+    budget_usd=0.50,
+    max_concurrent_runs=2,
+    llm_rpm=120,
+    manager_sink="runs.jsonl",
+    log_echo=False,
+)
+
+print(config().max_call_depth)      # 4
+print(gate_stats()["llm_rpm"])      # per_minute 120
+```
+
+`configure()` writes the values into `os.environ`, refreshes the poll interval,
+rebuilds the run/LLM gates, re-applies the logging settings, resizes the shared
+HTTP timeout and re-configures the global manager. Values that only matter when
+an object is constructed (`pause_timeout`, `approval_timeout`, `tool_timeout`,
+`budget_*`, `vote_timeout`) apply to objects created afterwards. An unknown
+setting raises `TypeError`, and `config().resolved()` shows the effective value
+of every setting together with the environment variable it came from.
+
+Two conveniences round it out:
+
+```python
+agent = Agent.from_env("MyAgent", system_prompt="You are terse.")  # llm built for you
+agent.reset()                                                      # forget the conversation
+```
 
 ## Timeouts, Retries and Cancellation
 
@@ -141,6 +248,27 @@ agent.run(user_input="Hi!")
 Hooks are selected under the broker lock but **invoked outside it**, so a slow
 hook delays only its own event, not every other run (or the emitting thread).
 
+## Subscribing from Your Code
+
+`orchify.on()` is the short form of the same thing, and it does not require your
+hook to pretend to be a plugin:
+
+```python
+from orchify import on, off
+
+@on('tool:call:start')
+def log_tool(event):
+    print(f"tool {event.tool_name}")
+
+binding = on('run:finish', lambda event: print(event.payload), once=True)
+
+off(binding)      # a HookBinding, an owner name or the callback itself
+```
+
+A hook registered by an application fires whatever `owner` it carries; only
+hooks registered as plugins are filtered by an agent's `enabled_plugins`, so
+plugin isolation still holds.
+
 ## Runs and Turns
 
 Every `Agent.run()` / `Group.run()` is one **run**, identified by a `run_id`.
@@ -193,11 +321,24 @@ agent.last_answer               # the final answer of the last run
 `Agent.wait()` / `Group.wait()` default their timeout to `ORCHIFY_RUN_TIMEOUT`
 (unset = wait forever) and raise `RuntimeError` when called from the
 orchestrator loop thread, where waiting would deadlock the run being waited for.
+When you only want the answer, `ask()` combines `run()` + `wait()` for you and
+`aask()`/`arun()` are its awaitable forms:
+
+```python
+answer = agent.ask("Hello!", timeout=30)      # blocking, raises RunTimeout/RunFailed
+answer = await agent.aask("Hello!")           # safe on the orchestrator loop
+run_id = await agent.arun("Hello!")           # same, but you get the run id
+```
+
+`Group.ask()` follows the same shape and resolves the answer of the member (or
+nested group) that produced it. `agent.reset()` clears the conversation,
+`agent.last_error` holds the traceback of the last aborted run, and
+`Agent.from_env(...)` builds the LLM from the environment for you.
 
 One `Agent` handles one run at a time by default: a second `run()` while the
-first is still in flight raises `RuntimeError`, because both would share
-`agent.messages` and `agent.last_run_id`. Use a second instance, or pass
-`Agent(..., allow_concurrent_runs=True)` to opt into the overlap. `Group`
+first is still in flight raises `RunAlreadyActive` (a `RuntimeError`), because
+both would share `agent.messages` and `agent.last_run_id`. Use a second instance,
+or pass `Agent(..., allow_concurrent_runs=True)` to opt into the overlap. `Group`
 follows the same rule.
 
 ## Groups
@@ -310,6 +451,48 @@ def on_question(event):
 * An unanswered question times out into `[no answer] the user did not answer the
   question` — the run continues instead of hanging.
 
+## Terminal Console
+
+`console()` watches the pool for you: it prints every pending approval and
+question and sends the answer you type back to the waiting agent. That is all
+`examples/offline_demo.py` needs to drive a full approval + question flow.
+
+```python
+from orchify import console
+
+loop = console()          # inp=input, out=print
+loop.start()              # a daemon thread
+try:
+    print(agent.ask("Ship the release."))
+finally:
+    loop.stop()
+```
+
+`console(inp=..., out=...)` accepts any callables, so a test or a GUI can answer
+from a queue instead of a keyboard; `run_once()` handles at most one item and
+returns whether it did anything. The top-level shortcut functions
+`approvals()`, `pending_approvals()`, `questions()`, `approve()`, `reject()` and
+`answer()` are thin wrappers over the global manager for the cases where you want
+to build your own loop.
+
+## Errors
+
+Every failure the library raises on purpose derives from `OrchifyError`, while
+still subclassing the built-in exception it used to raise, so existing
+`except RuntimeError` / `except ValueError` blocks keep working:
+
+| Exception | Base | Raised when |
+| --- | --- | --- |
+| `RunAlreadyActive` | `RuntimeError` | A second `run()` starts on an agent/group that is still running (`run_id`, `owner`). |
+| `WaitOnLoopThread` | `RuntimeError` | `wait()`/`ask()` is called from the orchestrator loop thread; await `arun()`/`aask()` instead. |
+| `RunTimeout` | `TimeoutError` | `ask()` gave up waiting; the run is asked to stop first. |
+| `RunFailed` | `OrchifyError` | The run ended with `agent:abort`; `.error` carries the traceback. |
+| `UnknownRun` | `ValueError` | Waiting for a run id that does not exist (yet). |
+
+Message texts name the fix (use `allow_concurrent_runs=True`, `wait()`, a second
+instance, `arun()`), so a failure tells you what to change instead of only what
+broke.
+
 ## Async Tools and the Result Cache
 
 `async def` tools work: a coroutine returned by a tool is awaited on the
@@ -412,6 +595,35 @@ logger = get_logger(__name__)      # a child of the 'orchify' logger
 `ORCHIFY_LOG_ECHO=0` is the environment equivalent of `echo=False`: no handler is
 added and records propagate to your root logger.
 
+## Testing Your Agents
+
+`orchify.testing` ships the same helpers the suite uses, so you can test an agent
+without a provider, a key or a network:
+
+```python
+from orchify import Agent
+from orchify.testing import FakeLLM, final, tool_call, Recorder
+
+agent = Agent(
+    name="Bot",
+    llm=FakeLLM([
+        [final("", [tool_call("lookup", '{"key": "alpha"}')])],
+        [final("the answer")],
+    ]),
+    tools=[lookup],
+)
+
+with Recorder() as rec:
+    assert agent.ask("ask me something") == "the answer"
+
+print(rec.types())        # ['run:start', 'agent:start', ... , 'run:finish']
+```
+
+A script entry is either `{'content': '...'}` (a streamed chunk), `{'final':
+...}` (the terminal response, built by `final()`), or `{'delay': 0.1}`;
+`FakeLLM.calls` records the messages each request carried, which is how the
+suite asserts on tool results and feedback.
+
 ## Tests
 
 ```bash
@@ -422,10 +634,16 @@ python tests/test_budget_gate.py
 python tests/test_ask_user.py
 python tests/test_sink.py
 python tests/test_tool_runtime.py
+python tests/test_ergonomics.py
+python tests/test_plugins.py
+python tests/test_llm_middleware.py
+python tests/test_run_outcome.py
+python tests/test_group_async.py
+python tests/test_cli.py
 ```
 
 The suite is fully offline: a scripted fake LLM stands in for the provider.
-82 tests, no network — the four pause points (including mid-stream and the last
+162 tests, no network — the four pause points (including mid-stream and the last
 step), the lost-resume race, stop-while-parked, approval approve/reject/timeout,
 run/turn identity, group member handles and the voting tally, the per-instance
 run guard (`allow_concurrent_runs`), run-completion handles and their reuse,
@@ -436,10 +654,16 @@ agents and groups, async tools and the tool result cache, the open-question
 channel (`ask_user`), the JSONL sink and `read_sink()`, plus the
 global manager (registration and weakref release, the disabled/zero-cost mode,
 run lifecycle and history, the approval pool, stop/stop_all, group visibility,
-event filters, bounded buffers, and `to_json()`/`report()`), and the edges:
+event filters, bounded buffers, and `to_json()`/`report()`), the ergonomics
+surface (`ask()`/`aask()`/`arun()`, `reset()`, `from_env()`, the typed
+exceptions, `on()`/`off()`, `configure()`/`config()`, `console()`), the edges:
 logging configuration and the hook-failure record, `CallChain` (plus the
 `Agent`/`Group` chain getters), plugin loading/`attach`/`detach_tools`, the
-`WebBackend` lifecycle and `Vote`.
+`WebBackend` lifecycle and `Vote`, the plugin manager (registration errors,
+dependency order, discovery, load/unload closures), middleware ordering, scoping
+and owner filtering in the LLM dispatch chain, the per-run terminal outcome
+registry behind `ask()`, `Group.arun()`/`Group.aask()` and the non-blocking
+`await_run()`, and the `orchify` command line (`doctor`, `demo`, `version`).
 
 `tests/smoke_live_control.py`, `tests/smoke_live_manager.py` and
 `tests/smoke_live_features.py` are opt-in live smokes: they talk to a real
@@ -451,6 +675,10 @@ CI (`.github/workflows/ci.yml`) runs the same suite on Python 3.9/3.11/3.13 and
 builds the sdist + wheel; on 3.13 it also prints a coverage report (`pytest-cov`)
 for information — there is no coverage gate.
 
-The package is configured in `pyproject.toml` (setuptools). `setup.py` remains
-only as a shim, because `install.py` / `publish.py` shell out to
-`setup.py sdist bdist_wheel`.
+The package is configured in `pyproject.toml` (setuptools). `install.py` and
+`publish.py` drive the standard frontends — `python -m build` for the sdist and
+wheel, `python -m twine upload` over `dist/*` — and `setup.py` remains only as a
+shim. The wheel ships `orchify/py.typed` and `orchify/cli.py`, and
+`pip install -e ".[dev]"` adds `pytest`, `pytest-cov`, `mypy`, `build` and
+`twine`; `mypy orchify` is wired through `[tool.mypy]` but stays advisory rather
+than a CI gate.
