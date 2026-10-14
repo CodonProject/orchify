@@ -1,2 +1,4 @@
+# Runtime dependencies (kept in sync with [project].dependencies in pyproject.toml)
+httpx>=0.24
 docstring_parser
-dotenv
+python-dotenv

@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orchify"
+description = "A lightweight, event-driven orchestration library for LLM agents"
+readme = "README.md"
+# Builtin generics (dict[str, ...], list[...]) are used in annotations, which are
+# evaluated at runtime, so 3.9 is the real floor.
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Yizhou Li" }]
+keywords = ["llm", "agent", "orchestration", "openai", "tools"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "httpx>=0.24",
+    "docstring_parser",
+    "python-dotenv",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/YizhouLi/orchify"
+
+[tool.setuptools]
+packages = ["orchify", "orchify.llm"]
+
+[tool.setuptools.dynamic]
+version = { attr = "orchify.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The default cache provider tries to write .pytest_cache, which some locked-down
+# environments deny; the offline suite does not need it.
+addopts = "-p no:cacheprovider"

@@ -1,4 +1,6 @@
 import json
+import asyncio
+import os
 import httpx
 
 from typing import AsyncGenerator, Optional, Literal
@@ -6,6 +8,54 @@ from typing import AsyncGenerator, Optional, Literal
 from orchify.llm.base import Chunk, FinalStatus, Response, LLMInterface
 from orchify.env import req_key, req_url, req_model
 from orchify.backend import orchify_web_backend
+
+
+# Transient failures worth retrying when nothing has been streamed yet.
+RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+_MAX_RETRY_DELAY = 30.0
+
+
+def _read_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if not raw or raw.strip() == '':
+        return default
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+def _read_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if not raw or raw.strip() == '':
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+def _is_retryable(exc: Exception) -> bool:
+    '''429/5xx and any transport error (including timeouts) are transient.'''
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in RETRYABLE_STATUS
+    return isinstance(exc, httpx.TransportError)
+
+
+def _retry_delay(attempt: int, exc: Exception) -> float:
+    '''Exponential backoff, honoring a Retry-After header when the server sent one.'''
+    response = getattr(exc, 'response', None)
+    if response is not None:
+        raw = response.headers.get('Retry-After')
+        if raw:
+            try:
+                return max(0.0, min(float(raw), _MAX_RETRY_DELAY))
+            except (TypeError, ValueError):
+                pass
+    backoff = _read_float_env('ORCHIFY_LLM_RETRY_BACKOFF', 0.5)
+    return min(backoff * (2 ** attempt), _MAX_RETRY_DELAY)
 
 
 class OpenAICompat(LLMInterface):
@@ -88,6 +138,36 @@ class OpenAICompat(LLMInterface):
 
         return data
 
+    async def _resilient_lines(self, url: str, headers: dict, data: dict) -> AsyncGenerator[str, None]:
+        '''
+        Stream response lines, retrying transient failures.
+
+        A retry is safe only while NOTHING has been streamed yet (the caller has
+        seen no partial content): connect errors, timeouts before the first line
+        and error statuses such as 429/503 all qualify. A connection that dies
+        mid-answer is raised as-is, because the caller has already consumed part
+        of the answer and a silent replay could duplicate output.
+
+        ORCHIFY_LLM_MAX_RETRIES (default 2) and ORCHIFY_LLM_RETRY_BACKOFF
+        (default 0.5s, exponential) control this; a Retry-After header wins.
+        '''
+        attempt = 0
+        while True:
+            produced = False
+            try:
+                async for line in orchify_web_backend.post_stream_async(url, headers=headers, json_data=data):
+                    produced = True
+                    yield line
+                return
+            except (httpx.HTTPStatusError, httpx.TransportError) as exc:
+                max_retries = _read_int_env('ORCHIFY_LLM_MAX_RETRIES', 2)
+                if produced or attempt >= max_retries or not _is_retryable(exc):
+                    raise
+                delay = _retry_delay(attempt, exc)
+                attempt += 1
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
     async def _core_request(
         self,
         messages: list[dict],
@@ -134,7 +214,7 @@ class OpenAICompat(LLMInterface):
             )
 
         try:
-            stream_gen = orchify_web_backend.post_stream_async(self.full_url, headers=headers, json_data=data)
+            stream_gen = self._resilient_lines(self.full_url, headers, data)
             async for line_bytes in stream_gen:
                 if not line_bytes:
                     continue

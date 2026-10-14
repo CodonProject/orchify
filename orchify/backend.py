@@ -1,7 +1,32 @@
 import asyncio
+import os
 import threading
 from typing import AsyncGenerator, Any, Dict, Optional
 import httpx
+
+
+# Request timeout for the shared HTTP client. Without one, a stalled provider
+# hangs the whole run forever and the only escape is a control:stop.
+# ORCHIFY_HTTP_TIMEOUT accepts seconds (applied to every phase), or 0 / none /
+# off to disable the timeout entirely.
+DEFAULT_HTTP_TIMEOUT = httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=60.0)
+
+
+def _read_http_timeout():
+    '''Resolve ORCHIFY_HTTP_TIMEOUT into an httpx timeout (or None = no timeout).'''
+    raw = os.getenv('ORCHIFY_HTTP_TIMEOUT')
+    if not raw or raw.strip() == '':
+        return DEFAULT_HTTP_TIMEOUT
+    value = raw.strip().lower()
+    if value in ('0', 'none', 'off', 'false', '-1', 'inf', 'infinite'):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_HTTP_TIMEOUT
+    if seconds <= 0:
+        return None
+    return httpx.Timeout(seconds)
 
 
 class WebBackend:
@@ -18,6 +43,7 @@ class WebBackend:
         '''
         self._loop = asyncio.new_event_loop()
         self._client: Optional[httpx.AsyncClient] = None
+        self.timeout = _read_http_timeout()
         self._thread = threading.Thread(
             target=self._run_loop,
             name='OrchifyWebBackend',
@@ -30,7 +56,7 @@ class WebBackend:
         Target function for the background thread running the event loop.
         '''
         asyncio.set_event_loop(self._loop)
-        self._client = httpx.AsyncClient(timeout=None)
+        self._client = httpx.AsyncClient(timeout=self.timeout)
         self._loop.run_forever()
 
     async def _cleanup(self) -> None:
@@ -67,6 +93,10 @@ class WebBackend:
             str: Lines of the response stream.
         '''
         async with self._client.stream('POST', url, headers=headers, json=json_data) as response:
+            if response.status_code >= 400:
+                # Read the error body so raise_for_status() details survive the
+                # stream context (and so callers can see Retry-After / messages).
+                await response.aread()
             response.raise_for_status()
             async for line in response.aiter_lines():
                 yield line

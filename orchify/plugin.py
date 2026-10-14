@@ -80,14 +80,17 @@ class Plugin:
     # ---------- declarative markers (class-level decorators) ----------
 
     @staticmethod
-    def hook(event_type: Union[str, List[str]] = '*', *, turn_id: Optional[str] = None,
+    def hook(event_type: Union[str, List[str]] = '*', *, run_id: Optional[str] = None,
+             turn_id: Optional[str] = None,
              mode: str = 'normal', once: bool = False,
              agent_name: Optional[str] = None, match: Optional[Callable] = None) -> Callable:
         '''Mark a method to be registered as a hook when the plugin loads.
-        `event_type` may be a single string or a list of strings.'''
+        `event_type` may be a single string or a list of strings. `run_id` binds
+        the hook to one execution (removed when that run finishes); `turn_id` is
+        a legacy alias.'''
         def decorator(func: Callable) -> Callable:
             func.__plugin_hook__ = dict(
-                event_type=event_type, turn_id=turn_id,
+                event_type=event_type, run_id=run_id, turn_id=turn_id,
                 mode='once' if once else mode, agent_name=agent_name, match=match,
             )
             return func
@@ -155,14 +158,15 @@ class Plugin:
 
     # ---------- imperative helpers (usable inside on_load) ----------
 
-    def on(self, event_type: Union[str, List[str]] = '*', *, turn_id: Optional[str] = None,
-           mode: str = 'normal', once: bool = False,
+    def on(self, event_type: Union[str, List[str]] = '*', *, run_id: Optional[str] = None,
+           turn_id: Optional[str] = None, mode: str = 'normal', once: bool = False,
            agent_name: Optional[str] = None, match: Optional[Callable] = None) -> Callable:
         '''Register a hook tracked by this plugin (auto-removed on unload).
         `event_type` may be a single string or a list of strings.'''
         def decorator(func: Callable) -> Callable:
             binding = self.broker.register_hook(
                 event_type, func,
+                run_id=run_id,
                 turn_id=turn_id,
                 mode='once' if once else mode,
                 agent_name=agent_name,
@@ -178,12 +182,27 @@ class Plugin:
         kwargs.setdefault('source', 'plugin')
         return self.broker.event(event_type, **kwargs)
 
-    def feedback(self, ftype: str, *, task_name: Optional[str] = None,
-                 turn_id: Optional[str] = None,
+    def feedback(self, ftype: str, *, run_id: Optional[str] = None,
+                 turn_id: Optional[str] = None, task_name: Optional[str] = None,
                  payload: Optional[dict] = None) -> bool:
-        '''Convenience wrapper around broker.feedback() for the reverse control channel.'''
-        return self.broker.feedback(ftype, task_name=task_name, turn_id=turn_id,
-                                    payload=payload)
+        '''Convenience wrapper around broker.feedback() for the reverse control channel.
+
+        Target the run with `run_id` (see Agent.run's return value).
+        '''
+        return self.broker.feedback(ftype, run_id=run_id, turn_id=turn_id,
+                                    task_name=task_name, payload=payload)
+
+    def pending_approvals(self, run_id: Optional[str] = None) -> list:
+        '''Manual-confirmation requests still waiting for a decision.'''
+        return self.broker.pending_approvals(run_id)
+
+    def approve(self, approval_id: str, *, reason: str = '', remove: bool = False) -> bool:
+        '''Accept a pending approval request. Returns False if it is unknown or stale.'''
+        return self.broker.approve(approval_id, reason=reason, remove=remove)
+
+    def reject(self, approval_id: str, *, reason: str = 'denied', remove: bool = False) -> bool:
+        '''Deny a pending approval request. Returns False if it is unknown or stale.'''
+        return self.broker.reject(approval_id, reason=reason, remove=remove)
 
     def add_tool(self, tool: Tool, agent=None) -> Tool:
         '''Register an already-constructed Tool with this plugin; optionally attach to an agent.'''
@@ -235,23 +254,25 @@ class Plugin:
 
     # ---------- plugin config ----------
 
-    def get_config(self, key: str = None, task_name: str = None):
+    def get_config(self, key: str = None, run_id: str = None, task_name: str = None):
         '''
-        Read plugin configuration from the broker task context.
+        Read plugin configuration from the broker run context.
 
         Args:
             key: specific config key to retrieve. If None, returns the full
                  config dict for this plugin.
-            task_name: the task/run name to look up. If None, attempts to
-                       find the currently active task for this plugin's agent.
+            run_id: the run to look up (see Agent.run). If None, attempts to
+                    find the currently active run for this plugin's agent.
+            task_name: deprecated alias of run_id.
 
         Returns the config value, or None if not found.
         '''
-        if task_name is None:
-            task_name = self._find_active_task()
-        if task_name is None:
+        run_id = run_id or task_name
+        if run_id is None:
+            run_id = self._find_active_run()
+        if run_id is None:
             return None
-        ctx = self.broker.get_run_context(task_name)
+        ctx = self.broker.get_run_context(run_id)
         if ctx is None:
             return None
         cfg = ctx.get('plugin_config', {}).get(self.id)
@@ -261,12 +282,12 @@ class Plugin:
             return cfg
         return cfg.get(key)
 
-    def _find_active_task(self) -> Optional[str]:
-        '''Find the most recent active task for this plugin's scope.'''
-        for task_name, ctx in self.broker.run_contexts.items():
+    def _find_active_run(self) -> Optional[str]:
+        '''Find the most recent active run for this plugin's scope.'''
+        for run_id, ctx in self.broker.run_contexts.items():
             agent_name = ctx.get('agent_name', '')
             if self.matches(agent_name):
-                return task_name
+                return run_id
         return None
 
     # ---------- cleanup ----------

@@ -2,8 +2,6 @@ from orchify import Agent, OpenAICompat
 from orchify.broker import orchify_broker
 from orchify.event import BaseEvent
 
-import time
-
 endpoint = OpenAICompat()
 
 agent = Agent(
@@ -17,11 +15,13 @@ agent = Agent(
 def handle_agent_events(event: BaseEvent):
     # 1. 运行生命周期事件
     if event.event_type == 'run:start':
-        print(f"\n[Run Start] Agent: {event.agent_name} (#{event.agent_code}), Turn: {event.turn_id}")
+        print(f"\n[Run Start] Agent: {event.agent_name} (#{event.agent_code})")
+        print(f"  run_id : {event.run_id}   (one execution; feedback targets this)")
+        print(f"  turn_id: {event.turn_id}   (one LLM round trip)")
         print(f"User Input: {event.payload.get('user_input')}\n")
     
     elif event.event_type == 'run:next':
-        print(f"\n[Next Turn] Entering Step {event.turn}...")
+        print(f"\n[Next Turn] Entering Step {event.turn} ({event.turn_id})...")
 
     # 2. LLM 推理（CoT思维链）事件 - 如果是支持思维链的模型（如 DeepSeek R1/o1）会触发
     elif event.event_type == 'agent:reason:step':
@@ -59,11 +59,17 @@ def handle_agent_events(event: BaseEvent):
 
     # 6. 运行结束
     elif event.event_type == 'run:finish':
-        print(f"\n[Run Finished] Total Steps: {event.payload.get('total_steps')}")
+        print(f"\n[Run Finished] run_id: {event.run_id}")
+        print(f"Total Steps: {event.payload.get('total_steps')}")
         print(f"Total Tokens: {event.payload.get('usage', {}).get('total_tokens')}")
+        print(f"Answer: {event.payload.get('answer')!r}")
 
 
-agent.run(user_input='你好')
+run_id = agent.run(user_input='你好')
 
-while orchify_broker.runs:
-    time.sleep(1)
+# Wait for exactly this execution instead of busy-polling the broker. From a
+# different thread you can also stop it: agent.cancel(run_id).
+if not agent.wait(run_id):
+    print(f'\n[Main] run {run_id} did not finish before ORCHIFY_RUN_TIMEOUT')
+
+print(f'\n[Main] final answer: {agent.last_answer!r}')

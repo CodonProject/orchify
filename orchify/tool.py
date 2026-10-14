@@ -12,13 +12,19 @@ class Tool:
         name: Optional[str] = None,
         description: Optional[str] = None,
         parameters: Optional[List[Dict[str, Any]]] = None,
-        cache: Optional[Any] = None
+        cache: Optional[Any] = None,
+        require_approval: bool = False,
     ):
         '''
         cache: 结果缓存配置
           - None / False / 0 : 不缓存（默认）
           - True            : 永久缓存（相同参数只执行一次）
           - 数字（秒）       : 限时缓存，过期后重新执行
+
+        require_approval: when True, the owning Agent parks this call in the
+          broker's approval pool and waits for a manual approve()/reject()
+          before executing it. The Agent can also demand approval for every tool
+          through its own `require_approval` policy.
         '''
         self.func = func
 
@@ -28,11 +34,17 @@ class Tool:
         self.description: str = description or analysis.get('docstring', 'No description provided.')
         self.parameters: List[Dict[str, Any]] = parameters or analysis.get('parameters', [])
         self.cache = cache
+        self.require_approval: bool = bool(require_approval)
 
         self._cache: Dict[str, tuple] = {}
         self._cache_lock = threading.RLock()
         self.last_cached: bool = False
         self._info = self.build_info()
+
+    @property
+    def needs_approval(self) -> bool:
+        '''True when this tool must be manually confirmed before it runs.'''
+        return bool(self.require_approval)
     
     @property
     def info(self) -> Dict[str, Any]:
@@ -143,7 +155,8 @@ def tool(
     name: Optional[str] = None,
     description: Optional[str] = None,
     parameters: Optional[List[Dict[str, Any]]] = None,
-    cache: Optional[Any] = None
+    cache: Optional[Any] = None,
+    require_approval: bool = False,
 ):
     def decorator(func: Callable) -> Tool:
         return Tool(
@@ -151,6 +164,7 @@ def tool(
             name=name,
             description=description,
             parameters=parameters,
-            cache=cache
+            cache=cache,
+            require_approval=require_approval,
         )
     return decorator

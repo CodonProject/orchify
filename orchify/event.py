@@ -6,6 +6,21 @@ import json
 import time
 
 
+# ---------------------------------------------------------------------------
+# Run / turn identity (see also broker.make_turn_id)
+#
+#   run_id  : one Agent.run()/Group.run() execution. Unique, stable, returned by
+#             run() and carried on EVERY event. This is what feedback targets.
+#   turn    : the 1-based LLM round trip inside a run (a "step").
+#   turn_id : one turn, formatted '<run_id>#<turn>'. Fine-grained label, e.g.
+#             for tracing a single request; resolvable back to its run via
+#             Broker.run_id_of_turn().
+#
+# So a run contains many turns. Feedback must address the run (run_id), never a
+# turn, because a turn ends as soon as its response is consumed.
+# ---------------------------------------------------------------------------
+
+
 EVENT_TYPES: TypeAlias = Literal[
     'agent:start',
     'agent:reason:step',
@@ -23,6 +38,8 @@ EVENT_TYPES: TypeAlias = Literal[
     'run:next',
     'run:paused',
     'run:resumed',
+    'run:approval:required',
+    'run:approval:resolved',
     'run:finish',
     'group:start',
     'group:step',
@@ -321,6 +338,94 @@ class RuntimeEvent(BaseEvent):
         metadata: dict = None,
     ):
         super().__init__(agent_name, agent_code, turn_id, turn=turn, event_type=event_type, payload=payload, run_id=run_id, source=source, metadata=metadata)
+
+
+class ApprovalEvent(BaseEvent):
+    '''
+    Emitted around a manual-approval gate.
+
+    payload for 'run:approval:required':
+        {'approval_id', 'kind', 'tool_id', 'tool_name', 'args', 'step', 'timeout'}
+    payload for 'run:approval:resolved':
+        {'approval_id', 'kind', 'tool_id', 'tool_name', 'approved', 'reason',
+         'timed_out', 'step'}
+
+    The decision itself is delivered through orchify_broker.resolve_approval()
+    (or the convenience parent methods below); the event only carries the
+    identifier and context needed for a UI to render the prompt.
+    '''
+
+    @staticmethod
+    def build_required(
+        agent_name: str,
+        agent_code: str,
+        turn_id: str,
+        approval_id: str,
+        kind: str = 'tool',
+        tool_id: str = '',
+        tool_name: str = '',
+        args: Optional[dict] = None,
+        step: int = 1,
+        timeout: Optional[float] = None,
+    ) -> 'ApprovalEvent':
+        event = ApprovalEvent(
+            agent_name=agent_name,
+            agent_code=agent_code,
+            turn_id=turn_id,
+            turn=step,
+            event_type='run:approval:required',
+            payload={
+                'approval_id': approval_id,
+                'kind': kind,
+                'tool_id': tool_id,
+                'tool_name': tool_name,
+                'args': args or {},
+                'step': step,
+                'timeout': timeout,
+            },
+        )
+        event.approval_id = approval_id
+        event.kind = kind
+        event.tool_id = tool_id
+        event.tool_name = tool_name
+        return event
+
+    @staticmethod
+    def build_resolved(
+        agent_name: str,
+        agent_code: str,
+        turn_id: str,
+        approval_id: str,
+        kind: str = 'tool',
+        tool_id: str = '',
+        tool_name: str = '',
+        approved: bool = False,
+        reason: str = '',
+        timed_out: bool = False,
+        step: int = 1,
+    ) -> 'ApprovalEvent':
+        event = ApprovalEvent(
+            agent_name=agent_name,
+            agent_code=agent_code,
+            turn_id=turn_id,
+            turn=step,
+            event_type='run:approval:resolved',
+            payload={
+                'approval_id': approval_id,
+                'kind': kind,
+                'tool_id': tool_id,
+                'tool_name': tool_name,
+                'approved': bool(approved),
+                'reason': reason,
+                'timed_out': bool(timed_out),
+                'step': step,
+            },
+        )
+        event.approval_id = approval_id
+        event.kind = kind
+        event.tool_id = tool_id
+        event.tool_name = tool_name
+        return event
 
 
 class GroupEvent(BaseEvent):

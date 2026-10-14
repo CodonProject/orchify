@@ -1,30 +1,76 @@
 from typing import List, Dict, Union, Optional, Any
 
+import os
+import threading
+import time
+
 from .agent import Agent
+from .backend import orchify_web_backend
 from .call_chain import CallChain
+from .schema import Vote
 from .tool import Tool
 from .utils import safecode
-from .broker import orchify_broker
+from .broker import orchify_broker, make_turn_id
 from .event import RuntimeEvent, GroupEvent as GroupEventBase
 
 
+def _read_float_env(name: str) -> Optional[float]:
+    '''Positive float from the environment, or None when unset/invalid.'''
+    raw = os.getenv(name)
+    if not raw or raw.strip() == '':
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+# how long a 'voting' run waits for its members before tallying, unless
+# ORCHIFY_VOTE_TIMEOUT (or Group(vote_timeout=...)) says otherwise. 0 or a
+# negative value restores the old "dispatch and return" behaviour.
+DEFAULT_VOTE_TIMEOUT = 300.0
+
+
+def _read_vote_timeout_env() -> Optional[float]:
+    '''ORCHIFY_VOTE_TIMEOUT as a float ('0' means "do not wait"), else None.'''
+    raw = os.getenv('ORCHIFY_VOTE_TIMEOUT')
+    if raw is None or raw.strip() == '':
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 class GroupEventBroker:
-    '''Simple event broker for collecting group events.'''
-    
+    '''Simple event broker for collecting group events.
+
+    Unlike `orchify_broker.emit` (which may be called from a member's thread),
+    this one is locked: members running in parallel append to the same event
+    list, and callbacks are invoked on the emitting thread AFTER the lock is
+    released so a slow callback cannot block appends.
+    '''
+
     def __init__(self):
         self.events: List[GroupEventBase] = []
         self._callbacks: List[Any] = []
-    
+        self._lock = threading.RLock()
+
     def emit(self, event: GroupEventBase):
-        self.events.append(event)
-        for callback in self._callbacks:
+        with self._lock:
+            self.events.append(event)
+            callbacks = list(self._callbacks)
+        for callback in callbacks:
             callback(event)
-    
+
     def on_event(self, callback):
-        self._callbacks.append(callback)
-    
+        with self._lock:
+            self._callbacks.append(callback)
+
     def get_events_by_type(self, event_type: str) -> List[GroupEventBase]:
-        return [e for e in self.events if e.event_type == event_type]
+        with self._lock:
+            return [e for e in self.events if e.event_type == event_type]
 
 
 class Group:
@@ -45,6 +91,9 @@ class Group:
         manager_agent_name: Optional[str] = None,
         shared_tools: Optional[List[Tool]] = None,
         mode: str = 'broadcast',
+        *,
+        allow_concurrent_runs: bool = False,
+        vote_timeout: Optional[float] = None,
     ):
         '''Initializes an Agent Group.
 
@@ -57,9 +106,14 @@ class Group:
             mode (str, optional): The communication mode between Agents.
                                   'broadcast': All Agents can call each other.
                                   'manager_delegation': Only the manager can call other Agents.
-                                  'round_robin': Agents execute sequentially in a chain.
-                                  'voting': All Agents vote on a final answer.
+                                  'voting': All Agents answer, the majority answer wins.
                                   'competition': All Agents compete, best answer wins.
+            allow_concurrent_runs (bool): refuse a second run() while one is in
+              flight (default). The group keeps `current_run_id`/`last_run_ids` on
+              the instance, so overlapping runs would clobber each other.
+            vote_timeout (float, optional): seconds a 'voting' run waits for its
+              members before tallying (defaults to ORCHIFY_VOTE_TIMEOUT; 0 or a
+              negative value dispatches without waiting, as older versions did).
         '''
         self.name = name
         self.description = description or f'A group of agents named {name}.'
@@ -69,8 +123,36 @@ class Group:
         self.mode = mode
         self.broker = GroupEventBroker()
         self.code = safecode(length=4)
+        # run identity: the group's own execution, and the run_id of every member
+        # it has dispatched (members run under their OWN run_id)
+        self.current_run_id: str = ''
+        self.last_run_id: str = ''
+        self.last_run_ids: List[str] = []
+        # voting results (filled by _run_voting)
+        self.last_votes: List[Vote] = []
+        self.last_winner: Optional[str] = None
+        self.last_answer: str = ''
+
+        # one group run at a time per instance: concurrent runs would share
+        # current_run_id / last_run_ids / last_votes.
+        self.allow_concurrent_runs = allow_concurrent_runs
+        self._run_slot = threading.Lock()
+        self._active_run_id: str = ''
+        if vote_timeout is None:
+            vote_timeout = _read_vote_timeout_env()
+        if vote_timeout is None:
+            vote_timeout = DEFAULT_VOTE_TIMEOUT
+        self.vote_timeout = vote_timeout
         
-        if mode not in ['broadcast', 'manager_delegation', 'round_robin', 'voting', 'competition']:
+        # 'round_robin' was removed: Agent.run() returns a run handle instead of
+        # the answer, so a group cannot chain members synchronously.
+        if mode == 'round_robin':
+            raise ValueError(
+                "mode 'round_robin' was removed. Chain agents yourself with "
+                "Group.call_agent()/Agent.call_agent(), or use "
+                "'manager_delegation' to have one agent drive the others."
+            )
+        if mode not in ['broadcast', 'manager_delegation', 'voting', 'competition']:
             raise ValueError(f'Unsupported mode: {mode}')
 
         self.manager_agent = None
@@ -88,13 +170,20 @@ class Group:
         self._wire_agents()
 
     def _emit(self, event_type: str, payload: dict = None):
-        '''Emit a group event.'''
+        '''Emit a group event.
+
+        Group events belong to the group's own run (`current_run_id`). A group is
+        a dispatcher, so it labels them turn 1: the LLM round trips happen inside
+        each member's own run.
+        '''
+        run_id = self.current_run_id
         event = GroupEventBase.build_group_event(
             group_name=self.name,
             group_code=self.code,
-            turn_id='',
+            turn_id=make_turn_id(run_id, 1) if run_id else '',
             event_type=event_type,
             payload=payload or {},
+            run_id=run_id,
             source_entity=self,
         )
         self.broker.emit(event)
@@ -109,20 +198,14 @@ class Group:
             elif isinstance(agent, Group):
                 all_agents_as_tools[name] = agent.as_tool()
 
-        for i, agent in enumerate(self.agent_sequence):
+        for agent in self.agent_sequence:
             final_toolset = list(agent.tools.values()) if isinstance(agent, Agent) else []
             final_toolset.extend(self.shared_tools)
 
             extra_context = {'collaboration_mode': self.mode}
             is_manager = (agent.name == self.manager_agent.name)
 
-            if self.mode == 'round_robin':
-                extra_context['mode_description'] = 'You are part of a sequential pipeline. Receive input, perform your specific task, and provide a clear final answer.'
-                prev_agent = self.agent_sequence[i-1].name if i > 0 else 'the initial user input'
-                next_agent = self.agent_sequence[i+1].name if i < len(self.agent_sequence) - 1 else 'the final output'
-                extra_context['position_in_chain'] = f'You will receive input from \'{prev_agent}\' and your output will be passed to \'{next_agent}\'.'
-            
-            elif self.mode == 'manager_delegation':
+            if self.mode == 'manager_delegation':
                 if is_manager:
                     extra_context['mode_description'] = 'You are the manager. Break down tasks and delegate to expert agents.'
                     for other_name, other_agent_as_tool in all_agents_as_tools.items():
@@ -170,7 +253,8 @@ class Group:
             orchify_broker.emit(RuntimeEvent(
                 agent_name=group_self.name,
                 agent_code=group_self.code,
-                turn_id=kwargs.get('turn_id', ''),
+                run_id=group_self.current_run_id,
+                turn_id=kwargs.get('run_id') or kwargs.get('turn_id') or '',
                 event_type='group:agent_call',
                 payload={
                     'group_name': group_self.name,
@@ -179,8 +263,8 @@ class Group:
                 }
             ))
             
-            turn_id = agent.run(user_input, **kwargs)
-            return turn_id
+            run_id = agent.run(user_input, **kwargs)
+            return run_id
         
         agent_runner.__name__ = agent.name
         agent_runner.__doc__ = f'Call agent \'{agent.name}\' to perform a task.'
@@ -231,7 +315,8 @@ class Group:
                 orchify_broker.emit(RuntimeEvent(
                     agent_name=_caller.name,
                     agent_code=_caller.code,
-                    turn_id=kwargs.get('turn_id', ''),
+                    run_id=_caller.current_run_id,
+                    turn_id=kwargs.get('run_id') or kwargs.get('turn_id') or '',
                     event_type='agent:call',
                     payload={
                         'caller': _caller.name,
@@ -242,8 +327,8 @@ class Group:
                     }
                 ))
 
-            turn_id = group_self.run(user_input, **kwargs)
-            return turn_id
+            run_id = group_self.run(user_input, **kwargs)
+            return run_id
 
         group_runner.__name__ = self.name
         group_runner.__doc__ = self.description
@@ -257,82 +342,208 @@ class Group:
         tool = Tool(func=group_runner, name=self.name, description=f'Group: {self.name}')
         return tool
 
-    def run(self, user_input: str, **kwargs) -> str:
+    def run(self, user_input: str, run_id: Optional[str] = None, **kwargs) -> str:
         '''
         Runs the entire Group to perform a task.
         The execution flow depends on the group's mode.
 
         Args:
             user_input: The input task for the group.
+            run_id: Optional handle for this group execution.
             **kwargs: Additional parameters.
 
         Returns:
-            str: The turn_id for tracking the execution.
+            str: The group's run_id. Members run under their OWN run_ids, which
+            are collected in `last_run_ids` so any single member can still be
+            stopped, paused or approved on its own.
+
+        `turn_id=` is accepted as a legacy alias of run_id.
         '''
-        self._emit('start', {'mode': self.mode, 'input': user_input})
+        run_id = run_id or kwargs.pop('turn_id', None) or f'{self.name}#{self.code}_{safecode()}'
+
+        if not self.allow_concurrent_runs and not self._run_slot.acquire(blocking=False):
+            raise RuntimeError(
+                f"Group '{self.name}' is already running (run_id={self._active_run_id or self.last_run_id}). "
+                "A Group keeps current_run_id/last_run_ids/last_votes on the instance, so overlapping "
+                "runs would clobber each other: wait for the current run (Group.wait()), stop it "
+                "(Group.cancel()), use a separate Group instance, or construct this one with "
+                "allow_concurrent_runs=True."
+            )
+
+        self._active_run_id = run_id
+        self.current_run_id = run_id
+        self.last_run_id = run_id
+        self.last_run_ids = []
+        self.last_votes = []
+        self.last_winner = None
+        self.last_answer = ''
+        orchify_broker.start_task(run_id, None, context={
+            'run_id': run_id,
+            'task_name': run_id,
+            'kind': 'group',
+            'group_name': self.name,
+            'group_code': self.code,
+            'mode': self.mode,
+            'started_at': time.time(),
+        })
+
+        self._emit('start', {'mode': self.mode, 'input': user_input, 'run_id': run_id})
         
         try:
-            if self.mode == 'round_robin':
-                turn_id = self._run_round_robin(user_input, **kwargs)
-            elif self.mode == 'voting':
-                turn_id = self._run_voting(user_input, **kwargs)
+            if self.mode == 'voting':
+                self._run_voting(user_input, **kwargs)
             elif self.mode == 'competition':
-                turn_id = self._run_competition(user_input, **kwargs)
+                self._run_competition(user_input, **kwargs)
             else:
-                turn_id = self._run_manager_based(user_input, **kwargs)
-            
-            self._emit('end', {'turn_id': turn_id})
-            return turn_id
+                self._run_manager_based(user_input, **kwargs)
+
+            self._emit('end', {
+                'run_id': run_id,
+                'agent_run_ids': list(self.last_run_ids),
+                'votes': [{'agent_name': v.agent_name, 'vote': v.vote, 'reason': v.reason} for v in self.last_votes],
+                'winner': self.last_winner,
+                'answer': self.last_answer,
+            })
+            return run_id
         except Exception as e:
             self._emit('error', {'message': str(e)})
             raise
+        finally:
+            orchify_broker.finish_task(run_id)
+            self.current_run_id = ''
+            self._release_run_slot()
 
-    def _run_round_robin(self, user_input: str, **kwargs) -> str:
-        '''Runs the group in a sequential, round-robin fashion.'''
-        if not self.agent_sequence:
-            return ''
-        
-        self._emit('step', {'action': 'Starting round-robin execution'})
-        
-        first_agent = self.agent_sequence[0]
-        turn_id = first_agent.run(user_input, **kwargs)
-        
-        self._emit('step', {
-            'action': f'Agent \'{first_agent.name}\' started',
-            'turn_id': turn_id
+    def _release_run_slot(self) -> None:
+        '''Release this group's run slot (safe to call twice).'''
+        self._active_run_id = ''
+        try:
+            self._run_slot.release()
+        except RuntimeError:
+            pass
+
+    def is_running(self) -> bool:
+        '''True while a run() is in flight on this instance.'''
+        return self._run_slot.locked()
+
+    def wait(self, run_id: Optional[str] = None, timeout: Optional[float] = None) -> bool:
+        '''
+        Block until the group's run finishes.
+
+        Args:
+            run_id: The run to wait for; defaults to the group's last run.
+            timeout: Seconds to wait; defaults to ORCHIFY_RUN_TIMEOUT (None waits
+                     forever).
+
+        Returns:
+            bool: True when the run had finished by the deadline, False otherwise
+            (also False for a run id this process never started).
+
+        Raises:
+            ValueError: when there is no run to wait for.
+            RuntimeError: when called from the orchestrator loop thread, where
+                          blocking would stall every other run.
+        '''
+        target = run_id or self.last_run_id
+        if not target:
+            raise ValueError(f"Group '{self.name}' has no run to wait for; pass run_id=... .")
+        if timeout is None:
+            timeout = _read_float_env('ORCHIFY_RUN_TIMEOUT')
+        if threading.current_thread() is orchify_web_backend._thread:
+            raise RuntimeError(
+                "Group.wait() would deadlock: it is being called from the orchestrator loop "
+                "thread, which is the thread that executes the run. Wait from your own "
+                "thread, or use the 'run:finish' hook instead."
+            )
+        return orchify_broker.wait_run(target, timeout=timeout)
+
+    def cancel(self, run_id: Optional[str] = None) -> bool:
+        '''Request a stop for this group's run (`control:stop` feedback).'''
+        target = run_id or self.last_run_id
+        if not target:
+            return False
+        return orchify_broker.feedback('control:stop', run_id=target)
+
+    @staticmethod
+    def _normalize_vote(text: Any) -> str:
+        '''Normalise an answer for tallying (whitespace + case insensitive).'''
+        return ' '.join(str(text or '').split()).strip().lower()
+
+    def _can_block_for_votes(self) -> bool:
+        '''True when this thread may block until members finish.
+
+        `vote_timeout` of 0 (or less) keeps the old fire-and-forget behaviour, and
+        the orchestrator loop thread must never block: it is the thread that
+        executes the members.
+        '''
+        if self.vote_timeout is None or self.vote_timeout <= 0:
+            return False
+        return threading.current_thread() is not orchify_web_backend._thread
+
+    def _collect_votes(self) -> None:
+        '''Tally the members' answers after waiting for them (voting mode).'''
+        votes: List[Vote] = []
+        counts: Dict[str, int] = {}
+        for agent in self.agent_sequence:
+            answer = getattr(agent, 'last_answer', '') or ''
+            votes.append(Vote(agent_name=agent.name, vote=answer))
+            key = self._normalize_vote(answer)
+            if key:
+                counts[key] = counts.get(key, 0) + 1
+
+        self.last_votes = votes
+        self.last_winner = None
+        self.last_answer = ''
+        if not counts:
+            return
+
+        # majority; ties go to the answer that reached its count first
+        winner_key = max(counts, key=lambda k: counts[k])
+        for vote in votes:
+            if self._normalize_vote(vote.vote) == winner_key:
+                self.last_winner = vote.agent_name
+                self.last_answer = str(vote.vote or '')
+                break
+        self._emit('vote', {
+            'winner': self.last_winner,
+            'answer': self.last_answer,
+            'votes': [{'agent_name': v.agent_name, 'vote': v.vote} for v in votes],
         })
-        
-        return turn_id
 
     def _run_voting(self, user_input: str, **kwargs) -> str:
         '''Runs the group in a parallel, voting-based fashion.'''
         self._emit('step', {'action': 'Starting voting execution'})
         
-        turn_ids = []
         for agent in self.agent_sequence:
-            turn_id = agent.run(user_input, **kwargs)
-            turn_ids.append(turn_id)
+            run_id = agent.run(user_input, **kwargs)
+            self.last_run_ids.append(run_id)
             self._emit('step', {
                 'action': f'Agent \'{agent.name}\' started voting',
-                'turn_id': turn_id
+                'run_id': run_id
             })
-        
-        return turn_ids[0] if turn_ids else ''
+
+        if self._can_block_for_votes():
+            deadline = time.monotonic() + self.vote_timeout
+            for member_run_id in list(self.last_run_ids):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not orchify_broker.wait_run(member_run_id, timeout=remaining):
+                    break
+            self._collect_votes()
+
+        return self.last_run_ids[0] if self.last_run_ids else ''
 
     def _run_competition(self, user_input: str, **kwargs) -> str:
         '''Runs the group in a parallel, competition-based fashion.'''
         self._emit('step', {'action': 'Starting competition execution'})
         
-        turn_ids = []
         for agent in self.agent_sequence:
-            turn_id = agent.run(user_input, **kwargs)
-            turn_ids.append(turn_id)
+            run_id = agent.run(user_input, **kwargs)
+            self.last_run_ids.append(run_id)
             self._emit('step', {
                 'action': f'Agent \'{agent.name}\' started competing',
-                'turn_id': turn_id
+                'run_id': run_id
             })
         
-        return turn_ids[0] if turn_ids else ''
+        return self.last_run_ids[0] if self.last_run_ids else ''
 
     def _run_manager_based(self, user_input: str, **kwargs) -> str:
         '''Runs the main loop for manager-based modes.'''
@@ -340,8 +551,9 @@ class Group:
             'action': f'Delegating to manager \'{self.manager_agent.name}\''
         })
         
-        turn_id = self.manager_agent.run(user_input, **kwargs)
-        return turn_id
+        run_id = self.manager_agent.run(user_input, **kwargs)
+        self.last_run_ids.append(run_id)
+        return run_id
 
     def to_dict(self) -> Dict[str, Any]:
         '''Serializes the group's configuration to a dictionary.'''
@@ -372,7 +584,7 @@ class Group:
             **kwargs: Additional parameters.
             
         Returns:
-            str: The turn_id of the agent's execution.
+            str: The run_id of the agent's execution.
         '''
         self._emit('agent_call', {
             'caller': self.name,
@@ -384,7 +596,8 @@ class Group:
         orchify_broker.emit(RuntimeEvent(
             agent_name=self.name,
             agent_code=self.code,
-            turn_id=kwargs.get('turn_id', ''),
+            run_id=self.current_run_id,
+            turn_id=kwargs.get('run_id') or kwargs.get('turn_id') or '',
             event_type='group:call_agent',
             payload={
                 'group_name': self.name,
@@ -405,7 +618,7 @@ class Group:
             **kwargs: Additional parameters.
             
         Returns:
-            str: The turn_id of the group's execution.
+            str: The run_id of the group's execution.
         '''
         self._emit('group_call', {
             'caller': self.name,
@@ -417,7 +630,8 @@ class Group:
         orchify_broker.emit(RuntimeEvent(
             agent_name=self.name,
             agent_code=self.code,
-            turn_id=kwargs.get('turn_id', ''),
+            run_id=self.current_run_id,
+            turn_id=kwargs.get('run_id') or kwargs.get('turn_id') or '',
             event_type='group:call_group',
             payload={
                 'caller_group': self.name,
