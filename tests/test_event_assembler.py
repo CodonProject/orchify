@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -124,6 +125,35 @@ def test_unparsable_and_empty_arguments_never_finish():
     assert _types(blank_after_start) == ['tool:assembly:start']
 
 
+def test_braces_and_escapes_inside_strings_do_not_finish_early():
+    '''Braces inside string literals (even escaped quotes) never close the value.'''
+    assembler = ToolEventAssembler()
+    payload = json.dumps({'code': 'if (x) { return "} " }', 'n': 1})
+    events = []
+    acc = ''
+    for i in range(0, len(payload), 4):
+        acc += payload[i:i + 4]
+        events.extend(_build(assembler, _assembly([_call('c', 'run', acc)])))
+    finishes = [event for event in events if event.event_type == 'tool:assembly:finish']
+    assert len(finishes) == 1, 'the value must finish exactly once, at the very end'
+    assert finishes[0].args == {'code': 'if (x) { return "} " }', 'n': 1}
+    assert 'tool:assembly:step' in _types(events)
+
+
+def test_large_argument_streams_to_a_single_finish():
+    '''A large streamed argument produces one finish and stays event-faithful.'''
+    assembler = ToolEventAssembler()
+    payload = json.dumps({'content': 'x' * 50000, 'path': '/tmp/f'})
+    events = []
+    acc = ''
+    for i in range(0, len(payload), 512):
+        acc += payload[i:i + 512]
+        events.extend(_build(assembler, _assembly([_call('c', 'write', acc)])))
+    finishes = [event for event in events if event.event_type == 'tool:assembly:finish']
+    assert len(finishes) == 1
+    assert finishes[0].args == {'content': 'x' * 50000, 'path': '/tmp/f'}
+
+
 def test_build_from_resp_rejects_an_empty_response():
     '''A response with neither a final status nor a narratable chunk is rejected.'''
     response = Response(current_chunk=Chunk(is_cot=False, content='', is_assembly_tool=True))
@@ -144,6 +174,8 @@ def main():
         test_multiple_calls_assemble_independently,
         test_call_without_id_is_tracked_by_index,
         test_unparsable_and_empty_arguments_never_finish,
+        test_braces_and_escapes_inside_strings_do_not_finish_early,
+        test_large_argument_streams_to_a_single_finish,
         test_build_from_resp_rejects_an_empty_response,
     ]
     failures = []

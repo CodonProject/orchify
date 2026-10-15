@@ -219,12 +219,70 @@ class ToolEventAssembler:
         _started (set): Tool-call ids whose assembly already started.
         _finished (set): Tool-call ids whose arguments parsed as complete JSON.
         _args_len (dict): Length of the arguments already reported per call.
+        _scan (dict): Per-call ``[depth, in_string, escaped]`` scan state used
+            to gate JSON parsing (see ``_advance_scan``).
     '''
 
     def __init__(self):
         self._started = set()
         self._finished = set()
         self._args_len = {}
+        self._scan = {}
+
+    def _advance_scan(self, tool_id: str, chunk: str) -> int:
+        '''Advance the JSON nesting scan with one streamed argument chunk.
+
+        Keeps, per tool call, a running brace/bracket depth plus the in-string
+        and escape state, so `build()` knows — in O(chunk) — whether the
+        accumulated arguments could possibly be complete. A value can only
+        finish when the depth returns to zero, i.e. a top-level closer just
+        arrived; only then is a parse attempt worth its cost. String contents
+        (and escapes) are skipped so braces inside string literals never move
+        the depth.
+
+        Args:
+            tool_id (str): Tool-call id the chunk belongs to.
+            chunk (str): The newly arrived argument fragment (may be empty).
+
+        Returns:
+            int: The nesting depth after applying the chunk; `0` means a
+            top-level value may now be complete.
+        '''
+        scan = self._scan.get(tool_id)
+        if scan is None:
+            scan = [0, False, False]
+            self._scan[tool_id] = scan
+        depth, in_string, escaped = scan
+        if chunk and '"' not in chunk and '\\' not in chunk:
+            # Fast path: no quote or backslash appears in this chunk, so the
+            # string state cannot change (a pending escape, if any, is simply
+            # consumed by the chunk's first character) and - outside a string -
+            # the nesting is pure brace counting. Both run at C speed instead
+            # of a per-character Python loop, which is what large content
+            # deltas (the bulk of a big argument) hit.
+            escaped = False
+            if not in_string:
+                depth += chunk.count('{') + chunk.count('[') - chunk.count('}') - chunk.count(']')
+                if depth < 0:
+                    depth = 0
+        else:
+            for ch in chunk:
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif ch == '\\':
+                        escaped = True
+                    elif ch == '"':
+                        in_string = False
+                elif ch == '"':
+                    in_string = True
+                elif ch in '{[':
+                    depth += 1
+                elif ch in '}]':
+                    if depth > 0:
+                        depth -= 1
+        scan[0], scan[1], scan[2] = depth, in_string, escaped
+        return depth
 
     def build(
         self,
@@ -282,9 +340,17 @@ class ToolEventAssembler:
             chunk_arg = arguments[last_len:]
             self._args_len[tool_id] = len(arguments)
 
+            # The parse is gated so the growing argument string is not
+            # re-parsed on every chunk (the old code was O(n**2) over a long
+            # stream and ran on the orchestrator loop thread): a chunk is only
+            # parsed when it actually added content AND the nesting depth
+            # returned to zero, i.e. a top-level closer just arrived. A partial
+            # value is never valid JSON, so no finish is ever missed - it fires
+            # on exactly the chunk a parse would have succeeded on before.
+            depth = self._advance_scan(tool_id, chunk_arg)
             parsed_args = None
             is_json_valid = False
-            if arguments.strip():
+            if chunk_arg and depth == 0 and arguments.strip():
                 try:
                     parsed_args = json.loads(arguments)
                     is_json_valid = True

@@ -5,26 +5,17 @@ import threading
 import time
 
 from .agent import Agent
-from .backend import orchify_web_backend
-from .call_chain import CallChain, CallBlocked, plan_call
-from .errors import RunAlreadyActive, RunFailed, RunTimeout, UnknownRun, WaitOnLoopThread
+from .call_chain import CallChain
+from .errors import RunFailed, RunTimeout, UnknownRun
 from .schema import Vote
 from .tool import Tool
 from .utils import safecode
 from .broker import orchify_broker, make_turn_id
 from .event import RuntimeEvent, GroupEvent as GroupEventBase
-
-
-def _read_float_env(name: str) -> Optional[float]:
-    '''Positive float from the environment, or None when unset/invalid.'''
-    raw = os.getenv(name)
-    if not raw or raw.strip() == '':
-        return None
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return None
-    return value if value > 0 else None
+from .runtime import (
+    RunSlot, assert_not_on_loop_thread, make_single_input_tool,
+    on_loop_thread, plan_outgoing_call, prepare_call, set_call_path, wait_for_run,
+)
 
 
 DEFAULT_VOTE_TIMEOUT = 300.0
@@ -272,8 +263,7 @@ class Group:
         self.last_answer: str = ''
 
         self.allow_concurrent_runs = allow_concurrent_runs
-        self._run_slot = threading.Lock()
-        self._active_run_id: str = ''
+        self._run_slot = RunSlot(name)
         if vote_timeout is None:
             vote_timeout = _read_vote_timeout_env()
         if vote_timeout is None:
@@ -424,17 +414,12 @@ class Group:
             run_id = agent.run(user_input, **kwargs)
             return run_id
 
-        agent_runner.__name__ = agent.name
-        agent_runner.__doc__ = f'Call agent \'{agent.name}\' to perform a task.'
-
-        from inspect import Parameter, Signature
-        params = [
-            Parameter(name='input', kind=Parameter.POSITIONAL_OR_KEYWORD, annotation=str),
-        ]
-        agent_runner.__signature__ = Signature(params)
-
-        tool = Tool(func=agent_runner, name=agent.name, description=f'Agent: {agent.name}')
-        return tool
+        return make_single_input_tool(
+            agent.name,
+            f'Agent: {agent.name}',
+            agent_runner,
+            doc=f'Call agent \'{agent.name}\' to perform a task.',
+        )
 
     def as_tool(self, caller_agent: Optional[Agent] = None) -> Tool:
         '''Wrap this group in a Tool so that agents can call it.
@@ -469,18 +454,8 @@ class Group:
             user_input = kwargs.get('input', kwargs.get('query', ''))
 
             if _caller is not None:
-                path = _caller._outgoing_path(f'Group:{group_self.name}')
+                path = prepare_call(_caller, f'Group:{group_self.name}', user_input, 'group')
                 group_self._call_path = path
-
-                if _caller._call_chain is None:
-                    _caller._call_chain = CallChain(root_caller=f'Agent:{_caller.name}')
-
-                _caller._call_chain.add_frame(
-                    caller=f'Agent:{_caller.name}',
-                    callee=f'Group:{group_self.name}',
-                    call_type='group',
-                    input_data=user_input
-                )
 
                 orchify_broker.emit(RuntimeEvent(
                     agent_name=_caller.name,
@@ -500,17 +475,12 @@ class Group:
             run_id = group_self.run(user_input, **kwargs)
             return run_id
 
-        group_runner.__name__ = self.name
-        group_runner.__doc__ = self.description
-
-        from inspect import Parameter, Signature
-        params = [
-            Parameter(name='input', kind=Parameter.POSITIONAL_OR_KEYWORD, annotation=str),
-        ]
-        group_runner.__signature__ = Signature(params)
-
-        tool = Tool(func=group_runner, name=self.name, description=f'Group: {self.name}')
-        return tool
+        return make_single_input_tool(
+            self.name,
+            f'Group: {self.name}',
+            group_runner,
+            doc=self.description,
+        )
 
     def run(self, user_input: str, run_id: Optional[str] = None, **kwargs) -> str:
         '''Run the group on a task.
@@ -568,18 +538,19 @@ class Group:
         '''
         run_id = run_id or kwargs.pop('turn_id', None) or f'{self.name}#{self.code}_{safecode()}'
 
-        if not self.allow_concurrent_runs and not self._run_slot.acquire(blocking=False):
-            raise RunAlreadyActive(
-                f"Group '{self.name}' is already running (run_id={self._active_run_id or self.last_run_id}). "
+        self._run_slot.acquire(
+            run_id,
+            allow_concurrent=self.allow_concurrent_runs,
+            busy_message=(
+                f"Group '{self.name}' is already running "
+                f"(run_id={self._run_slot.active_run_id or self.last_run_id}). "
                 "A Group keeps current_run_id/last_run_ids/last_votes on the instance, so overlapping "
                 "runs would clobber each other: wait for the current run (Group.wait()), stop it "
                 "(Group.cancel()), use a separate Group instance, or construct this one with "
-                "allow_concurrent_runs=True.",
-                run_id=self._active_run_id or self.last_run_id,
-                owner=self.name,
-            )
+                "allow_concurrent_runs=True."
+            ),
+        )
 
-        self._active_run_id = run_id
         self.current_run_id = run_id
         self.last_run_id = run_id
         self.last_run_ids = []
@@ -636,11 +607,7 @@ class Group:
 
     def _release_run_slot(self) -> None:
         '''Release this group's run slot (safe to call twice).'''
-        self._active_run_id = ''
-        try:
-            self._run_slot.release()
-        except RuntimeError:
-            pass
+        self._run_slot.release()
 
     def is_running(self) -> bool:
         '''True while a run() is in flight on this instance.'''
@@ -667,15 +634,12 @@ class Group:
         target = run_id or self.last_run_id
         if not target:
             raise UnknownRun(f"Group '{self.name}' has no run to wait for; pass run_id=... .", owner=self.name)
-        if timeout is None:
-            timeout = _read_float_env('ORCHIFY_RUN_TIMEOUT')
-        if threading.current_thread() is orchify_web_backend._thread:
-            raise WaitOnLoopThread(
-                "Group.wait() would deadlock: it is being called from the orchestrator loop "
-                "thread, which is the thread that executes the run. Wait from your own "
-                "thread, await Group.arun()/Group.aask(), or use the 'run:finish' hook instead."
-            )
-        return orchify_broker.wait_run(target, timeout=timeout)
+        return wait_for_run(
+            target, timeout,
+            "Group.wait() would deadlock: it is being called from the orchestrator loop "
+            "thread, which is the thread that executes the run. Wait from your own "
+            "thread, await Group.arun()/Group.aask(), or use the 'run:finish' hook instead."
+        )
 
     def cancel(self, run_id: Optional[str] = None) -> bool:
         '''Request a stop for this group's run (`control:stop` feedback).'''
@@ -756,11 +720,10 @@ class Group:
                 to stop before the error is raised.
             RunFailed: When a member run aborted with an error.
         '''
-        if threading.current_thread() is orchify_web_backend._thread:
-            raise WaitOnLoopThread(
-                "Group.ask() cannot block on the orchestrator loop thread, because that "
-                "thread executes the run: await group.aask() instead."
-            )
+        assert_not_on_loop_thread(
+            "Group.ask() cannot block on the orchestrator loop thread, because that "
+            "thread executes the run: await group.aask() instead."
+        )
         run_id = self.run(user_input, **kwargs)
         if not self._wait_members(timeout):
             self.cancel()
@@ -892,7 +855,7 @@ class Group:
         '''
         if self.vote_timeout is None or self.vote_timeout <= 0:
             return False
-        return threading.current_thread() is not orchify_web_backend._thread
+        return not on_loop_thread()
 
     def _collect_votes(self) -> None:
         '''Tally the members' answers after waiting for them (voting mode).'''
@@ -1012,27 +975,10 @@ class Group:
         Raises:
             CallBlocked: When the call would exceed the depth cap or form a cycle.
         '''
-        try:
-            return plan_call(
-                f'Group:{self.name}', self._call_path, callee_label, self.max_call_depth
-            )
-        except CallBlocked as blocked:
-            orchify_broker.emit(RuntimeEvent(
-                agent_name=self.name,
-                agent_code=self.code,
-                run_id=self.current_run_id,
-                turn_id='',
-                event_type='run:call:blocked',
-                payload={
-                    'reason': blocked.reason,
-                    'caller': blocked.caller,
-                    'callee': blocked.callee,
-                    'call_path': list(blocked.path or []),
-                    'call_depth': max(0, len(blocked.path or []) - 1),
-                    'max_call_depth': blocked.limit,
-                }
-            ))
-            raise
+        return plan_outgoing_call(
+            f'Group:{self.name}', self._call_path, callee_label, self.max_call_depth,
+            name=self.name, code=self.code, run_id=self.current_run_id,
+        )
 
     def call_agent(self, agent: Agent, user_input: str, **kwargs) -> str:
         '''Call an agent inside or outside this group.
@@ -1046,8 +992,7 @@ class Group:
             str: The agent's run id.
         '''
         path = self._outgoing_path(f'Agent:{agent.name}')
-        agent._call_path = path
-        agent._call_depth = max(0, len(path) - 1)
+        set_call_path(agent, path)
 
         self._emit('agent_call', {
             'caller': self.name,

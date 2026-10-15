@@ -7,10 +7,14 @@ from orchify.tool       import Tool
 from orchify.event      import AgentEvent, ToolEvent, RuntimeEvent, ToolEventAssembler, ApprovalEvent
 from orchify.utils      import safecode, get_logger
 from orchify.env        import req_model
-from orchify.errors     import RunAlreadyActive, RunFailed, RunTimeout, UnknownRun, WaitOnLoopThread
+from orchify.errors     import RunFailed, RunTimeout, UnknownRun
 from orchify.broker     import orchify_broker, ApprovalTimeout, RunStopped, POLL_INTERVAL, make_turn_id
 from orchify.backend    import orchify_web_backend
-from orchify.call_chain import CallChain, CallBlocked, plan_call
+from orchify.call_chain import CallChain
+from orchify.runtime    import (
+    RunSlot, assert_not_on_loop_thread, make_single_input_tool,
+    plan_outgoing_call, prepare_call, set_call_path, wait_for_run,
+)
 from orchify.budget     import Budget
 from orchify.gate       import get_llm_gate, get_llm_rpm, get_run_gate
 
@@ -256,8 +260,7 @@ class Agent:
         self.last_answer: str = ''
         self.last_error: str = ''
         self.allow_concurrent_runs = allow_concurrent_runs
-        self._run_slot = threading.Lock()
-        self._active_run_id: str = ''
+        self._run_slot = RunSlot(name)
 
         self.tools: Dict[str, Tool] = {t.name: t for t in (tools or [])}
         if enable_ask_user and 'ask_user' not in self.tools:
@@ -408,7 +411,7 @@ class Agent:
         Returns:
             str: The live run id, or '' when the agent has no active run.
         '''
-        run_id = self._active_run_id or self.last_run_id
+        run_id = self._run_slot.active_run_id or self.last_run_id
         return run_id if run_id and run_id in orchify_broker.run_contexts else ''
 
     def needs_approval(self, tool: Optional[Tool], args: Optional[Dict[str, Any]] = None) -> bool:
@@ -472,25 +475,10 @@ class Agent:
                 an entity already on the call path; 'run:call:blocked' is emitted
                 first, so A -> B -> A can never nest until the process dies.
         '''
-        try:
-            return plan_call(f'Agent:{self.name}', self._call_path, callee_label, self.max_call_depth)
-        except CallBlocked as exc:
-            orchify_broker.emit(RuntimeEvent(
-                agent_name=self.name,
-                agent_code=self.code,
-                run_id=self.current_run_id,
-                turn_id='',
-                event_type='run:call:blocked',
-                payload={
-                    'reason': exc.reason,
-                    'caller': exc.caller,
-                    'callee': exc.callee,
-                    'call_path': list(exc.path),
-                    'call_depth': max(0, len(exc.path) - 1),
-                    'max_call_depth': self.max_call_depth,
-                },
-            ))
-            raise
+        return plan_outgoing_call(
+            f'Agent:{self.name}', self._call_path, callee_label, self.max_call_depth,
+            name=self.name, code=self.code, run_id=self.current_run_id,
+        )
 
     def call_agent(self, agent: 'Agent', user_input: str, **kwargs) -> str:
         '''Call another Agent and track the call chain.
@@ -503,21 +491,10 @@ class Agent:
         Returns:
             str: The run_id of the target agent's execution.
         '''
-        path = self._outgoing_path(f'Agent:{agent.name}')
-
-        if self._call_chain is None:
-            self._call_chain = CallChain(root_caller=f'Agent:{self.name}')
-
-        self._call_chain.add_frame(
-            caller=f'Agent:{self.name}',
-            callee=f'Agent:{agent.name}',
-            call_type='agent',
-            input_data=user_input
-        )
+        path = prepare_call(self, f'Agent:{agent.name}', user_input, 'agent')
 
         agent._call_chain = self._call_chain
-        agent._call_path = path
-        agent._call_depth = max(0, len(path) - 1)
+        set_call_path(agent, path)
 
         orchify_broker.emit(RuntimeEvent(
             agent_name=self.name,
@@ -547,17 +524,7 @@ class Agent:
         Returns:
             str: The run_id of the group's execution.
         '''
-        path = self._outgoing_path(f'Group:{group.name}')
-
-        if self._call_chain is None:
-            self._call_chain = CallChain(root_caller=f'Agent:{self.name}')
-
-        self._call_chain.add_frame(
-            caller=f'Agent:{self.name}',
-            callee=f'Group:{group.name}',
-            call_type='group',
-            input_data=user_input
-        )
+        path = prepare_call(self, f'Group:{group.name}', user_input, 'group')
 
         if hasattr(group, '_call_chain'):
             group._call_chain = self._call_chain
@@ -617,20 +584,10 @@ class Agent:
             user_input = kwargs.get('input', kwargs.get('query', ''))
 
             if _caller is not None:
-                path = _caller._outgoing_path(f'Agent:{agent_self.name}')
-                if _caller._call_chain is None:
-                    _caller._call_chain = CallChain(root_caller=f'Agent:{_caller.name}')
-
-                _caller._call_chain.add_frame(
-                    caller=f'Agent:{_caller.name}',
-                    callee=f'Agent:{agent_self.name}',
-                    call_type='agent',
-                    input_data=user_input
-                )
+                path = prepare_call(_caller, f'Agent:{agent_self.name}', user_input, 'agent')
 
                 agent_self._call_chain = _caller._call_chain
-                agent_self._call_path = path
-                agent_self._call_depth = max(0, len(path) - 1)
+                set_call_path(agent_self, path)
 
                 orchify_broker.emit(RuntimeEvent(
                     agent_name=_caller.name,
@@ -650,17 +607,12 @@ class Agent:
             run_id = agent_self.run(user_input, **kwargs)
             return run_id
 
-        agent_runner.__name__ = self.name
-        agent_runner.__doc__ = self.description or f'Call agent \'{self.name}\' to perform a task.'
-
-        from inspect import Parameter, Signature
-        params = [
-            Parameter(name='input', kind=Parameter.POSITIONAL_OR_KEYWORD, annotation=str),
-        ]
-        agent_runner.__signature__ = Signature(params)
-
-        tool = Tool(func=agent_runner, name=self.name, description=self.description)
-        return tool
+        return make_single_input_tool(
+            self.name,
+            self.description,
+            agent_runner,
+            doc=self.description or f'Call agent \'{self.name}\' to perform a task.',
+        )
 
     def ask_user_tool(self) -> Tool:
         '''Build the ready-made ``ask_user`` tool for this agent.
@@ -691,24 +643,18 @@ class Agent:
             '''
             return question
 
-        ask_user.__name__ = 'ask_user'
-        ask_user.__doc__ = (
+        doc = (
             'Ask the human operator an open question and wait for a free-text '
             'answer. Use it when the request is ambiguous or when it needs '
             'information only the user can provide.\n\n'
             'Args:\n'
             '    question (str): the question to put to the human operator.'
         )
-
-        from inspect import Parameter, Signature
-        ask_user.__signature__ = Signature([
-            Parameter(name='question', kind=Parameter.POSITIONAL_OR_KEYWORD, annotation=str),
-        ])
-
-        return Tool(
-            func=ask_user,
-            name='ask_user',
-            description=ask_user.__doc__,
+        return make_single_input_tool(
+            'ask_user',
+            doc,
+            ask_user,
+            param_name='question',
             parameters=[{
                 'name': 'question',
                 'kind': 'positional or keyword',
@@ -766,18 +712,18 @@ class Agent:
         if not isinstance(max_steps, int) or isinstance(max_steps, bool) or max_steps < 1:
             raise ValueError(f'max_steps must be a positive integer, got {max_steps!r}')
         run_id = run_id or turn_id or f'{self.name}#{self.code}_{safecode()}'
-        if not self.allow_concurrent_runs and not self._run_slot.acquire(blocking=False):
-            raise RunAlreadyActive(
+        self._run_slot.acquire(
+            run_id,
+            allow_concurrent=self.allow_concurrent_runs,
+            busy_message=(
                 f"Agent '{self.name}' is already running "
-                f"(run_id={self._active_run_id!r}). An Agent keeps its messages "
+                f"(run_id={self._run_slot.active_run_id!r}). An Agent keeps its messages "
                 f"and last_run_id on the instance, so overlapping runs would "
                 f"clobber each other: wait for the current run (Agent.wait()), "
                 f"stop it (Agent.cancel()), use a separate Agent instance, or "
-                f"construct this one with allow_concurrent_runs=True.",
-                run_id=self._active_run_id,
-                owner=self.name,
-            )
-        self._active_run_id = run_id
+                f"construct this one with allow_concurrent_runs=True."
+            ),
+        )
         self.last_run_id = run_id
         orchify_broker.start_task(run_id, None, context={
             'run_id': run_id,
@@ -806,11 +752,7 @@ class Agent:
 
     def _release_run_slot(self) -> None:
         '''Release the one-run-at-a-time slot (safe to call more than once).'''
-        self._active_run_id = ''
-        try:
-            self._run_slot.release()
-        except RuntimeError:
-            pass
+        self._run_slot.release()
 
     def is_running(self) -> bool:
         '''True while this agent has a run in flight.'''
@@ -839,16 +781,13 @@ class Agent:
         target = run_id or self.last_run_id
         if not target:
             raise UnknownRun('wait() needs a run_id (this agent has not run yet).', owner=self.name)
-        if timeout is None:
-            timeout = _read_timeout_env('ORCHIFY_RUN_TIMEOUT')
-        if threading.current_thread() is orchify_web_backend._thread:
-            raise WaitOnLoopThread(
-                'Agent.wait() would deadlock: it is being called from the '
-                'orchestrator loop thread, which must run the target itself. '
-                'Await Agent.arun() or Agent.aask() instead, or use the '
-                'broker\'s run:finish hook.'
-            )
-        return orchify_broker.wait_run(target, timeout=timeout)
+        return wait_for_run(
+            target, timeout,
+            'Agent.wait() would deadlock: it is being called from the '
+            'orchestrator loop thread, which must run the target itself. '
+            'Await Agent.arun() or Agent.aask() instead, or use the '
+            'broker\'s run:finish hook.'
+        )
 
     def cancel(self, run_id: Optional[str] = None) -> bool:
         '''Ask a run to stop.
@@ -1002,11 +941,10 @@ class Agent:
             RunTimeout: When the run missed its deadline; the run is asked to stop
                 before the error is raised.
         '''
-        if threading.current_thread() is orchify_web_backend._thread:
-            raise WaitOnLoopThread(
-                "Agent.ask() cannot block on the orchestrator loop thread, because that "
-                "thread executes the run: await agent.aask() instead."
-            )
+        assert_not_on_loop_thread(
+            "Agent.ask() cannot block on the orchestrator loop thread, because that "
+            "thread executes the run: await agent.aask() instead."
+        )
         return self._outcome_answer(self._run_and_await_finish(user_input, timeout, **kwargs))
 
     async def aask(self, user_input: str, *, timeout: Optional[float] = None, **kwargs: Any) -> str:
