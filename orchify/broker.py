@@ -7,6 +7,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
+from queue import Queue
 from typing import Any, Callable, Optional, Union, get_args
 
 
@@ -172,10 +173,14 @@ class HookBinding:
         owner (str): Owner id (usually a plugin) used by ``remove_hooks()``.
         plugin (bool): True for a hook registered by a plugin, which makes it
             subject to the enabled-plugin filter.
+        priority (int): Dispatch order; higher runs first, ties keep registration
+            order.
+        background (bool): True runs the hook later on the shared dispatcher, so
+            a slow hook never delays the emitting run.
     '''
 
     __slots__ = ('func', 'event_type', 'run_id', 'mode', 'count', 'disposed', 'agent_name', 'match',
-                 'owner', 'plugin')
+                 'owner', 'plugin', 'priority', 'background')
 
     def __init__(
         self,
@@ -187,6 +192,8 @@ class HookBinding:
         match: Optional[Callable] = None,
         owner: str = '',
         plugin: bool = False,
+        priority: int = 0,
+        background: bool = False,
     ):
         self.func = func
         self.event_type = event_type
@@ -198,6 +205,8 @@ class HookBinding:
         self.match = match
         self.owner = owner
         self.plugin = bool(plugin)
+        self.priority = int(priority or 0)
+        self.background = bool(background)
 
     @property
     def turn_id(self) -> Optional[str]:
@@ -206,7 +215,8 @@ class HookBinding:
 
     def __repr__(self):
         return (f"<HookBinding event_type={self.event_type!r} run_id={self.run_id!r} "
-                f"mode={self.mode!r} agent_name={self.agent_name!r} count={self.count} disposed={self.disposed}>")
+                f"mode={self.mode!r} agent_name={self.agent_name!r} count={self.count} "
+                f"priority={self.priority} background={self.background} disposed={self.disposed}>")
 
 
 class Broker:
@@ -250,6 +260,12 @@ class Broker:
         self._run_outcome_limit = _read_run_outcome_limit()
         self._run_outcomes: dict[str, dict] = {}
         self._run_outcomes_lock = td.Lock()
+
+        self._hook_queue: Queue = Queue()
+        self._hook_pending = 0
+        self._hook_cond = td.Condition()
+        self._hook_worker: Optional[td.Thread] = None
+        self._hook_worker_lock = td.Lock()
 
     def record_run_outcome(
         self,
@@ -349,6 +365,60 @@ class Broker:
             logger.error("Error executing hook '%s' for event '%s': %s",
                          name, event.event_type, e)
 
+    def _hook_worker_loop(self) -> None:
+        '''Drain the background hook queue until the process exits.'''
+        while True:
+            item = self._hook_queue.get()
+            try:
+                binding, event = item
+                if not binding.disposed:
+                    self._execute_hook(binding.func, event)
+            except Exception as exc:
+                logger.error('Error in the background hook dispatcher: %s', exc)
+            finally:
+                with self._hook_cond:
+                    self._hook_pending = max(0, self._hook_pending - 1)
+                    self._hook_cond.notify_all()
+
+    def _dispatch_hook(self, binding: HookBinding, event: BaseEvent) -> None:
+        '''Hand a background hook to the dispatcher thread.
+
+        Args:
+            binding (HookBinding): Binding registered with ``background=True``.
+            event (BaseEvent): The event to deliver later.
+        '''
+        with self._hook_worker_lock:
+            worker = self._hook_worker
+            if worker is None or not worker.is_alive():
+                worker = td.Thread(target=self._hook_worker_loop,
+                                   name='OrchifyHookDispatcher', daemon=True)
+                self._hook_worker = worker
+                worker.start()
+        with self._hook_cond:
+            self._hook_pending += 1
+        self._hook_queue.put((binding, event))
+
+    def drain_hooks(self, timeout: Optional[float] = None) -> bool:
+        '''Wait until every queued background hook has run.
+
+        Args:
+            timeout (Optional[float]): Seconds to wait; None waits forever.
+
+        Returns:
+            bool: True when the queue drained, False on timeout.
+        '''
+        with self._hook_cond:
+            return self._hook_cond.wait_for(lambda: self._hook_pending == 0, timeout)
+
+    def pending_hooks(self) -> int:
+        '''Number of background hooks queued but not executed yet.
+
+        Returns:
+            int: Pending background hook count.
+        '''
+        with self._hook_cond:
+            return self._hook_pending
+
     def _matches(self, binding: HookBinding, event: BaseEvent) -> bool:
         if binding.run_id is not None and event.run_id != binding.run_id:
             return False
@@ -366,8 +436,11 @@ class Broker:
         Hook selection and bookkeeping (``count``, ``once`` disposal, pruning of
         disposed and agent-scoped bindings) happen under ``_emit_lock``; the hook
         callables themselves run after the lock is released, so a slow hook can no
-        longer stall hook registration or another run's bookkeeping. Hooks for one
-        event still run in registration order, on the emitting thread.
+        longer stall hook registration or another run's bookkeeping. Normal hooks
+        for one event run in priority order (higher first, ties keep registration
+        order) on the emitting thread; hooks registered with ``background=True``
+        are handed to the shared dispatcher instead, so they never delay the
+        emitting run.
 
         A hook registered by a plugin (``plugin=True``) fires only while that
         plugin is enabled for the run; hooks registered by the application always
@@ -411,8 +484,13 @@ class Broker:
                 if not b.disposed and not (is_finish and b.mode == 'agent' and b.run_id == event.run_id)
             ]
 
+        if any(b.priority for b in candidates):
+            candidates.sort(key=lambda b: -b.priority)
         for binding in candidates:
-            self._execute_hook(binding.func, event)
+            if binding.background:
+                self._dispatch_hook(binding, event)
+            else:
+                self._execute_hook(binding.func, event)
 
 
     def register_hook(
@@ -426,6 +504,8 @@ class Broker:
         owner: str = '',
         turn_id: Optional[str] = None,
         plugin: bool = False,
+        priority: int = 0,
+        background: bool = False,
     ) -> HookBinding:
         '''Bind a hook to events.
 
@@ -442,6 +522,11 @@ class Broker:
             turn_id (Optional[str]): Deprecated alias of ``run_id``.
             plugin (bool): True when a plugin registers this hook, which subjects
                 it to the enabled-plugin filter in ``emit()``.
+            priority (int): Higher priority hooks run first; equal priorities keep
+                registration order.
+            background (bool): Run the hook on the shared dispatcher instead of the
+                emitting thread, so a slow hook cannot delay the run. Use
+                ``drain_hooks()`` to wait for queued background hooks.
 
         Returns:
             HookBinding: The binding, which can be passed to ``remove_binding()``.
@@ -458,7 +543,8 @@ class Broker:
         if not types or not all(isinstance(t, str) for t in types):
             raise ValueError(f'event_type must be a str or a list/tuple/set of strings, got {event_type!r}')
         binding = HookBinding(hook, types, run_id, mode, agent_name=agent_name, match=match,
-                              owner=owner, plugin=plugin)
+                              owner=owner, plugin=plugin, priority=priority,
+                              background=background)
         with self._emit_lock:
             self.hooks.append(binding)
         return binding
@@ -510,6 +596,8 @@ class Broker:
         owner: str = '',
         turn_id: Optional[str] = None,
         plugin: bool = False,
+        priority: int = 0,
+        background: bool = False,
     ) -> Callable:
         '''Decorator registering a hook.
 
@@ -524,6 +612,8 @@ class Broker:
             owner (str): Owner id, used by ``remove_hooks()``.
             turn_id (Optional[str]): Deprecated alias of ``run_id``.
             plugin (bool): True when a plugin registers this hook.
+            priority (int): Higher priority hooks run first.
+            background (bool): Run the hook on the shared dispatcher.
 
         Returns:
             Callable: A decorator that registers the function and returns it.
@@ -539,7 +629,7 @@ class Broker:
             '''
             return self.register_hook(event_type, func, run_id=run_id, mode='once' if once else mode,
                                       agent_name=agent_name, match=match, owner=owner, turn_id=turn_id,
-                                      plugin=plugin)
+                                      plugin=plugin, priority=priority, background=background)
         return decorator
 
 

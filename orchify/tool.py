@@ -50,6 +50,52 @@ def _read_tool_timeout() -> Optional[float]:
     return value if value > 0 else None
 
 
+def _read_cache_default_ttl() -> Optional[float]:
+    '''Read the default TTL applied to ``cache=True`` tools.
+
+    ``cache=True`` keeps its documented meaning (cache forever) unless
+    ``ORCHIFY_TOOL_CACHE_TTL`` is set, in which case that many seconds bound every
+    entry so a long-lived tool cannot serve permanently stale results.
+
+    Returns:
+        Optional[float]: TTL in seconds, or None when unset/invalid/<= 0.
+    '''
+    raw = os.getenv('ORCHIFY_TOOL_CACHE_TTL')
+    if raw is None or raw.strip() == '':
+        return None
+    try:
+        value = float(raw.strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+class ToolCache:
+    '''Thread-safe LRU result store that several tools may share.
+
+    Pass one instance as ``cache_store`` to every ``Tool`` that should share
+    cached results. Keys are namespaced by the tool name, so tools sharing a
+    store never collide; single-flight also coalesces across them.
+
+    Attributes:
+        lock (threading.RLock): Guards ``data`` and ``inflight``.
+        data (OrderedDict): ``key -> (expires_at, value)`` entries.
+        inflight (Dict[str, list]): Single-flight slots, ``key -> [lock, waiters]``.
+    '''
+
+    def __init__(self) -> None:
+        '''Create an empty shared store.'''
+        self.lock = threading.RLock()
+        self.data: 'OrderedDict[str, tuple]' = OrderedDict()
+        self.inflight: Dict[str, list] = {}
+
+    def clear(self) -> None:
+        '''Drop every cached value and in-flight slot.'''
+        with self.lock:
+            self.data.clear()
+            self.inflight.clear()
+
+
 class Tool:
     '''A function exposed to the model as a callable tool.
 
@@ -88,6 +134,7 @@ class Tool:
         cache_size: Optional[int] = None,
         timeout: Optional[float] = None,
         ask_question: bool = False,
+        cache_store: Optional['ToolCache'] = None,
     ):
         '''Build a tool around ``func``.
 
@@ -115,6 +162,9 @@ class Tool:
                 approval pool with ``kind='question'``, emits
                 ``run:approval:required`` and feeds the free-text answer back as the
                 tool result. The tool function itself is never executed.
+            cache_store (Optional[ToolCache]): Shared store to use instead of a
+                private one; every tool given the same instance shares cached
+                results (and single-flight) while keys remain namespaced per tool.
 
         Note:
             A tool whose function returns an awaitable has its result resolved on
@@ -137,10 +187,17 @@ class Tool:
         )
         self.timeout: Optional[float] = timeout if timeout is not None else _read_tool_timeout()
         self.is_async: bool = inspect.iscoroutinefunction(func) or inspect.isasyncgenfunction(func)
+        if cache is True:
+            self.cache_ttl: Optional[float] = _read_cache_default_ttl()
+        elif isinstance(cache, (int, float)) and cache:
+            self.cache_ttl = float(cache)
+        else:
+            self.cache_ttl = None
 
-        self._cache: 'OrderedDict[str, tuple]' = OrderedDict()
-        self._inflight: Dict[str, list] = {}
-        self._cache_lock = threading.RLock()
+        self._store = cache_store if cache_store is not None else ToolCache()
+        self._cache: 'OrderedDict[str, tuple]' = self._store.data
+        self._inflight: Dict[str, list] = self._store.inflight
+        self._cache_lock = self._store.lock
         self._hits: int = 0
         self._misses: int = 0
         self._coalesced: int = 0
@@ -284,7 +341,7 @@ class Tool:
     def _cache_store(self, key: str, value: Any) -> None:
         '''Store a result, evicting the least recently used entry over the cap.'''
         with self._cache_lock:
-            expires_at = None if self.cache is True else time.time() + float(self.cache)
+            expires_at = None if self.cache_ttl is None else time.time() + float(self.cache_ttl)
             self._cache[key] = (expires_at, value)
             self._cache.move_to_end(key)
             if self.cache_size:
@@ -345,7 +402,7 @@ class Tool:
         if not self.cache:
             return self._call(kwargs)
 
-        key = json.dumps(kwargs, sort_keys=True, default=str)
+        key = f'{self.name}\x00' + json.dumps(kwargs, sort_keys=True, default=str)
 
         found, value = self._cache_lookup(key)
         if found:
@@ -372,7 +429,7 @@ class Tool:
         with self._cache_lock:
             return {
                 'enabled': bool(self.cache),
-                'ttl': None if self.cache is True else (float(self.cache) if self.cache else None),
+                'ttl': self.cache_ttl,
                 'size': len(self._cache),
                 'maxsize': self.cache_size or None,
                 'hits': self._hits,
@@ -383,9 +440,8 @@ class Tool:
             }
 
     def clear_cache(self) -> None:
-        '''Drop every cached result of this tool.'''
-        with self._cache_lock:
-            self._cache.clear()
+        '''Drop every cached result this tool can reach (a shared store clears for all).'''
+        self._store.clear()
 
     def reset_cache_stats(self) -> None:
         '''Zero the hit/miss/coalesced/eviction counters (keeps cached values).'''
@@ -409,6 +465,7 @@ def tool(
     cache_size: Optional[int] = None,
     timeout: Optional[float] = None,
     ask_question: bool = False,
+    cache_store: Optional[ToolCache] = None,
 ):
     '''Turn a function into a Tool, usable as a decorator.
 
@@ -423,6 +480,7 @@ def tool(
         cache_size (Optional[int]): Maximum cached results; 0 means unbounded.
         timeout (Optional[float]): Seconds to wait for an async result.
         ask_question (bool): Treat the call as an open question to the operator.
+        cache_store (Optional[ToolCache]): Shared store to use (see :class:`Tool`).
 
     Returns:
         Callable: A decorator that wraps the function in a :class:`Tool`.
@@ -446,5 +504,6 @@ def tool(
             cache_size=cache_size,
             timeout=timeout,
             ask_question=ask_question,
+            cache_store=cache_store,
         )
     return decorator

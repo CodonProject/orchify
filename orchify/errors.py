@@ -83,6 +83,28 @@ class RunFailed(OrchifyError):
         self.error = error
 
 
+class MissingCredentials(OrchifyError, RuntimeError):
+    '''Raised when a live provider is asked to run without an API key.
+
+    The check happens before the run starts, so no request is attempted and no
+    run id is registered: the caller gets the configuration problem instead of a
+    provider 401 several seconds later.
+
+    Attributes:
+        owner (str): Name of the agent whose backend needs a key.
+    '''
+
+    def __init__(self, message: str, owner: str = ''):
+        '''Build the error.
+
+        Args:
+            message (str): Explanation that names the missing variable and the fix.
+            owner (str): Name of the agent whose backend needs a key.
+        '''
+        super().__init__(message)
+        self.owner = owner
+
+
 class UnknownRun(OrchifyError, ValueError):
     '''Raised when a run id is required but none was supplied or known.
 

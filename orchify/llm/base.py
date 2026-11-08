@@ -239,6 +239,16 @@ class LLMInterface:
             self.middlewares.append(mw)
         return middleware
 
+    def missing_credentials(self) -> Optional[str]:
+        '''Return a fix-oriented message when the backend cannot authenticate.
+
+        Returns:
+            Optional[str]: None when the backend is ready to run (the default for
+            keyless backends such as test doubles), otherwise a message naming the
+            environment variable to set.
+        '''
+        return None
+
     def _dispatch(self, kwargs: Dict[str, Any], scope: str = '*') -> AsyncGenerator[Response, None]:
         enabled_plugins = kwargs.pop('_enabled_plugins', None)
 

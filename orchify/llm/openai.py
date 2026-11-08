@@ -158,6 +158,22 @@ class OpenAICompat(LLMInterface):
 
         return data
 
+    def missing_credentials(self) -> Optional[str]:
+        '''Report a missing API key before any request is attempted.
+
+        Returns:
+            Optional[str]: None when a key is configured, otherwise a message
+            naming the environment variable and the alternatives.
+        '''
+        if self.api_key:
+            return None
+        return (
+            'No API key configured: set API_KEY (or OPENAI_API_KEY) in the environment '
+            'or .env, pass api_key=OpenAICompat(api_key=...), or use '
+            'orchify.testing.FakeLLM for offline runs. Check the setup with '
+            '`python -m orchify doctor`.'
+        )
+
     async def _resilient_lines(self, url: str, headers: dict, data: dict) -> AsyncGenerator[str, None]:
         '''Stream response lines, retrying transient failures.
 

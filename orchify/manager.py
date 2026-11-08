@@ -7,8 +7,9 @@ from collections import deque
 from fnmatch import fnmatchcase
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
+from . import broker as _broker_module
 from .backend import orchify_web_backend
-from .broker import orchify_broker
+from .broker import POLL_INTERVAL, orchify_broker
 from .gate import gate_stats
 from .utils import get_logger
 
@@ -34,6 +35,8 @@ DEFAULT_EVENTS = 500
 MAX_STRING = 2000
 MAX_ANSWER = 20000
 MAX_PAYLOAD_DEPTH = 6
+MAX_START_CONTEXTS = 4096
+RECORD_CREATING_EVENTS = ('run:start', 'run:queued')
 
 
 def _read_int_env(name: str, default: int, minimum: int = 0) -> int:
@@ -54,6 +57,20 @@ def _read_bool_env(name: str, default: bool = True) -> bool:
     return str(raw).strip().lower() not in (
         '0', 'false', 'no', 'off', 'disable', 'disabled', 'none'
     )
+
+
+def _poll_seconds() -> float:
+    '''Current consumer poll interval, honouring a runtime configure() patch.
+
+    Returns:
+        float: Seconds between inbox drains (never below 0.001).
+    '''
+    value = getattr(_broker_module, 'POLL_INTERVAL', POLL_INTERVAL)
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = POLL_INTERVAL
+    return value if value > 0.001 else 0.001
 
 
 def _read_str_env(name: str, default: str = '') -> str:
@@ -221,6 +238,11 @@ class OrchifyManager:
         self._sink_written = 0
         self._tap = None
         self._closed = False
+        self._inbox: deque = deque()
+        self._inbox_lock = threading.Lock()
+        self._start_contexts: Dict[str, dict] = {}
+        self._tap_stop = threading.Event()
+        self._worker: Optional[threading.Thread] = None
         if self._enabled:
             self._install_tap()
 
@@ -272,6 +294,84 @@ class OrchifyManager:
         if self._tap is not None or self._closed or not self._enabled:
             return
         self._tap = orchify_broker.register_hook('*', self._on_event, owner='')
+        self._start_worker()
+
+    def _start_worker(self) -> None:
+        '''Start the consumer thread that turns queued events into records.'''
+        with self._lock:
+            worker = self._worker
+            if worker is not None and worker.is_alive():
+                return
+            self._tap_stop.clear()
+            worker = threading.Thread(target=self._tap_worker,
+                                      name='OrchifyManagerTap', daemon=True)
+            self._worker = worker
+        worker.start()
+
+    def _tap_worker(self) -> None:
+        '''Drain the inbox on a background thread until close() stops it.'''
+        while not self._tap_stop.is_set():
+            try:
+                self._drain_inbox()
+            except Exception as exc:
+                logger.error('Error in OrchifyManager event consumer: %s', exc)
+            self._tap_stop.wait(_poll_seconds())
+
+    def _drain_inbox(self, limit: Optional[int] = None) -> int:
+        '''Apply queued events to the manager state in order.
+
+        Args:
+            limit (Optional[int]): Maximum number of events to apply; None drains
+                the queue until it is empty.
+
+        Returns:
+            int: How many events were applied.
+        '''
+        applied = 0
+        while limit is None or applied < limit:
+            with self._inbox_lock:
+                if not self._inbox:
+                    break
+                source, event, now = self._inbox.popleft()
+            applied += 1
+            if source == 'group':
+                self._handle_group_event(event, now)
+                continue
+            record = None
+            try:
+                record = self._handle_event(event, now)
+            except Exception as exc:
+                logger.error('Error in OrchifyManager event tap: %s', exc)
+            if record is not None and self._sink_path:
+                self._write_sink({'record': 'event', **record})
+        return applied
+
+    def _sync(self) -> None:
+        '''Flush queued events so a reader sees a deterministic snapshot.'''
+        self._drain_inbox()
+
+    def _stash_context(self, event: Any, run_id: str = '') -> None:
+        '''Remember a run context before the run can finish and drop it.
+
+        The tap enqueues instead of recording, so a very short run could be
+        archived before its ``run:start`` is consumed. Copy the context here so
+        the record still knows its kind, mode and group name.
+
+        Args:
+            event (Any): The record-creating event.
+            run_id (str): Explicit run id when the event does not carry one.
+        '''
+        run_id = run_id or str(getattr(event, 'run_id', '') or '')
+        if not run_id:
+            return
+        context = orchify_broker.get_run_context(run_id)
+        if not context:
+            return
+        with self._inbox_lock:
+            if len(self._start_contexts) > MAX_START_CONTEXTS:
+                for stale in list(self._start_contexts)[:len(self._start_contexts) // 2]:
+                    self._start_contexts.pop(stale, None)
+            self._start_contexts[run_id] = dict(context)
 
     def _ensure_tap(self) -> None:
         '''Re-install the tap if something removed it (e.g. remove_hooks('')).'''
@@ -286,6 +386,12 @@ class OrchifyManager:
 
     def close(self) -> bool:
         '''Detach the event tap and every group callback. Read APIs keep working.'''
+        self._drain_inbox()
+        self._tap_stop.set()
+        with self._lock:
+            worker, self._worker = self._worker, None
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=2.0)
         with self._lock:
             tap, self._tap = self._tap, None
             self._closed = True
@@ -449,15 +555,15 @@ class OrchifyManager:
 
 
     def _on_event(self, event: Any) -> None:
-        '''Global broker tap. Append-only: never blocks, never raises.'''
-        record = None
+        '''Global broker tap. Enqueue-only: never blocks, never raises.'''
         try:
-            now = time.time()
-            record = self._handle_event(event, now)
+            event_type = str(getattr(event, 'event_type', '') or '')
+            if event_type in RECORD_CREATING_EVENTS:
+                self._stash_context(event)
+            with self._inbox_lock:
+                self._inbox.append(('broker', event, time.time()))
         except Exception as exc:
             logger.error('Error in OrchifyManager event tap: %s', exc)
-        if record is not None and self._sink_path:
-            self._write_sink({'record': 'event', **record})
 
     def _handle_event(self, event: Any, now: float) -> Optional[dict]:
         '''Apply one event to the manager state; returns its record (or None).'''
@@ -517,7 +623,10 @@ class OrchifyManager:
 
     def _new_run_record(self, event: Any, now: float) -> dict:
         run_id = str(getattr(event, 'run_id', '') or '')
-        context = orchify_broker.get_run_context(run_id) or {}
+        with self._inbox_lock:
+            context = self._start_contexts.pop(run_id, None)
+        if context is None:
+            context = orchify_broker.get_run_context(run_id) or {}
         record = self._context_record(run_id, context, now)
         if not record.get('name'):
             record['name'] = str(getattr(event, 'agent_name', '') or '')
@@ -667,8 +776,21 @@ class OrchifyManager:
 
 
     def _on_group_event(self, event: Any) -> None:
+        '''Group-broker tap. Enqueue-only so a group callback never blocks.'''
         try:
-            now = time.time()
+            event_type = str(getattr(event, 'event_type', '') or '')
+            payload = getattr(event, 'payload', None) or {}
+            run_id = str(getattr(event, 'run_id', '') or payload.get('run_id') or '')
+            if event_type == 'start' and run_id:
+                self._stash_context(event, run_id)
+            with self._inbox_lock:
+                self._inbox.append(('group', event, time.time()))
+        except Exception as exc:
+            logger.error('Error in OrchifyManager group tap: %s', exc)
+
+    def _handle_group_event(self, event: Any, now: float) -> None:
+        '''Apply one Group-broker event to the manager state.'''
+        try:
             event_type = str(getattr(event, 'event_type', '') or '')
             payload = getattr(event, 'payload', None) or {}
             run_id = str(getattr(event, 'run_id', '') or payload.get('run_id') or '')
@@ -687,7 +809,11 @@ class OrchifyManager:
                     return
                 live = self._runs.get(run_id)
                 if live is None:
-                    live = self._context_record(run_id, orchify_broker.get_run_context(run_id) or {}, now)
+                    with self._inbox_lock:
+                        context = self._start_contexts.pop(run_id, None)
+                    if context is None:
+                        context = orchify_broker.get_run_context(run_id) or {}
+                    live = self._context_record(run_id, context, now)
                     self._runs[run_id] = live
                 live['last_event_at'] = now
                 if event_type == 'start':
@@ -725,6 +851,7 @@ class OrchifyManager:
             float: The timestamp used.
         '''
         now = now or time.time()
+        self._sync()
         self._ensure_tap()
         contexts = dict(orchify_broker.run_contexts)
         with self._lock:
@@ -935,6 +1062,7 @@ class OrchifyManager:
 
     def approvals(self, *, pending_only: bool = False, run_id: Optional[str] = None) -> List[dict]:
         '''The manual-confirmation pool (newest last), including decided ones.'''
+        self._sync()
         now = time.time()
         items = (orchify_broker.pending_approvals(run_id) if pending_only
                  else orchify_broker.approvals(run_id))
@@ -1012,9 +1140,14 @@ class OrchifyManager:
                 'count': binding.count,
                 'disposed': bool(binding.disposed),
                 'agent_name': binding.agent_name,
+                'plugin': bool(getattr(binding, 'plugin', False)),
+                'priority': int(getattr(binding, 'priority', 0) or 0),
+                'background': bool(getattr(binding, 'background', False)),
                 'func': getattr(binding.func, '__qualname__', None) or repr(binding.func),
             })
-        return {'total': len(items), 'by_owner': by_owner, 'by_event_type': by_event_type, 'bindings': items}
+        return {'total': len(items), 'by_owner': by_owner, 'by_event_type': by_event_type,
+                'pending_background': orchify_broker.pending_hooks(),
+                'bindings': items}
 
     def feedback(self) -> Dict[str, int]:
         '''Undrained feedback items queued per run (control messages on the way).'''
@@ -1081,6 +1214,7 @@ class OrchifyManager:
         Returns:
             List[dict]: Event records, oldest first.
         '''
+        self._sync()
         self._ensure_tap()
         with self._lock:
             items = list(self._events)
@@ -1096,6 +1230,7 @@ class OrchifyManager:
 
     def totals(self) -> dict:
         '''Cumulative counters for the runs this manager has seen finish.'''
+        self._sync()
         with self._lock:
             totals = dict(self._totals)
             totals['history_size'] = len(self._history)

@@ -1,8 +1,9 @@
 import glob
 import importlib
+import importlib.util
 import os
 import sys
-from typing import List, Optional, Type, Union
+from typing import Dict, List, Optional, Type, Union
 
 from orchify.plugin import Plugin
 from orchify.broker import orchify_broker
@@ -329,8 +330,9 @@ class PluginManager:
                 registered.append(inst)
         return registered
 
-    def _import_modules(self, mod_names: List[str], sys_path: Optional[str] = None) -> None:
-        '''Import plugin modules, updating sys.path if needed.
+    def _import_modules(self, mod_names: List[str], sys_path: Optional[str] = None,
+                        paths: Optional[Dict[str, str]] = None) -> None:
+        '''Import plugin modules.
 
         A module that fails to import is reported (``plugin:error`` plus a warning)
         but does not abort the remaining modules.
@@ -338,15 +340,24 @@ class PluginManager:
         Args:
             mod_names (List[str]): Module names to import.
             sys_path (Optional[str]): Directory prepended to ``sys.path`` for the
-                duration of the import.
+                duration of the import (only used for names without a ``paths``
+                entry, e.g. dotted package names).
+            paths (Optional[Dict[str, str]]): File path per module name. A name
+                listed here is loaded straight from its file, without touching
+                ``sys.path``.
         '''
-        added = sys_path is not None and sys_path not in sys.path
+        paths = paths or {}
+        added = (
+            sys_path is not None
+            and sys_path not in sys.path
+            and any(name not in paths for name in mod_names)
+        )
         if added:
             sys.path.insert(0, sys_path)
         try:
             for mod_name in mod_names:
                 try:
-                    self._import_module(mod_name, suppress_errors=True)
+                    self._import_module(mod_name, suppress_errors=True, path=paths.get(mod_name))
                 except Exception as e:
                     logger.warning('[plugin] skipped module %s: %s', mod_name, e)
                     self._emit('plugin:error', {'plugin': mod_name, 'action': 'import', 'error': str(e)})
@@ -365,8 +376,8 @@ class PluginManager:
             List[Plugin]: The plugins registered from the directory.
         '''
         files = self.discover(path)
-        mod_names = [os.path.splitext(os.path.basename(f))[0] for f in files]
-        self._import_modules(mod_names, sys_path=os.path.abspath(path))
+        paths = {os.path.splitext(os.path.basename(f))[0]: f for f in files}
+        self._import_modules(list(paths), paths=paths)
         return self.load_all() if auto_load else []
 
     def load_from_file(self, path: str, *, auto_load: bool = True) -> List[Plugin]:
@@ -375,7 +386,7 @@ class PluginManager:
         if not os.path.isfile(path):
             raise PluginError(f'Plugin file does not exist: {path}')
         mod_name = os.path.splitext(os.path.basename(path))[0]
-        self._import_modules([mod_name], sys_path=os.path.dirname(path))
+        self._import_modules([mod_name], paths={mod_name: path})
         return self.load_all() if auto_load else []
 
     def load_from_package(self, package: str, *, auto_load: bool = True) -> List[Plugin]:
@@ -386,8 +397,23 @@ class PluginManager:
         self._import_modules(mod_names)
         return self.load_all() if auto_load else []
 
-    def _import_module(self, mod_name: str, *, suppress_errors: bool = False) -> Optional[object]:
-        if mod_name in sys.modules:
+    def _import_module(self, mod_name: str, *, suppress_errors: bool = False,
+                       path: Optional[str] = None) -> Optional[object]:
+        '''Import one plugin module and register the plugins it declares.
+
+        Args:
+            mod_name (str): Module name to import.
+            suppress_errors (bool): When True, a registration error is reported
+                instead of raised.
+            path (Optional[str]): File to load the module from. When omitted the
+                module is imported by name from ``sys.path``.
+
+        Returns:
+            Optional[object]: The imported module.
+        '''
+        if path is not None:
+            module = self._load_from_path(mod_name, path)
+        elif mod_name in sys.modules:
             module = importlib.reload(sys.modules[mod_name])
         else:
             module = importlib.import_module(mod_name)
@@ -398,6 +424,31 @@ class PluginManager:
                 raise
             logger.warning('[plugin] skipped module %s: %s', mod_name, e)
             self._emit('plugin:error', {'plugin': mod_name, 'action': 'import', 'error': str(e)})
+        return module
+
+    def _load_from_path(self, mod_name: str, path: str) -> object:
+        '''Execute ``path`` as the module ``mod_name`` and make it importable.
+
+        Args:
+            mod_name (str): Name the module is registered under.
+            path (str): File to execute.
+
+        Returns:
+            object: The executed module.
+
+        Raises:
+            ImportError: When no loader can handle the file.
+        '''
+        spec = importlib.util.spec_from_file_location(mod_name, path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot import module '{mod_name}' from '{path}'")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(mod_name, None)
+            raise
         return module
 
 

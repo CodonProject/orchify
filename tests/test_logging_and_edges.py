@@ -246,10 +246,16 @@ def test_manager_tap_stays_lazy():
     from orchify.manager import _jsonable
 
     marker = object()
+    orchify_manager._sync()
     orchify_manager._events.clear()
-    orchify_broker.emit(orchify_broker.event(
-        'test:lazy', payload={'blob': {'inner': marker}}))
+    assert orchify_manager._tap is not None and not orchify_manager._tap.disposed
+    event = orchify_broker.event('test:lazy', payload={'blob': {'inner': marker}})
+    orchify_manager._on_event(event)
 
+    queued = orchify_manager._inbox[-1][1].payload
+    assert queued['blob']['inner'] is marker
+
+    orchify_manager._sync()
     stored = orchify_manager._events[-1]['payload']
     assert stored['blob']['inner'] is marker
 

@@ -9,6 +9,7 @@ A Python framework for building LLM-powered AI agent orchestration systems.
 - [Quick Start](#quick-start)
 - [With Tools](#with-tools)
 - [Examples](#examples)
+- [HTTP API](#http-api)
 - [Environment Variables](#environment-variables)
 - [Configuration in Code](#configuration-in-code)
 - [Timeouts, Retries and Cancellation](#timeouts-retries-and-cancellation)
@@ -106,10 +107,47 @@ Runnable scripts live in `examples/`:
 | `examples/approval_console.py` | `console()` approving risky tool calls in the terminal. |
 | `examples/group_vote.py` | A `mode='voting'` panel and its winner. |
 | `examples/offline_demo.py` | The whole flow with `orchify.testing.FakeLLM` — no API key needed. |
+| `examples/lit_review.py` | A literature-review agent over the arXiv API. |
+| `examples/serve_api.py` | The whole engine behind HTTP (FastAPI) for a web frontend. |
+| `examples/api_smoke_test.py` | 22 checks against a running `serve_api.py`. |
 
 ```bash
 python examples/offline_demo.py
 ```
+
+## HTTP API
+
+`examples/serve_api.py` wraps the engine in a thin FastAPI layer so a browser
+frontend can drive it. The kernel is untouched — this is pure application code
+(sessions, routes, event washing).
+
+```bash
+python examples/serve_api.py                 # 127.0.0.1:8010, docs at /docs
+HOST=0.0.0.0 PORT=8010 python examples/serve_api.py
+```
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/health` | Process + engine state |
+| `POST` | `/api/chat` | Submit a task, returns `run_id` immediately |
+| `GET` | `/api/runs` | Live + finished runs, newest first |
+| `GET` | `/api/runs/{id}` | One run: status, answer, usage, budget |
+| `GET` | `/api/runs/{id}/events` | Incremental timeline (`?since=`) |
+| `GET` | `/api/approvals` | Pending approvals, with the exact `args` |
+| `POST` | `/api/approvals/{id}/approve` | Approve |
+| `POST` | `/api/approvals/{id}/reject` | Deny — the reason goes back to the agent |
+| `POST` | `/api/approvals/{id}/answer` | Answer an `ask_user` question |
+
+Two things worth knowing before wiring a frontend:
+
+- **`run_id` contains `#`**, which is a URL fragment delimiter. Every record also
+  carries `run_id_url` (with `!` instead) — use that in paths, or the request
+  silently 404s.
+- **Denying does not stop the run.** The rejection becomes a tool result, and the
+  agent keeps going — usually to explain that the action was blocked. Judge
+  success by the `tool:call:finish` detail, not by `status`.
+
+Full contract, state machine and known limits: [`docs/api-contract.md`](docs/api-contract.md).
 
 ## Environment Variables
 
@@ -140,6 +178,10 @@ Optional runtime tuning (all have safe defaults):
 | `ORCHIFY_MAX_CONCURRENT_LLM_CALLS` | `0` (off) | In-flight LLM requests across every run. |
 | `ORCHIFY_LLM_RPM` | `0` (off) | LLM requests allowed per rolling minute. |
 | `ORCHIFY_TOOL_CACHE_SIZE` | `256` | Entries per `Tool` result cache (LRU); `0` disables caching. |
+| `ORCHIFY_TOOL_CACHE_TTL` | unset (never expires) | Seconds a `Tool(cache=True)` entry stays fresh; a numeric `cache=` value wins. |
+| `ORCHIFY_MAX_RUN_TOOL_CALLS` | `8` | Tool calls one run may have in flight at once (one run cannot occupy the whole shared pool); `0` disables the cap. |
+| `ORCHIFY_STREAM_RETRIES` | `1` | Automatic re-requests for a stream that failed **after** it already showed text; the replayed prefix is never shown twice. `0` disables it. |
+| `ORCHIFY_RUN_OUTCOME_LIMIT` | `256` | Finished-run outcomes the broker remembers for late readers; `0` disables the registry. |
 | `ORCHIFY_TOOL_TIMEOUT` | unset (wait forever) | Seconds an async tool may run before it is abandoned. |
 | `ORCHIFY_HTTP_TIMEOUT` | connect `15` / read `600` / write `60` / pool `60` | Shared HTTP client timeout, in seconds (one number applies to every phase). `0`/`off`/`none`/`inf` disables it. |
 | `ORCHIFY_LLM_MAX_RETRIES` | `2` | Retries when the provider stream fails **before** producing any data. |
@@ -247,6 +289,25 @@ agent.run(user_input="Hi!")
 
 Hooks are selected under the broker lock but **invoked outside it**, so a slow
 hook delays only its own event, not every other run (or the emitting thread).
+
+Two options make that guarantee stronger:
+
+```python
+from orchify.broker import orchify_broker
+
+orchify_broker.hook('run:finish', audit, priority=10)      # runs first
+orchify_broker.hook('*', upload_trace, background=True)    # never blocks the run
+
+orchify_broker.pending_hooks()        # queued background hooks
+orchify_broker.drain_hooks(timeout=5) # wait until they all ran
+```
+
+`priority` orders the hooks of one event (higher first, ties keep registration
+order); `background=True` hands the hook to one shared daemon dispatcher, so even
+a hook that does network IO cannot slow the run. Errors from a background hook
+are logged and never reach the run, and a hook removed before it runs is skipped.
+`orchify_manager.hooks()` reports each binding's owner, mode, priority and
+background flag, plus how many background hooks are still queued.
 
 ## Subscribing from Your Code
 
@@ -553,10 +614,15 @@ themselves at construction, so an idle instance is visible before it ever
 runs; the registry holds **weak references**, so simply dropping your last
 reference to an agent removes it from the manager.
 
-The manager is deliberately passive: it is a single hook that only appends to
-bounded buffers (`ORCHIFY_MANAGER_HISTORY`, `ORCHIFY_MANAGER_EVENTS`) and never
-blocks a run, touches the network, or starts a thread. `close()` removes that
-hook. Set `ORCHIFY_MANAGER_ENABLED=0` to opt out of all of it.
+The manager is deliberately passive: one hook appends to a bounded inbox, and a
+background consumer thread (`OrchifyManagerTap`) turns those entries into run
+records, history, totals and sink lines. The tap itself only enqueues, so the
+emitting run never takes the manager lock, builds a record or writes a file; each
+reader (`status()`, `runs()`, `events()`, `approvals()`, `totals()`, ...) first
+drains what is queued, so a read always reflects events emitted before it.
+`close()` flushes the inbox and stops that thread. The buffers stay bounded
+(`ORCHIFY_MANAGER_HISTORY`, `ORCHIFY_MANAGER_EVENTS`). Set
+`ORCHIFY_MANAGER_ENABLED=0` to opt out of all of it.
 
 The tap is also lazy: an event's payload is stored by reference (a shallow copy
 freezes only the top level) and converted to JSON-safe data when you actually
@@ -640,18 +706,22 @@ python tests/test_llm_middleware.py
 python tests/test_run_outcome.py
 python tests/test_group_async.py
 python tests/test_cli.py
+python tests/test_agent_controls.py
+python tests/test_stream_retry.py
+python tests/test_hooks.py
 ```
 
 The suite is fully offline: a scripted fake LLM stands in for the provider.
-162 tests, no network — the four pause points (including mid-stream and the last
+209 tests, no network — the four pause points (including mid-stream and the last
 step), the lost-resume race, stop-while-parked, approval approve/reject/timeout,
 run/turn identity, group member handles and the voting tally, the per-instance
 run guard (`allow_concurrent_runs`), run-completion handles and their reuse,
 hooks-outside-the-lock, the HTTP timeout and the retry/backoff helpers, the
 token/second/USD budgets (including the missing-price error and the price-table
 overrides), the run/LLM gates and their queueing, the call-depth/cycle guard for
-agents and groups, async tools and the tool result cache, the open-question
-channel (`ask_user`), the JSONL sink and `read_sink()`, plus the
+agents and groups, async tools and the tool result cache (TTL, LRU bound,
+single-flight, a shared `ToolCache`, the per-run concurrency cap), the
+open-question channel (`ask_user`), the JSONL sink and `read_sink()`, plus the
 global manager (registration and weakref release, the disabled/zero-cost mode,
 run lifecycle and history, the approval pool, stop/stop_all, group visibility,
 event filters, bounded buffers, and `to_json()`/`report()`), the ergonomics
@@ -663,7 +733,11 @@ logging configuration and the hook-failure record, `CallChain` (plus the
 dependency order, discovery, load/unload closures), middleware ordering, scoping
 and owner filtering in the LLM dispatch chain, the per-run terminal outcome
 registry behind `ask()`, `Group.arun()`/`Group.aask()` and the non-blocking
-`await_run()`, and the `orchify` command line (`doctor`, `demo`, `version`).
+`await_run()`, the `orchify` command line (`doctor`, `demo`, `version`), the
+in-run control channel (stop, override, message rewrites, inject/deny tool
+results, malformed arguments, unknown tools), and the mid-answer stream retry
+(duplicate-free replay, divergent-replay failure, the reasoning prefix, the
+`ORCHIFY_STREAM_RETRIES` switch) and hook priority plus background dispatch.
 
 `tests/smoke_live_control.py`, `tests/smoke_live_manager.py` and
 `tests/smoke_live_features.py` are opt-in live smokes: they talk to a real

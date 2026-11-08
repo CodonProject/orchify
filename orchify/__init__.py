@@ -2,7 +2,7 @@ from .agent import Agent, get_tool_executor, shutdown_tool_executor
 from .budget import Budget, Price, price_for
 from .call_chain import CallChain, CallFrame
 from .llm import Middleware, OpenAICompat
-from .tool import Tool, tool
+from .tool import Tool, ToolCache, tool
 from .plugin import Plugin
 from .plugin_manager import PluginManager, PluginError, orchify_plugins
 from .group import Group, GroupEventBroker, GroupCallback
@@ -11,7 +11,7 @@ from .schema import Vote
 from .broker import (orchify_broker, PendingApproval, ApprovalTimeout, RunStopped,
                      POLL_INTERVAL, make_turn_id)
 from .errors import (OrchifyError, RunAlreadyActive, RunTimeout, RunFailed,
-                     UnknownRun, WaitOnLoopThread)
+                     UnknownRun, WaitOnLoopThread, MissingCredentials)
 from .gate import gate_stats
 from .manager import OrchifyManager, orchify_manager, RUN_STATUSES, read_sink
 from .config import OrchifyConfig, config, configure
@@ -32,6 +32,7 @@ __all__ = [
     'OpenAICompat',
     'Middleware',
     'Tool',
+    'ToolCache',
     'tool',
     'Plugin',
     'PluginManager',
@@ -57,6 +58,7 @@ __all__ = [
     'RunFailed',
     'UnknownRun',
     'WaitOnLoopThread',
+    'MissingCredentials',
     'OrchifyConfig',
     'config',
     'configure',

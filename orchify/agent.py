@@ -7,7 +7,7 @@ from orchify.tool       import Tool
 from orchify.event      import AgentEvent, ToolEvent, RuntimeEvent, ToolEventAssembler, ApprovalEvent
 from orchify.utils      import safecode, get_logger
 from orchify.env        import req_model
-from orchify.errors     import RunFailed, RunTimeout, UnknownRun
+from orchify.errors     import MissingCredentials, RunFailed, RunTimeout, UnknownRun
 from orchify.broker     import orchify_broker, ApprovalTimeout, RunStopped, POLL_INTERVAL, make_turn_id
 from orchify.backend    import orchify_web_backend
 from orchify.call_chain import CallChain
@@ -21,6 +21,7 @@ from orchify.gate       import get_llm_gate, get_llm_rpm, get_run_gate
 if TYPE_CHECKING:
     from orchify.group import Group
 
+import dataclasses
 import json
 import os
 import time
@@ -53,6 +54,18 @@ def _read_tool_workers() -> int:
         except (TypeError, ValueError):
             pass
     return 32
+
+
+def _read_tool_concurrency() -> int:
+    '''Per-run cap on in-flight tool calls (env ORCHIFY_MAX_RUN_TOOL_CALLS).
+
+    One run can dispatch every tool call of a step at once; without a cap a
+    single run can occupy the whole shared executor and starve other runs.
+
+    Returns:
+        int: The cap; 0 means unlimited.
+    '''
+    return _read_int_env('ORCHIFY_MAX_RUN_TOOL_CALLS', 8)
 
 
 def _read_int_env(name: str, default: int = 0) -> int:
@@ -166,6 +179,7 @@ class Agent:
         require_approval: Union[bool, Callable[[Any, Dict[str, Any]], bool]] = False,
         allow_concurrent_runs: bool = False,
         max_call_depth: Optional[int] = None,
+        max_tool_concurrency: Optional[int] = None,
         budget_tokens: Optional[int] = None,
         budget_usd: Optional[float] = None,
         budget_seconds: Optional[float] = None,
@@ -230,6 +244,11 @@ class Agent:
             enable_ask_user (bool): Register the ready-made ``ask_user`` tool (see
                 ``ask_user_tool()``) so the model can ask the human operator an
                 open question and wait for a free-text answer.
+            max_tool_concurrency (Optional[int]): Per-run cap on tool calls that may
+                be in flight at once, from ``ORCHIFY_MAX_RUN_TOOL_CALLS`` when None
+                (default 8; 0 means unlimited). All tool calls of a step share the
+                global executor, so a cap keeps one run from occupying every worker
+                and starving other runs.
 
         Note:
             Request parameters (temperature, top_p, json_format, max_tokens,
@@ -290,6 +309,10 @@ class Agent:
         self.max_call_depth = (
             max_call_depth if max_call_depth is not None
             else _read_int_env('ORCHIFY_MAX_CALL_DEPTH', 8)
+        )
+        self.max_tool_concurrency = (
+            max_tool_concurrency if max_tool_concurrency is not None
+            else _read_tool_concurrency()
         )
         self.budget = Budget(
             tokens=(
@@ -711,6 +734,10 @@ class Agent:
             llm_kwargs.update(opts)
         if not isinstance(max_steps, int) or isinstance(max_steps, bool) or max_steps < 1:
             raise ValueError(f'max_steps must be a positive integer, got {max_steps!r}')
+        reporter = getattr(self.llm, 'missing_credentials', None)
+        missing = reporter() if callable(reporter) else None
+        if missing:
+            raise MissingCredentials(str(missing), owner=self.name)
         run_id = run_id or turn_id or f'{self.name}#{self.code}_{safecode()}'
         self._run_slot.acquire(
             run_id,
@@ -1139,6 +1166,8 @@ class Agent:
         suspend_result: Dict[str, Any] = {'status': 'resumed'}
         pause_timeout = self.pause_timeout
         approval_timeout = self.approval_timeout
+        tool_limit = self.max_tool_concurrency
+        tool_slots = asyncio.Semaphore(tool_limit) if tool_limit and tool_limit > 0 else None
 
         async def suspend(step: int, reason: str = 'control:pause') -> AsyncGenerator[RuntimeEvent, None]:
             '''Park this run until a matching 'control:resume'.
@@ -1538,6 +1567,39 @@ class Agent:
                     extra_data[k] = req_kwargs.pop(k)
                 return req_kwargs, extra_data
 
+            def _suppress_prefix(content: str, kind: str, shown: dict, suppress: dict) -> str:
+                '''Drop text a replayed stream repeats, failing if it diverges.
+
+                Args:
+                    content (str): Text of the new chunk.
+                    kind (str): ``'answer'`` or ``'cot'``.
+                    shown (dict): Text already emitted per kind.
+                    suppress (dict): Remaining characters to drop per kind.
+
+                Returns:
+                    str: The not-yet-shown tail of ``content``.
+
+                Raises:
+                    RuntimeError: When the replay contradicts the text already
+                        emitted, so splicing it would corrupt the answer.
+                '''
+                left = suppress[kind]
+                take = min(len(content), left)
+                matched = len(shown[kind]) - left
+                expected = shown[kind][matched:matched + take]
+                if content[:take] != expected:
+                    raise RuntimeError(
+                        'stream retry diverged from the text already shown; the '
+                        'replayed answer is not a continuation of the previous one'
+                    )
+                suppress[kind] = left - take
+                return content[take:]
+
+            stream_retries = _read_int_env('ORCHIFY_STREAM_RETRIES', 1)
+            stream_retried = 0
+            shown = {'answer': '', 'cot': ''}
+            suppress = {'answer': 0, 'cot': 0}
+            tool_events_emitted = 0
             final_status = None
             retries = 0
             stream_aborted = False
@@ -1604,8 +1666,20 @@ class Agent:
                                         turn_id=turn_id,
                                         turn=step
                                     )
+                                    tool_events_emitted += len(tool_events)
                                     for te in tool_events: yield te
                                 else:
+                                    kind = 'cot' if chunk.is_cot else 'answer'
+                                    content = chunk.content or ''
+                                    if suppress[kind] > 0:
+                                        content = _suppress_prefix(content, kind, shown, suppress)
+                                        if content == '':
+                                            continue
+                                        response = dataclasses.replace(
+                                            response,
+                                            current_chunk=dataclasses.replace(chunk, content=content)
+                                        )
+                                    shown[kind] += content
                                     yield AgentEvent.build_from_resp(
                                         response,
                                         agent_name=self.name,
@@ -1619,7 +1693,7 @@ class Agent:
                         except Exception:
                             pass
                     break
-                except Exception:
+                except Exception as exc:
                     retry_fb = None
                     for fb in drain_feedback({'control:retry'}):
                         if fb.ftype == 'control:retry':
@@ -1627,6 +1701,22 @@ class Agent:
                     if retry_fb is not None and retries < int(retry_fb.payload.get('max_retries', 1)):
                         retries += 1
                         req_overrides.update(retry_fb.payload.get('kwargs', {}) or {})
+                        suppress['answer'] = len(shown['answer'])
+                        suppress['cot'] = len(shown['cot'])
+                        continue
+                    if (
+                        stream_retried < stream_retries
+                        and tool_events_emitted == 0
+                        and (shown['answer'] or shown['cot'])
+                        and not isinstance(exc, MissingCredentials)
+                    ):
+                        stream_retried += 1
+                        suppress['answer'] = len(shown['answer'])
+                        suppress['cot'] = len(shown['cot'])
+                        logger.warning(
+                            'stream retry %s/%s after a mid-answer failure: %s',
+                            stream_retried, stream_retries, exc,
+                        )
                         continue
                     raise
                 finally:
@@ -1822,8 +1912,8 @@ class Agent:
                         ``result_text`` is the tool's string result (non-strings are
                         JSON-encoded) or "Error executing tool '<name>': ..." on failure.
                     '''
+                    cached = False
                     if t_tool:
-                        cached = False
                         try:
                             if isinstance(t_args, dict):
                                 res = t_tool.execute(**t_args)
@@ -1840,8 +1930,14 @@ class Agent:
                         res = f"Tool '{t_name}' not found."
                     return t_id, t_name, res, cached
 
-                future = loop.run_in_executor(get_tool_executor(), run_single_tool)
-                tasks.append(future)
+                async def submit_tool_call(runner=run_single_tool):
+                    '''Run one tool call, respecting the per-run concurrency cap.'''
+                    if tool_slots is None:
+                        return await loop.run_in_executor(get_tool_executor(), runner)
+                    async with tool_slots:
+                        return await loop.run_in_executor(get_tool_executor(), runner)
+
+                tasks.append(asyncio.ensure_future(submit_tool_call()))
 
             for future in asyncio.as_completed(tasks):
                 t_id, t_name, result, cached = await future

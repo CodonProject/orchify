@@ -7,7 +7,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from orchify import Agent, Tool, tool
+from orchify import Agent, Tool, ToolCache, tool
 from orchify.backend import orchify_web_backend
 
 from test_pause_approval import (FakeLLM, Recorder, final, tool_call, wait_until,
@@ -275,6 +275,135 @@ def test_async_tool_decorator_and_sync_unchanged():
     print('ok  decorator surfaces for async and sync tools')
 
 
+def test_cache_store_is_shared_across_tools():
+    '''Two tools given one ToolCache share results but never collide on keys.'''
+    counter = Counter()
+    shared = ToolCache()
+
+    def work(value: str = 'x') -> str:
+        counter.bump()
+        return f'work:{value}'
+
+    first = Tool(func=work, name='work', cache=True, cache_store=shared)
+    second = Tool(func=work, name='work', cache=True, cache_store=shared)
+
+    assert first.execute(value='a') == 'work:a'
+    assert second.execute(value='a') == 'work:a'
+    assert counter.calls == 1, 'the same tool name plus kwargs is served from the shared store'
+    assert second.last_cached is True
+    assert shared.data and first.cache_info()['size'] == 1
+
+    other = Tool(func=work, name='other-work', cache=True, cache_store=shared)
+    assert other.execute(value='a') == 'work:a'
+    assert counter.calls == 2, 'different tool names must not share a cached entry'
+
+    first.clear_cache()
+    assert shared.data == {}
+    assert second.execute(value='a') == 'work:a'
+    assert counter.calls == 3
+    print('ok  shared ToolCache shares by name and keeps tool namespaces apart')
+
+
+def test_cache_true_default_ttl_from_env():
+    '''ORCHIFY_TOOL_CACHE_TTL bounds cache=True entries without changing its docs.'''
+    saved = os.environ.get('ORCHIFY_TOOL_CACHE_TTL')
+    counter = Counter()
+    try:
+        os.environ['ORCHIFY_TOOL_CACHE_TTL'] = '0.15'
+        t = make_cached(counter)
+        assert t.cache_ttl == 0.15
+        assert t.cache_info()['ttl'] == 0.15
+        assert t.execute(value='a') == 'work:a'
+        assert t.execute(value='a') == 'work:a'
+        time.sleep(0.2)
+        assert t.execute(value='a') == 'work:a'
+        assert counter.calls == 2, 'the env TTL must expire a cache=True entry'
+
+        os.environ.pop('ORCHIFY_TOOL_CACHE_TTL', None)
+        forever = make_cached(counter)
+        assert forever.cache_ttl is None
+        assert forever.execute(value='b') == 'work:b'
+        assert forever.execute(value='b') == 'work:b'
+        time.sleep(0.2)
+        assert forever.execute(value='b') == 'work:b'
+        assert counter.calls == 3, 'without the env var cache=True still caches forever'
+    finally:
+        if saved is None:
+            os.environ.pop('ORCHIFY_TOOL_CACHE_TTL', None)
+        else:
+            os.environ['ORCHIFY_TOOL_CACHE_TTL'] = saved
+    print('ok  cache=True honours ORCHIFY_TOOL_CACHE_TTL when set')
+
+
+def test_per_run_tool_concurrency_cap():
+    '''A run never exceeds ORCHIFY_MAX_RUN_TOOL_CALLS in-flight tool calls.'''
+    state = {'active': 0, 'peak': 0}
+    lock = threading.Lock()
+
+    def slow(q: str = 'x') -> str:
+        with lock:
+            state['active'] += 1
+            state['peak'] = max(state['peak'], state['active'])
+        time.sleep(0.05)
+        with lock:
+            state['active'] -= 1
+        return f'ok:{q}'
+
+    calls = [tool_call('slow', '{"q": "v%d"}' % index, call_id=f'c{index}')
+             for index in range(6)]
+    llm = FakeLLM([[{'final': {'content': '', 'reasoning': '', 'tool_calls': calls}}],
+                   [final('done')]])
+    agent = Agent(name='cap-bounded', llm=llm, system_prompt='sys',
+                  max_tool_concurrency=2)
+    agent.add_tool(Tool(func=slow, name='slow', description='Slow echo'))
+    rec = Recorder()
+    try:
+        agent.run('go')
+        wait_finish(rec)
+    finally:
+        rec.close()
+    results = [m['content'] for m in llm.calls[1]['messages'] if m.get('role') == 'tool']
+    assert len(results) == 6 and all(item.startswith('ok:') for item in results)
+    assert state['peak'] <= 2, f"per-run cap exceeded: {state['peak']}"
+
+    state['peak'] = 0
+    calls = [tool_call('slow', '{"q": "u%d"}' % index, call_id=f'u{index}')
+             for index in range(6)]
+    llm = FakeLLM([[{'final': {'content': '', 'reasoning': '', 'tool_calls': calls}}],
+                   [final('done')]])
+    agent = Agent(name='cap-unlimited', llm=llm, system_prompt='sys',
+                  max_tool_concurrency=0)
+    agent.add_tool(Tool(func=slow, name='slow', description='Slow echo'))
+    rec = Recorder()
+    try:
+        agent.run('go')
+        wait_finish(rec)
+    finally:
+        rec.close()
+    assert state['peak'] > 2, 'the cap must be the only thing serialising the calls'
+    print('ok  per-run tool concurrency is capped')
+
+
+def test_per_run_tool_concurrency_from_env():
+    '''The cap defaults to ORCHIFY_MAX_RUN_TOOL_CALLS and the argument wins.'''
+    saved = os.environ.get('ORCHIFY_MAX_RUN_TOOL_CALLS')
+    os.environ['ORCHIFY_MAX_RUN_TOOL_CALLS'] = '3'
+    try:
+        assert Agent(name='env-cap', llm=FakeLLM([]), system_prompt='sys').max_tool_concurrency == 3
+        explicit = Agent(name='arg-cap', llm=FakeLLM([]), system_prompt='sys',
+                         max_tool_concurrency=1)
+        assert explicit.max_tool_concurrency == 1
+        os.environ.pop('ORCHIFY_MAX_RUN_TOOL_CALLS')
+        assert Agent(name='default-cap', llm=FakeLLM([]),
+                     system_prompt='sys').max_tool_concurrency == 8
+    finally:
+        if saved is None:
+            os.environ.pop('ORCHIFY_MAX_RUN_TOOL_CALLS', None)
+        else:
+            os.environ['ORCHIFY_MAX_RUN_TOOL_CALLS'] = saved
+    print('ok  the concurrency cap reads the environment')
+
+
 def main():
     '''Run every test in this file.
 
@@ -287,11 +416,15 @@ def main():
         test_cache_exceptions_are_not_cached,
         test_cache_lru_bound_and_eviction,
         test_cache_single_flight_coalesces_concurrent_calls,
+        test_cache_store_is_shared_across_tools,
+        test_cache_true_default_ttl_from_env,
         test_async_tool_runs_on_the_backend_loop,
         test_async_tool_timeout,
         test_async_tool_refuses_the_loop_thread,
         test_async_tool_through_an_agent_run,
         test_async_tool_decorator_and_sync_unchanged,
+        test_per_run_tool_concurrency_cap,
+        test_per_run_tool_concurrency_from_env,
     ]
     failures = []
     for fn in tests:

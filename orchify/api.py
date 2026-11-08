@@ -38,6 +38,8 @@ def on(
     match: Optional[Callable[[Any], bool]] = None,
     owner: str = 'user',
     turn_id: Optional[str] = None,
+    priority: int = 0,
+    background: bool = False,
 ) -> Union[HookBinding, Callable[[Callable[[Any], Any]], HookBinding]]:
     '''Subscribe a function to orchestration events.
 
@@ -57,6 +59,9 @@ def on(
         match (Optional[Callable[[Any], bool]]): Extra predicate over the event.
         owner (str): Owner label used by ``off()`` and ``remove_hooks()``.
         turn_id (Optional[str]): Only deliver events of that turn.
+        priority (int): Higher priority hooks run first.
+        background (bool): Deliver on the shared dispatcher so a slow callback
+            never delays the run; use ``orchify_broker.drain_hooks()`` to wait.
 
     Returns:
         Union[HookBinding, Callable[[Callable[[Any], Any]], HookBinding]]: The
@@ -75,6 +80,8 @@ def on(
             match=match,
             owner=owner,
             turn_id=turn_id,
+            priority=priority,
+            background=background,
         )
 
     if hook is None:

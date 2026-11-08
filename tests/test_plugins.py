@@ -634,6 +634,35 @@ def test_manager_load_from_package_and_single_file():
             pass
 
 
+def test_loading_a_file_does_not_mutate_sys_path():
+    '''File-based loads use the exact file and leave sys.path untouched.'''
+    path_before = list(sys.path)
+    single = os.path.join(ROOT, f'plugpure{os.getpid()}.py')
+    mod_name = os.path.splitext(os.path.basename(single))[0]
+    manager = PluginManager(broker=orchify_broker)
+    try:
+        _write(single, '\n'.join([
+            'from orchify.plugin import Plugin',
+            '',
+            'class PurePlugin(Plugin):',
+            "    name = 'path-pure'",
+            '',
+        ]))
+        loaded = manager.load_from_file(single)
+        assert [inst.name for inst in loaded] == ['path-pure']
+        assert sys.path == path_before, 'load_from_file must not edit sys.path'
+        reloaded = manager.load_from_file(single, auto_load=False)
+        assert reloaded == []
+    finally:
+        manager.unregister('path-pure')
+        sys.modules.pop(mod_name, None)
+        try:
+            os.remove(single)
+        except OSError:
+            pass
+    print('ok  file-based plugin loads leave sys.path alone')
+
+
 def main():
     '''Run every test in this module and report a summary.'''
     tests = [
@@ -649,6 +678,7 @@ def main():
         test_manager_load_all_unload_all_and_configure,
         test_manager_discovers_and_loads_plugin_files,
         test_manager_load_from_package_and_single_file,
+        test_loading_a_file_does_not_mutate_sys_path,
     ]
     failures = []
     for fn in tests:
