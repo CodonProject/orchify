@@ -212,6 +212,41 @@ def parse_structured(text: str, schema: Dict[str, Any]) -> Tuple[Any, List[str]]
     return value, validate(value, schema)
 
 
+_MAX_ECHO = 4000
+
+
+def _retry_message(prompt: str, previous: str, error: str, instruction: str) -> str:
+    '''Build the correction prompt for a retry.
+
+    The previous reply is echoed back (bounded) together with the original
+    request so the model can fix its own output instead of guessing what it
+    said before.
+
+    Args:
+        prompt (str): The original user request.
+        previous (str): The reply that failed validation.
+        error (str): Human-readable validation problems.
+        instruction (str): The schema instruction block.
+
+    Returns:
+        str: The message for the next attempt.
+    '''
+    reply = str(previous or '')
+    if len(reply) > _MAX_ECHO:
+        reply = reply[:_MAX_ECHO] + '\n…[truncated]'
+    request = str(prompt or '')
+    if len(request) > _MAX_ECHO:
+        request = request[:_MAX_ECHO] + '\n…[truncated]'
+    return (
+        'That reply did not match the schema.\n\n'
+        'Original request:\n%s\n\n'
+        'Your previous reply:\n%s\n\n'
+        'Problems:\n- %s\n\n'
+        'Return ONLY corrected JSON that matches the schema below.\n\n%s'
+        % (request, reply or '(empty)', error, instruction)
+    )
+
+
 def ask_structured(
     agent: Any,
     prompt: str,
@@ -250,11 +285,7 @@ def ask_structured(
         if attempt == 1:
             message = '\n\n%s' % instruction
         else:
-            message = (
-                'That reply did not match the schema.\n\nProblems:\n- %s\n\n'
-                'Return ONLY corrected JSON that matches the schema below.\n\n%s'
-                % (last_error, instruction)
-            )
+            message = _retry_message(prompt, last_text, last_error, instruction)
         kwargs: Dict[str, Any] = {}
         if max_steps is not None:
             kwargs['max_steps'] = max_steps

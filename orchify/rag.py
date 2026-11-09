@@ -18,12 +18,14 @@ Swap :class:`orchify.embeddings.HashingEmbeddings` for
 changes.
 """
 
+import heapq
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from orchify.embeddings import Embeddings, HashingEmbeddings, cosine
+from orchify.embeddings import Embeddings, HashingEmbeddings
 from orchify.tool import Tool
 from orchify.utils import get_logger
 
@@ -93,6 +95,9 @@ class VectorIndex:
         self.min_score = float(min_score)
         self.documents: List[Document] = []
         self.vectors: List[List[float]] = []
+        # Cached L2 norms, parallel to ``vectors``; search would otherwise
+        # recompute every stored norm on every query.
+        self._norms: List[float] = []
 
     def __len__(self) -> int:
         '''Number of indexed documents.'''
@@ -102,6 +107,14 @@ class VectorIndex:
         '''Drop every document and vector.'''
         self.documents.clear()
         self.vectors.clear()
+        self._norms.clear()
+
+    def _ensure_norms(self) -> None:
+        '''Recompute the cached vector norms when the index changed outside add_texts.'''
+        if len(self._norms) == len(self.vectors):
+            return
+        self._norms = [math.sqrt(sum(value * value for value in vector)) or 0.0
+                       for vector in self.vectors]
 
     def add_texts(self, texts: Sequence[str], metadatas: Optional[Sequence[Dict[str, Any]]] = None,
                   ids: Optional[Sequence[str]] = None) -> int:
@@ -113,7 +126,8 @@ class VectorIndex:
             ids (Optional[Sequence[str]]): One id per text; generated when omitted.
 
         Returns:
-            int: How many documents were added.
+            int: How many documents were added; a document whose id is already
+                indexed is updated in place and not counted.
         '''
         items = [str(text or '') for text in texts or []]
         if not items:
@@ -125,13 +139,26 @@ class VectorIndex:
             )
         metas = list(metadatas or [])
         supplied = list(ids or [])
+        positions = {document.doc_id: position
+                     for position, document in enumerate(self.documents)}
+        added = 0
         for offset, (text, vector) in enumerate(zip(items, vectors)):
-            base = len(self.documents)
             meta = dict(metas[offset]) if offset < len(metas) else {}
-            doc_id = str(supplied[offset]) if offset < len(supplied) else f'doc-{base:06d}'
-            self.documents.append(Document(text=text, metadata=meta, doc_id=doc_id))
-            self.vectors.append(list(vector))
-        return len(items)
+            doc_id = (str(supplied[offset]) if offset < len(supplied)
+                      else f'doc-{len(self.documents):06d}')
+            norm = math.sqrt(sum(value * value for value in vector)) or 0.0
+            position = positions.get(doc_id)
+            if position is None:
+                positions[doc_id] = len(self.documents)
+                self.documents.append(Document(text=text, metadata=meta, doc_id=doc_id))
+                self.vectors.append(list(vector))
+                self._norms.append(norm)
+                added += 1
+            else:
+                self.documents[position] = Document(text=text, metadata=meta, doc_id=doc_id)
+                self.vectors[position] = list(vector)
+                self._norms[position] = norm
+        return added
 
     def add_documents(self, documents: Iterable[Document]) -> int:
         '''Index already-built documents.
@@ -163,11 +190,20 @@ class VectorIndex:
         if not self.documents or not query:
             return []
         vector = self.embeddings.embed_one(query)
-        scored = [Hit(document=document, score=cosine(vector, stored))
-                  for document, stored in zip(self.documents, self.vectors)]
-        scored = [hit for hit in scored if hit.score > self.min_score]
-        scored.sort(key=lambda hit: hit.score, reverse=True)
-        return scored[:limit]
+        self._ensure_norms()
+        query_norm = math.sqrt(sum(value * value for value in vector)) or 0.0
+        scored: List[Any] = []
+        for index, stored in enumerate(self.vectors):
+            stored_norm = self._norms[index]
+            denominator = query_norm * stored_norm
+            if denominator <= 0.0:
+                continue
+            score = sum(left * right for left, right in zip(vector, stored)) / denominator
+            if score > self.min_score:
+                scored.append((score, index))
+        # Keep only the top ``k`` pairs; materialise Hit objects afterwards.
+        best = heapq.nlargest(limit, scored)
+        return [Hit(document=self.documents[index], score=score) for score, index in best]
 
     def snapshot(self) -> Dict[str, Any]:
         '''Return index metadata for reports.'''
@@ -323,13 +359,16 @@ def index_event_store(store: Any, index: VectorIndex, *, run_id: Optional[str] =
         event_types (Optional[Sequence[str]]): Journal types to index.
 
     Returns:
-        int: How many passages were added.
+        int: How many passages were added. Indexing the same journal twice
+        updates the existing passages instead of duplicating them.
     '''
     wanted = tuple(event_types or DEFAULT_INDEXED_TYPES)
     run_ids = [run_id] if run_id else list(store.runs())
     texts: List[str] = []
     metadatas: List[Dict[str, Any]] = []
+    ids: List[str] = []
     for current in run_ids:
+        position = 0
         for record in store.events(current):
             if record.get('type') not in wanted:
                 continue
@@ -339,7 +378,11 @@ def index_event_store(store: Any, index: VectorIndex, *, run_id: Optional[str] =
             texts.append(text)
             metadatas.append({'run_id': current, 'type': record.get('type'),
                               'ts': record.get('ts')})
-    return index.add_texts(texts, metadatas)
+            # The journal is append-only, so the nth kept event of a run keeps
+            # its identity across re-indexing.
+            ids.append(f'{current}:{position}')
+            position += 1
+    return index.add_texts(texts, metadatas, ids)
 
 
 __all__ = ['Document', 'Hit', 'VectorIndex', 'retrieve_tool', 'index_event_store',

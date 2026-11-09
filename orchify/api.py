@@ -270,7 +270,8 @@ class ConsoleLoop:
     Attributes:
         inp (Callable[[str], str]): Prompt function, ``input`` by default.
         out (Callable[[str], Any]): Output function, ``print`` by default.
-        poll_interval (float): Seconds between two pools scans.
+        poll_interval (float): Fallback seconds between two pools scans; a new
+            approval wakes the loop immediately.
     '''
 
     def __init__(
@@ -285,8 +286,10 @@ class ConsoleLoop:
             inp (Callable[[str], str]): Prompt function used to read an answer.
             out (Callable[[str], Any]): Output function used to report what was
                 sent back to the agent.
-            poll_interval (Optional[float]): Seconds between two scans; defaults
-                to ``ORCHIFY_POLL_INTERVAL``.
+            poll_interval (Optional[float]): Fallback wait between two scans;
+                defaults to ``ORCHIFY_POLL_INTERVAL``. A new approval wakes the
+                loop immediately, so this only bounds how fast an approval that
+                was queued without an event is noticed.
 
         Raises:
             ValueError: When numbers in the interval are not usable by the loop.
@@ -297,7 +300,9 @@ class ConsoleLoop:
         if self.poll_interval <= 0:
             raise ValueError(f'poll_interval must be a positive number, got {poll_interval!r}')
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._binding: Any = None
 
     @property
     def running(self) -> bool:
@@ -358,6 +363,10 @@ class ConsoleLoop:
         if self.running:
             return self
         self._stop.clear()
+        self._wake.clear()
+        self._binding = orchify_broker.register_hook(
+            'run:approval:required', self._on_approval, owner='console-loop'
+        )
         self._thread = threading.Thread(
             target=self._loop,
             name='OrchifyConsole',
@@ -366,16 +375,21 @@ class ConsoleLoop:
         self._thread.start()
         return self
 
+    def _on_approval(self, event: Any) -> None:
+        '''Wake the loop when a run parks on a new question or approval.'''
+        self._wake.set()
+
     def _loop(self) -> None:
         '''Scan the pool until ``stop()`` is called.'''
         while not self._stop.is_set():
+            self._wake.clear()
             try:
                 handled = self.run_once()
             except Exception as exc:
                 logger.error('[Console] %s', exc)
                 handled = False
             if not handled:
-                self._stop.wait(self.poll_interval)
+                self._wake.wait(self.poll_interval)
 
     def stop(self, timeout: Optional[float] = 5.0) -> bool:
         '''Stop the background loop and wait for the thread.
@@ -388,6 +402,13 @@ class ConsoleLoop:
             bool: True when the thread is no longer alive.
         '''
         self._stop.set()
+        self._wake.set()
+        binding, self._binding = self._binding, None
+        if binding is not None:
+            try:
+                orchify_broker.remove_binding(binding)
+            except Exception:
+                pass
         thread, self._thread = self._thread, None
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=timeout)

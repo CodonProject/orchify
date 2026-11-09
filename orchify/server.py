@@ -142,15 +142,21 @@ class EventLog:
         dropped (int): Events filtered out.
     '''
 
-    def __init__(self, per_run: int = 300, owner: str = 'orchify-server') -> None:
+    def __init__(self, per_run: int = 300, owner: str = 'orchify-server',
+                 max_runs: int = 1000) -> None:
         '''Configure the buffer.
 
         Args:
             per_run (int): Ring size per run.
             owner (str): Hook owner used for cleanup.
+            max_runs (int): How many finished runs stay readable. When more runs
+                finish, the oldest finished buffers are evicted so a long-lived
+                server keeps a bounded footprint; ``0`` disables the cap. Runs
+                with an open stream (a waiting SSE client) are never evicted.
         '''
         self.per_run = per_run
         self.owner = owner
+        self.max_runs = max(0, int(max_runs))
         self._lock = threading.Lock()
         # One condition per run, all sharing ``_lock``: a new event wakes only
         # the streams waiting on that run instead of every connected client.
@@ -158,10 +164,13 @@ class EventLog:
         self._buf: Dict[str, Deque[Dict[str, Any]]] = {}
         self._reason: Dict[str, List[str]] = {}
         self._finished: set = set()
+        # Finished runs in completion order; the eviction cap applies to it.
+        self._done: Deque[str] = deque()
         self._seq = 0
         self._binding: Any = None
         self.kept = 0
         self.dropped = 0
+        self.runs_dropped = 0
 
     # ----------------------------------------------------------------- wiring
 
@@ -300,6 +309,9 @@ class EventLog:
             if event_type in _TERMINAL_TYPES:
                 self._finished.add(run_id)
                 self._reason.pop(run_id, None)
+                if run_id not in self._done:
+                    self._done.append(run_id)
+                self._evict_locked()
             cond.notify_all()
             if event_type in _TERMINAL_TYPES:
                 # Waiters already woke and saw ``finished``; a late stream re-reads
@@ -307,6 +319,30 @@ class EventLog:
                 self._conds.pop(run_id, None)
 
     # ------------------------------------------------------------------- reads
+
+    def _evict_locked(self) -> None:
+        '''Drop the oldest finished runs until ``max_runs`` is respected.
+
+        Must be called with ``_lock`` held. A run with a live condition (an SSE
+        client waiting on it) is left alone and moved to the back of the queue,
+        so a slow reader cannot be silently disconnected.
+        '''
+        if not self.max_runs:
+            return
+        attempts = 0
+        while len(self._done) > self.max_runs and attempts <= len(self._done):
+            attempts += 1
+            run_id = self._done.popleft()
+            if run_id not in self._buf:
+                continue
+            if run_id in self._conds:
+                # A stream is still attached; retry it on the next eviction.
+                self._done.append(run_id)
+                continue
+            self._buf.pop(run_id, None)
+            self._finished.discard(run_id)
+            self._reason.pop(run_id, None)
+            self.runs_dropped += 1
 
     def since(self, run_id: str, seq: int = 0) -> List[Dict[str, Any]]:
         '''Return the events of one run with a sequence number above ``seq``.
@@ -378,6 +414,7 @@ class EventLog:
             return {
                 'runs_tracked': len(self._buf),
                 'runs_finished': len(self._finished),
+                'runs_dropped': self.runs_dropped,
                 'events_kept': self.kept,
                 'events_dropped': self.dropped,
             }
@@ -757,6 +794,7 @@ def create_app(*, agent: Optional[Agent] = None,
                tracer: Any = None,
                events: Optional[EventLog] = None,
                poll_per_run: int = 300,
+               poll_max_runs: int = 1000,
                mcp: Any = None,
                mcp_path: str = '/mcp',
                title: str = 'Orchify API') -> FastAPI:
@@ -774,6 +812,8 @@ def create_app(*, agent: Optional[Agent] = None,
         tracer (Any): :class:`orchify.telemetry.Tracer` to trace runs.
         events (Optional[EventLog]): Event buffer to reuse.
         poll_per_run (int): Ring size per run in a new buffer.
+        poll_max_runs (int): Finished runs kept in a new buffer (oldest are
+            evicted first); ``0`` keeps every run.
         mcp (Any): An :class:`orchify.mcp_server.MCPHTTPServer`, an
             ``MCPStdioServer`` to wrap, or ``None`` to skip the endpoint.
         mcp_path (str): Path of the MCP endpoint (streamable HTTP).
@@ -799,7 +839,7 @@ def create_app(*, agent: Optional[Agent] = None,
     if agent_factory is None:
         agent_factory = lambda session: _agent_from_parts(session, tools, system_prompt)  # noqa: E731
     pool = SessionPool(agent_factory, capacity=session_capacity)
-    log = events or EventLog(per_run=poll_per_run)
+    log = events or EventLog(per_run=poll_per_run, max_runs=poll_max_runs)
 
     local_metrics = metrics
     local_tracer = tracer

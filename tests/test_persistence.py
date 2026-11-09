@@ -148,3 +148,37 @@ def test_agent_snapshot_round_trip():
         assert any('kept answer' in str(message.get('content')) for message in other.messages)
     finally:
         _drop(directory)
+
+
+def test_event_store_keeps_a_bounded_handle_cache():
+    class _Stub:
+        def __init__(self, run_id):
+            self.run_id = run_id
+            self.event_type = 'agent:answer'
+            self.payload = {}
+            self.created_at = 0.0
+            self.agent_name = 'a'
+            self.turn = 1
+
+    directory = _directory()
+    try:
+        store = EventStore(directory)
+        assert store.max_handles >= 2
+        for index in range(4):
+            store.record(_Stub(f'run-{index}'))
+        store.flush()
+        assert store.handles_open == 4
+        # A second flush of the same runs must not open more handles.
+        for index in range(4):
+            store.record(_Stub(f'run-{index}'))
+        store.flush()
+        assert store.handles_open == 4
+        store.max_handles = 2
+        store.record(_Stub('run-9'))
+        store.flush()
+        assert store.handles_open <= 2
+        assert 'run-9' in store.runs()
+        store.close()
+        assert store.handles_open == 0
+    finally:
+        _drop(directory)

@@ -166,3 +166,50 @@ def test_sandbox_run_uses_the_configured_workdir():
         assert result == os.path.join(directory, 'note.txt')
         with open(result, encoding='utf-8') as handle:
             assert handle.read() == 'kept'
+
+
+def noisy(size: int) -> str:
+    """Return a long string, to exercise the output cap.
+
+    Args:
+        size (int): How many characters to return.
+
+    Returns:
+        str: ``size`` characters.
+    """
+    return 'x' * size
+
+
+def worker_pid() -> int:
+    """Return the id of the sandbox process.
+
+    Returns:
+        int: The child's process id.
+    """
+    import os
+    return os.getpid()
+
+
+def test_output_is_capped():
+    with _Workspace() as workdir:
+        result = run_sandboxed(noisy, {'size': 5000}, timeout=20.0,
+                               workdir=workdir, max_output=100)
+    assert isinstance(result, str)
+    assert len(result) == 100
+
+
+def test_persistent_sandbox_reuses_one_worker():
+    with _Workspace() as workdir:
+        box = Sandbox(timeout=20.0, workdir=workdir, persistent=True)
+        try:
+            first = box.run(worker_pid)
+            second = box.run(worker_pid)
+        finally:
+            box.close()
+    assert first == second
+
+    with _Workspace() as workdir:
+        box = Sandbox(timeout=20.0, workdir=workdir, persistent=False)
+        third = box.run(worker_pid)
+        fourth = box.run(worker_pid)
+    assert third != fourth

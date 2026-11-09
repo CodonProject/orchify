@@ -29,6 +29,9 @@ logger = get_logger(__name__)
 #: Words, numbers and single CJK/kana/hangul characters.
 _TOKEN_RE = re.compile(r'[A-Za-z0-9_]+|[\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af]')
 
+#: Upper bound on the token -> bucket cache kept by :class:`HashingEmbeddings`.
+_MAX_TOKEN_CACHE = 20000
+
 DEFAULT_OPENAI_MODEL = 'text-embedding-3-small'
 
 
@@ -93,6 +96,22 @@ class HashingEmbeddings(Embeddings):
 
     def __init__(self, dimension: int = 512):
         self.dimension = max(8, int(dimension))
+        # token -> bucket, bounded: the same tokens recur across a corpus and
+        # across queries, and blake2b per occurrence is pure overhead.
+        self._buckets: Dict[str, int] = {}
+
+    def _bucket(self, token: str) -> int:
+        '''Return (and cache) the bucket a token hashes into.'''
+        bucket = self._buckets.get(token)
+        if bucket is None:
+            if len(self._buckets) >= _MAX_TOKEN_CACHE:
+                self._buckets.clear()
+            digest = int.from_bytes(
+                hashlib.blake2b(token.encode('utf-8'), digest_size=8).digest(), 'big'
+            )
+            bucket = digest % self.dimension
+            self._buckets[token] = bucket
+        return bucket
 
     def _vector(self, text: str) -> List[float]:
         counts: Dict[str, int] = {}
@@ -100,10 +119,7 @@ class HashingEmbeddings(Embeddings):
             counts[token] = counts.get(token, 0) + 1
         vector = [0.0] * self.dimension
         for token, count in counts.items():
-            digest = int.from_bytes(
-                hashlib.blake2b(token.encode('utf-8'), digest_size=8).digest(), 'big'
-            )
-            index = digest % self.dimension
+            index = self._bucket(token)
             # No sign flipping: a shared token must always increase similarity, so
             # a bucket collision between unrelated tokens cannot make two related
             # passages look dissimilar.

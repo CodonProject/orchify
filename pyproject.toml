@@ -33,6 +33,19 @@ dynamic = ["version"]
 dev = ["pytest>=7", "pytest-cov>=4", "mypy>=1.8", "build>=1.0", "twine>=5"]
 # Only examples/serve_api.py needs these; the library itself stays httpx-only.
 web = ["fastapi>=0.100", "uvicorn>=0.20"]
+# Optional integrations: each one is imported lazily and reports a clear
+# RuntimeError when it is missing (``orchify doctor`` lists what is installed).
+redis = ["redis>=4.0"]
+otel = ["opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]
+mcp = ["mcp>=1.0"]
+all = [
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
+    "redis>=4.0",
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "mcp>=1.0",
+]
 
 [project.scripts]
 orchify = "orchify.cli:main"

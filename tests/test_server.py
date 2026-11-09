@@ -294,7 +294,31 @@ def test_event_log_wakes_only_the_run_being_watched():
         log.stop()
 
 
-def test_event_log_drops_noise_and_merges_reasoning():
+def test_event_log_evicts_the_oldest_finished_runs():
+    '''A long-lived server keeps a bounded number of finished run buffers.'''
+    log = EventLog(per_run=5, max_runs=2)
+    try:
+        for index in range(4):
+            run_id = f'run-{index}'
+            log._on_event(_logged('run:start', run_id=run_id))
+            log._on_event(_logged('run:finish', run_id=run_id))
+        assert log.size() == 2, log.stats()
+        assert log.runs_dropped == 2
+        assert log.stats()['runs_dropped'] == 2
+        assert log.since('run-0') == [] and log.since('run-1') == []
+        assert log.finished('run-0') is False
+        assert [item['type'] for item in log.since('run-3')] == ['run:start', 'run:finish']
+        # An attached stream is never evicted out from under its client.
+        with log._lock:
+            log._cond_for('run-2')
+        log._on_event(_logged('run:start', run_id='run-4'))
+        log._on_event(_logged('run:finish', run_id='run-4'))
+        assert log.since('run-2') != [], log.stats()
+        assert log.since('run-3') == [], log.stats()
+        assert log.size() <= 3, log.stats()
+    finally:
+        log.stop()
+
     '''Token fragments are dropped, reasoning chunks are merged.'''
     class _Event:
         def __init__(self, event_type, **kwargs):

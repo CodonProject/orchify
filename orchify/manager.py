@@ -297,6 +297,9 @@ class OrchifyManager:
                           if events is None else max(0, int(events)))
 
         self._history: deque = deque(maxlen=history_capacity)
+        # Run ids kept next to ``_history`` so a finish can evict exactly the
+        # run that fell out of the bounded history instead of scanning it.
+        self._history_ids: deque = deque(maxlen=history_capacity)
         self._events: deque = deque(maxlen=event_capacity)
         self._instances: Dict[str, weakref.ref] = {}
         self._kinds: Dict[str, str] = {}
@@ -450,21 +453,28 @@ class OrchifyManager:
         '''
         applied = 0
         while limit is None or applied < limit:
+            # Pop a batch under one lock: a burst of events costs one lock
+            # round-trip instead of one per event. They are still handled in
+            # order, outside the lock.
             with self._inbox_lock:
                 if not self._inbox:
                     break
-                source, event, now = self._inbox.popleft()
-            applied += 1
-            if source == 'group':
-                self._handle_group_event(event, now)
-                continue
-            record = None
-            try:
-                record = self._handle_event(event, now)
-            except Exception as exc:
-                logger.error('Error in OrchifyManager event tap: %s', exc)
-            if record is not None and self._sink_path:
-                self._write_sink({'record': 'event', **record})
+                wanted = min(len(self._inbox), 1024)
+                if limit is not None:
+                    wanted = min(wanted, limit - applied)
+                batch = [self._inbox.popleft() for _ in range(wanted)]
+            for source, event, now in batch:
+                applied += 1
+                if source == 'group':
+                    self._handle_group_event(event, now)
+                    continue
+                record = None
+                try:
+                    record = self._handle_event(event, now)
+                except Exception as exc:
+                    logger.error('Error in OrchifyManager event tap: %s', exc)
+                if record is not None and self._sink_path:
+                    self._write_sink({'record': 'event', **record})
         if applied:
             # One flush per drain keeps a fast event stream from paying a
             # write syscall per record while readers still see a whole batch.
@@ -917,13 +927,25 @@ class OrchifyManager:
         live['tokens'] = record['tokens']
         live['cost_usd'] = record['cost_usd']
         self._runs.pop(run_id, None)
-        if previous is not None and self._history.maxlen != 0:
+        capacity = self._history.maxlen
+        if previous is not None and capacity != 0:
             self._history = deque(
                 (item for item in self._history if item.get('run_id') != run_id),
-                maxlen=self._history.maxlen,
+                maxlen=capacity,
+            )
+            self._history_ids = deque(
+                (known for known in self._history_ids if known != run_id),
+                maxlen=capacity,
             )
         self._finished[run_id] = record
-        self._history.append(record)
+        if capacity == 0:
+            # History is disabled, so a finished run cannot be remembered.
+            self._finished.pop(run_id, None)
+        else:
+            if capacity is not None and len(self._history) >= capacity:
+                self._finished.pop(self._history_ids.popleft(), None)
+            self._history.append(record)
+            self._history_ids.append(run_id)
         self._add_totals(record)
         if self._sink_path:
             self._write_sink({'record': 'run', **record})
@@ -933,10 +955,6 @@ class OrchifyManager:
             except Exception as exc:
                 logger.warning('run store %s rejected run %s: %s',
                                getattr(self._store, 'name', '?'), run_id, exc)
-        if self._history.maxlen is not None:
-            keep = {item.get('run_id') for item in self._history}
-            for stale in [key for key in self._finished if key not in keep]:
-                self._finished.pop(stale, None)
 
     def _add_totals(self, record: dict) -> None:
         totals = self._totals

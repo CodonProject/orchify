@@ -57,6 +57,18 @@ A Python framework for building LLM-powered AI agent orchestration systems.
 pip install -e .
 ```
 
+Optional integrations are extras, imported lazily so the core stays httpx-only:
+
+```bash
+pip install "orchify[web]"    # orchify serve, create_app, /metrics, SSE
+pip install "orchify[redis]"  # RedisRunStore across replicas
+pip install "orchify[otel]"   # real OpenTelemetry spans (in-memory fallback otherwise)
+pip install "orchify[mcp]"    # official MCP SDK interoperability path
+pip install "orchify[all]"    # everything above
+```
+
+`orchify doctor` lists which of these are importable and explains what is missing.
+
 ## Command Line
 
 Installing the package also adds an `orchify` console script; from a checkout,
@@ -661,6 +673,10 @@ returns whether it did anything. The top-level shortcut functions
 `answer()` are thin wrappers over the global manager for the cases where you want
 to build your own loop.
 
+The loop is event driven: a run that parks on an approval wakes it immediately, so
+`poll_interval` only bounds how fast an approval that was queued without an event
+is noticed (it also caps how quickly `stop()` returns).
+
 ## Errors
 
 Every failure the library raises on purpose derives from `OrchifyError`, while
@@ -739,7 +755,10 @@ behind a proxy or a mirror).
   `initialize`, which the specification forbids cancelling).
 * With `resume_stream=True` (the default) the client opens the optional `GET`
   SSE stream and resumes it with `Last-Event-ID` after a disconnect; pass
-  `resume_stream=False` when the server answers `405` or you do not need it.
+  `resume_stream=False` when the server answers `405` or you do not need it. The
+  stream is not retried forever: `400`/`401`/`403`/`404` stop it immediately and
+  `max_stream_failures` (5) consecutive transport errors give up; `stream_failures`
+  reports the count.
 * Names are sanitised to `[A-Za-z0-9_-]` and capped at 64 characters (MCP allows
   arbitrary strings; OpenAI does not), so `tools(prefix='fs_')` is the escape
   hatch when two servers would collide.
@@ -845,9 +864,14 @@ agent.ask("Now shorten it")            # continues the same conversation
 * `EventStore` buffers events and flushes them per run (`flush_every` seconds;
   `events.flush()` forces it), keeps at most `max_events` per run, and skips a
   damaged line instead of failing the read. `events(run_id)` and `runs()` replay
-  what happened.
+  what happened. Open run files are cached (`max_handles=32`, LRU), so a busy
+  journal does not pay an `open()` per record; `events.handles_open` shows the
+  cache size.
 * `CheckpointStore` writes one JSON line per step (`run_id`, `step`, `agent`,
-  `model`, `messages`) and keeps the newest `keep` per run.
+  `model`, `messages`) and keeps the newest `keep` per run. The agent only copies
+  the messages added since the previous step, so a long conversation is not
+  re-copied on every step; a rewritten history (a `control:update_messages`
+  replace/truncate) restarts the snapshot.
 * `save_agent(agent, path)` / `load_agent(agent, path)` snapshot a whole agent
   (messages, model, `messages_mode`) when you want a single file instead of a
   run history.
@@ -925,6 +949,16 @@ agent = Agent.from_env(llm=llm)
 * Honouring proxy/envelope retries: `orchify.llm.retry.stream_sse()` retries
   408/409/425/429/500/502/503/504 and transport errors before the first token,
   then raises — a mid-stream failure is surfaced rather than replayed.
+* DeepSeek also serves an Anthropic-compatible endpoint, so the Anthropic adapter
+  drives it directly — verified live from `.env` (text and a `tool_use` round
+  trip):
+
+  ```python
+  llm = AnthropicLLM(api_key=os.environ['API_KEY'],
+                     base_url='https://api.deepseek.com/anthropic',
+                     model='deepseek-chat')
+  agent = Agent(name='deepseek-via-anthropic', llm=llm)
+  ```
 
 ## Multimodal Input
 
@@ -966,11 +1000,15 @@ index_event_store(EventStore('var/runs'), index)    # index past runs
 ```
 
 * `search(query, k=4)` returns `Hit(document, score)` sorted by cosine
-  similarity; `min_score` filters noise.
+  similarity; `min_score` filters noise. Vector norms are cached, and only the
+  top `k` documents are materialised, so a large index costs one dot product per
+  document rather than a full sort.
 * `retrieve_tool()` wraps an index as a normal tool and returns
   `[score] source\n<text>` blocks, truncated to `max_chars`.
 * `index_event_store()` copies finished answers and tool results out of an
-  `EventStore` into the index, so an agent can remember earlier runs.
+  `EventStore` into the index, so an agent can remember earlier runs. Passages
+  get a stable id (`<run_id>:<n>`), so re-indexing a journal updates them in
+  place instead of duplicating them; the return value counts new passages only.
 
 ## MCP Server
 
@@ -1023,7 +1061,11 @@ app = create_app(mcp=MCPHTTPServer(MCPStdioServer(tools=my_tools, expose='tools'
 One endpoint answers `POST` (a message or a batch, JSON in, JSON out), `GET`
 (the optional server-to-client SSE stream) and `DELETE` (end the session).
 `initialize` returns `Mcp-Session-Id`; later requests must echo it, an expired
-session gets `404`, an unsupported `MCP-Protocol-Version` gets `400`.
+session gets `404`, an unsupported `MCP-Protocol-Version` gets `400`. Each session
+keeps its own negotiated version, so two clients on different versions cannot
+disturb each other. The session table is swept by idle time and capped
+(`max_sessions=4096`), so clients that never call `DELETE` cannot grow it forever;
+finishing an SSE stream returns once its session is gone.
 `create_app(mcp=..., mcp_path='/mcp')` mounts it next to the API and shares its
 auth (a configured `api_keys` makes `/mcp` require `Authorization: Bearer` or
 `X-API-Key`, like every other route).
@@ -1141,6 +1183,10 @@ serve(app)                                                 # 127.0.0.1:8010
 * `orchify serve --setup setup.py --keys k1,k2 --sessions 32 --tokens 200000`
   starts this app from the shell; `orchify chat` is the same agent in a
   terminal REPL (`/help`, `/reset`, `/status`, `/report`, `/runs`, `/stop`).
+* The polling log is bounded too: `EventLog(max_runs=1000)` (or
+  `create_app(poll_max_runs=...)`) evicts the oldest finished run once that many
+  are buffered — a run someone is streaming is never evicted — and
+  `events.stats()['runs_dropped']` counts what was dropped.
 
 The full HTTP contract — payloads, error codes, event taxonomy, deployment
 checklist — lives in [`docs/api-contract.md`](docs/api-contract.md).
@@ -1257,9 +1303,10 @@ data = ask_structured(agent, 'Summarise this changelog.', schema, retries=2)
 ```
 
 * The first attempt appends a schema instruction; a mismatch re-sends the
-  problems as a correction and counts an attempt. After `retries` failures it
-  raises `StructuredOutputError` carrying `attempts`, `last_error` and
-  `last_text`, and the last few replies stay on
+  original request, the model's own previous reply and the problems as a
+  correction (both echoed parts are bounded), and counts an attempt. After
+  `retries` failures it raises `StructuredOutputError` carrying `attempts`,
+  `last_error` and `last_text`, and the last few replies stay on
   `agent.structured_failures` for debugging.
 * `extract_json()` tolerates prose and ```json fences; `validate()` implements
   the subset of JSON Schema that matters for tool-shaped output (`type`, `enum`,
@@ -1285,6 +1332,12 @@ agent = Agent.from_env(tools=[safe])
   arguments on stdin; the child's `cwd` is a scratch directory (or `workdir`)
   and its environment keeps only `PATH`/system/TEMP — API keys in the parent are
   invisible.
+* A `Sandbox` keeps one worker process alive (`persistent=True`, the default), so
+  repeated calls skip the ~50 ms interpreter start-up; `persistent=False` spawns a
+  fresh process per call.
+* Output is bounded: the function's own `print()`s are dropped and a result longer
+  than `max_output` (100 000 characters by default) is truncated with
+  `original_chars`, so a chatty tool cannot exhaust memory.
 * Timeouts raise `SandboxTimeout`; a child exception comes back as a
   `SandboxError` with its type and message.
 * Functions that close over local variables are rejected up front (a child
@@ -1456,7 +1509,7 @@ python tests/test_sandbox.py
 The suite is fully offline: a scripted fake LLM stands in for the provider, and
 the MCP tests start a real (but local, inline) MCP server over stdio or mount the
 streamable-HTTP transport in-process.
-400 tests, no network — the four pause points (including mid-stream and the last
+409 tests, no network — the four pause points (including mid-stream and the last
 step), the lost-resume race, stop-while-parked, approval approve/reject/timeout,
 run/turn identity, group member handles and the voting tally, the per-instance
 run guard (`allow_concurrent_runs`), run-completion handles and their reuse,
@@ -1515,6 +1568,16 @@ closure rejection).
 provider from `.env` (pause/resume, the approval pool, the manager driving both,
 and — for the features — a priced token budget, an async cached tool, `ask_user`
 and the JSONL sink).
+
+Round four tightened the bounds these tests pin: `test_server.py` also checks the
+`EventLog` run cap (`max_runs`, oldest finished run evicted, a streamed run kept),
+`test_mcp_http.py` checks session idle-sweep/`max_sessions`/per-session protocol
+versions and that the client gives up on an auth failure or repeated transport
+errors, `test_rag.py` checks idempotent re-indexing, `test_sandbox.py` checks the
+output cap and worker reuse, `test_persistence.py` checks the bounded handle cache
+and incremental checkpoints, `test_manager.py` checks bounded-history eviction,
+and `test_latency.py` checks that the console loop is woken by a new approval
+instead of polling.
 
 CI (`.github/workflows/ci.yml`) runs the same suite on Python 3.9/3.11/3.13 and
 builds the sdist + wheel; on 3.13 it also prints a coverage report (`pytest-cov`)

@@ -298,6 +298,10 @@ class Agent:
         self.require_approval = require_approval
         self.tool_policy = tool_policy
         self.checkpoint = checkpoint
+        # Messages already handed to the checkpoint callable, plus their
+        # identities, so a step only copies the messages that are new.
+        self._checkpoint_messages: List[Dict[str, Any]] = []
+        self._checkpoint_ids: List[int] = []
         self.tool_result_limit = max(0, int(tool_result_limit or 0))
         self.tool_result_dir = str(tool_result_dir or '')
         self.last_run_id: str = ''
@@ -454,13 +458,25 @@ class Agent:
         '''
         if self.checkpoint is None:
             return
+        identities = [id(message) for message in messages]
+        seen = len(self._checkpoint_ids)
+        if len(identities) < seen or identities[:seen] != self._checkpoint_ids[:seen]:
+            # The history was rewritten (replace/truncate); start over.
+            self._checkpoint_messages = []
+            self._checkpoint_ids = []
+            seen = 0
+        snapshot = list(self._checkpoint_messages)
+        for message in messages[seen:]:
+            snapshot.append(dict(message))
+        self._checkpoint_messages = snapshot
+        self._checkpoint_ids = identities
         try:
             self.checkpoint({
                 'run_id': run_id,
                 'step': step,
                 'agent': self.name,
                 'model': self.model,
-                'messages': [dict(message) for message in messages],
+                'messages': snapshot,
             })
         except Exception as exc:
             get_logger(__name__).warning(
@@ -1061,6 +1077,8 @@ class Agent:
             self.messages[:] = [system] if system else []
         self.last_answer = ''
         self.last_error = ''
+        self._checkpoint_messages = []
+        self._checkpoint_ids = []
         if not self.is_running():
             self.last_run_id = ''
 

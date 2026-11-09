@@ -120,6 +120,46 @@ def test_live_run_lifecycle_and_history():
     print('ok  live run lifecycle, pause status and history record')
 
 
+def test_bounded_history_evicts_finished_records():
+    '''A small history keeps ``_finished`` aligned without scanning it.'''
+    manager = OrchifyManager(enabled=True, history=2, events=10)
+    try:
+        for index in range(3):
+            manager._finish_run({
+                'run_id': f'run-{index}',
+                'kind': 'agent',
+                'name': f'bounded-{index}',
+                'status': 'done',
+                'started_at': float(index),
+                'total_steps': 1,
+                'usage': {'total_tokens': 10},
+                'answer': f'answer {index}',
+            }, float(index + 1))
+        assert list(manager._history_ids) == ['run-1', 'run-2']
+        assert sorted(manager._finished) == ['run-1', 'run-2']
+        assert [item['run_id'] for item in manager.history(limit=10)] == ['run-2', 'run-1']
+        assert manager.run('run-0') is None
+
+        # Finishing the same run twice must not duplicate it.
+        manager._finish_run({
+            'run_id': 'run-1',
+            'kind': 'agent',
+            'name': 'bounded-1',
+            'status': 'done',
+            'started_at': 1.0,
+            'total_steps': 1,
+            'usage': {'total_tokens': 10},
+            'answer': 'answer 1 again',
+        }, 5.0)
+        assert list(manager._history_ids) == ['run-2', 'run-1']
+        assert len(manager.history(limit=10)) == 2
+        assert manager.history(limit=10)[0]['run_id'] == 'run-1'
+        assert manager.history(limit=10)[0]['answer'] == 'answer 1 again'
+    finally:
+        manager.close()
+    print('ok  bounded history evicts finished records')
+
+
 def test_approval_pool_through_the_manager():
     '''The pending-approval pool is readable and decidable from the manager.'''
     danger = Tool(func=lambda x: f'ran:{x}', name='mgr-danger',

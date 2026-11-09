@@ -266,12 +266,12 @@ def test_client_speaks_the_http_transport_end_to_end():
 
 def test_client_rejects_an_unsupported_negotiated_version():
     class _OldServer(MCPStdioServer):
-        def handle_request(self, method, params=None):
+        def handle_request(self, method, params=None, protocol_version=None):
             if method == 'initialize':
                 return {'protocolVersion': '1999-01-01',
                         'capabilities': {'tools': {}},
                         'serverInfo': {'name': 'old', 'version': '0'}}
-            return super().handle_request(method, params)
+            return super().handle_request(method, params, protocol_version)
 
     transport = MCPHTTPServer(_OldServer(None, tools=[_Echo()], expose='tools'))
     app = create_app(mcp=transport)
@@ -281,3 +281,92 @@ def test_client_rejects_an_unsupported_negotiated_version():
         with pytest.raises(Exception) as error:
             client.connect()
         assert 'protocol version' in str(error.value)
+
+
+class _Clock:
+    """A controllable clock for the session sweep tests."""
+
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def time(self):
+        return self.now
+
+
+def test_sessions_are_swept_by_idle_and_capped():
+    transport = _transport()
+    transport.session_idle = 10.0
+    transport.max_sessions = 3
+    clock = _Clock()
+    transport._time = clock
+    first = _initialize(transport)
+    assert first in transport._sessions
+    clock.now += 11.0
+    for _ in range(3):
+        _initialize(transport)
+    assert first not in transport._sessions
+    assert len(transport._sessions) <= 3
+    assert transport.sessions_swept >= 1
+
+
+def test_sessions_keep_their_own_protocol_version():
+    transport = _transport()
+    old = _initialize(transport, '2025-03-26')
+    new = _initialize(transport, '2025-11-25')
+    assert transport._sessions[old]['version'] == '2025-03-26'
+    assert transport._sessions[new]['version'] == '2025-11-25'
+    # The HTTP transport never writes the version back onto the shared
+    # stdio server, so one client cannot move another off its version.
+    assert transport.server.protocol_version == '2025-06-18'
+    status, _, body = _post(transport, {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'},
+                            {'mcp-session-id': old})
+    assert status == 200 and body['result']['tools']
+
+
+class _StreamingClient:
+    """A fake httpx client whose GET stream returns one status."""
+
+    def __init__(self, status=None, error=None):
+        self.status = status
+        self.error = error
+        self.calls = 0
+
+    def stream(self, method, url, headers=None):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+
+        outer = self
+
+        class _Response:
+            status_code = outer.status
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def iter_lines(self):
+                yield 'data: {}'
+
+        return _Response()
+
+
+def test_event_stream_stops_on_an_auth_failure():
+    fake = _StreamingClient(status=401)
+    client = MCPClient(url='http://mcp.test/mcp', auto_start=False, client=fake)
+    client._http = fake
+    client._stream_loop()
+    assert fake.calls == 1
+    assert client.stream_failures == 0
+
+
+def test_event_stream_gives_up_after_repeated_transport_errors():
+    fake = _StreamingClient(error=RuntimeError('connection refused'))
+    client = MCPClient(url='http://mcp.test/mcp', auto_start=False, client=fake,
+                       max_stream_failures=1)
+    client._http = fake
+    client._stream_loop()
+    assert fake.calls == 1
+    assert client.stream_failures == 1

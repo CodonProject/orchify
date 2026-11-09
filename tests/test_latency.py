@@ -168,6 +168,43 @@ def test_emit_only_visits_matching_bindings():
     print('ok  emit dispatches through the literal index')
 
 
+def test_console_loop_wakes_on_a_new_approval():
+    '''
+    The console loop parks on an event: a run that lands in the approval pool
+    is answered immediately even though the fallback poll interval is huge.
+    '''
+    from orchify.api import ConsoleLoop
+
+    printed = []
+
+    def answering(prompt):
+        printed.append(prompt)
+        return 'yes'
+
+    loop = ConsoleLoop(inp=answering, out=printed.append, poll_interval=30.0)
+    approval = orchify_broker.request_approval(
+        'latency-console', tool_name='write_file', args={'path': 'a.md'}
+    )
+    started = time.monotonic()
+    try:
+        loop.start()
+        assert wait_until(lambda: loop_handled(approval), timeout=5.0), printed
+        elapsed = time.monotonic() - started
+    finally:
+        loop.stop()
+        orchify_broker.resolve_approval(approval.approval_id, approved=False, reason='cleanup')
+
+    assert elapsed < _CEILING, f'console loop took {elapsed:.3f}s to answer an approval'
+    assert any('needs approval' in item for item in printed), printed
+    print(f'ok  console loop woke on the approval ({elapsed * 1000:.1f} ms)')
+
+
+def loop_handled(approval):
+    '''Whether the console loop resolved ``approval``.'''
+    current = orchify_broker.get_approval(approval.approval_id)
+    return bool(current and current.resolved is not None)
+
+
 def test_limit_gate_hands_over_every_freed_slot():
     '''
     Two slots freed in one go must wake two waiters: the first taker leaves the

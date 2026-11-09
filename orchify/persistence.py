@@ -23,6 +23,7 @@ import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from orchify.utils import get_logger
@@ -161,6 +162,51 @@ class EventStore:
         self._lock = threading.Lock()
         self._last_flush = time.time()
         self.written = 0
+        # Open handle per run file, least recently used first. Reopening a file
+        # for every flush costs one open() per run per flush.
+        self._handles: 'OrderedDict[str, Any]' = OrderedDict()
+        self._handle_lock = threading.Lock()
+        self.max_handles = 32
+
+    def _append_handle(self, path: str) -> Any:
+        '''Return (and cache) an append handle for ``path``.
+
+        Args:
+            path (str): Journal file.
+
+        Returns:
+            Any: A text handle opened in append mode.
+        '''
+        with self._handle_lock:
+            handle = self._handles.get(path)
+            if handle is not None:
+                self._handles.move_to_end(path)
+                return handle
+            handle = open(path, 'a', encoding='utf-8')
+            self._handles[path] = handle
+            while len(self._handles) > self.max_handles:
+                _, stale = self._handles.popitem(last=False)
+                try:
+                    stale.close()
+                except Exception:
+                    pass
+            return handle
+
+    def _drop_handle(self, path: str) -> None:
+        '''Close and forget the cached handle for ``path``.'''
+        with self._handle_lock:
+            handle = self._handles.pop(path, None)
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+    @property
+    def handles_open(self) -> int:
+        '''Number of journal handles currently kept open.'''
+        with self._handle_lock:
+            return len(self._handles)
 
     def path_for(self, run_id: str) -> str:
         '''Return the journal path for one run.
@@ -283,11 +329,13 @@ class EventStore:
         for run_id, records in grouped.items():
             path = self.path_for(run_id or 'unknown')
             try:
-                with open(path, 'a', encoding='utf-8') as handle:
-                    for record in records:
-                        handle.write(json.dumps(record, ensure_ascii=False, default=str) + '\n')
-                        written += 1
+                handle = self._append_handle(path)
+                for record in records:
+                    handle.write(json.dumps(record, ensure_ascii=False, default=str) + '\n')
+                    written += 1
+                handle.flush()
             except OSError as exc:
+                self._drop_handle(path)
                 logger.warning('persistence: cannot write %s: %s', path, exc)
         self.written += written
         return written
@@ -315,9 +363,17 @@ class EventStore:
         return _run_ids(self.runs_dir)
 
     def close(self) -> None:
-        '''Detach from the broker and flush the buffer.'''
+        '''Detach from the broker, flush the buffer and close cached handles.'''
         self.detach()
         self.flush()
+        with self._handle_lock:
+            handles = list(self._handles.values())
+            self._handles.clear()
+        for handle in handles:
+            try:
+                handle.close()
+            except Exception:
+                pass
 
 
 class CheckpointStore:

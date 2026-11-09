@@ -87,6 +87,9 @@ def test_ask_structured_retries_with_the_validation_error():
     sent = [m['content'] for m in agent.llm.calls[-1]['messages']]
     assert any('did not match the schema' in str(text) for text in sent)
     assert any('title must be of type string' in str(text) for text in sent)
+    # The retry shows the model its own previous reply and the original request.
+    assert any('Your previous reply:\n{"title": 3}' in str(text) for text in sent), sent
+    assert any('Original request:\ndescribe it' in str(text) for text in sent), sent
 
 
 def test_ask_structured_gives_up_after_the_retries():

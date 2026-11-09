@@ -131,6 +131,7 @@ class MCPClient:
         auto_start: bool = True,
         client: Any = None,
         resume_stream: bool = True,
+        max_stream_failures: int = 5,
     ):
         '''Configure a client.
 
@@ -151,6 +152,9 @@ class MCPClient:
                 (mainly for tests); one is created when omitted.
             resume_stream (bool): Open the optional GET event stream over HTTP
                 and resume it with ``Last-Event-ID`` after a disconnect.
+            max_stream_failures (int): Consecutive event-stream failures before
+                the reconnect loop gives up. Transport errors such as 400/401/
+                403/404 stop it immediately, because retrying cannot fix them.
 
         Raises:
             ValueError: When neither ``command`` nor ``url`` is given.
@@ -170,6 +174,8 @@ class MCPClient:
         self.tools_cache: List[Dict[str, Any]] = []
         self.protocol_version = PROTOCOL_VERSION
         self.resume_stream = bool(resume_stream)
+        self.max_stream_failures = max(1, int(max_stream_failures))
+        self.stream_failures = 0
         self._client = client
 
         self._proc: Optional[subprocess.Popen] = None
@@ -307,6 +313,7 @@ class MCPClient:
     def _stream_loop(self) -> None:
         '''Consume the GET event stream, resuming it after a disconnect.'''
         delay = 1.0
+        failures = 0
         while not self._stream_stop.is_set() and not self._closed:
             try:
                 with self._http.stream('GET', self.url,
@@ -314,12 +321,21 @@ class MCPClient:
                     if response.status_code == 405:
                         logger.debug('%s: server offers no event stream', self.name)
                         return
+                    if response.status_code in (400, 401, 403, 404):
+                        # Retrying cannot fix auth or a missing session, so stop
+                        # instead of reconnecting forever.
+                        logger.warning(
+                            '%s: event stream returned HTTP %d; not retrying',
+                            self.name, response.status_code,
+                        )
+                        return
                     if response.status_code >= 400:
                         raise MCPError(
                             f'MCP event stream for {self.name!r} returned '
                             f'HTTP {response.status_code}'
                         )
                     delay = 1.0
+                    failures = 0
                     for line in response.iter_lines():
                         if self._stream_stop.is_set():
                             return
@@ -340,6 +356,14 @@ class MCPClient:
                             continue
             except Exception as exc:  # the stream is best effort
                 if self._stream_stop.is_set() or self._closed:
+                    return
+                failures += 1
+                self.stream_failures = failures
+                if failures >= self.max_stream_failures:
+                    logger.warning(
+                        '%s: event stream failed %d times in a row (%s); giving up',
+                        self.name, failures, exc,
+                    )
                     return
                 logger.debug('%s: event stream dropped (%s); resuming soon', self.name, exc)
             if self._stream_stop.wait(delay):

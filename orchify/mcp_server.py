@@ -228,12 +228,15 @@ class MCPStdioServer:
             payload['structuredContent'] = result
         return payload
 
-    def handle_request(self, method: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    def handle_request(self, method: str, params: Optional[Dict[str, Any]] = None,
+                       protocol_version: Optional[str] = None) -> Any:
         '''Dispatch one JSON-RPC request method.
 
         Args:
             method (str): JSON-RPC method name.
             params (Optional[Dict[str, Any]]): Request parameters.
+            protocol_version (Optional[str]): Version negotiated by the caller
+                (HTTP sessions). ``None`` means this stdio server owns it.
 
         Returns:
             Any: The JSON-RPC result value.
@@ -245,7 +248,11 @@ class MCPStdioServer:
         if method == 'initialize':
             requested = str(params.get('protocolVersion') or '')
             version = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else PROTOCOL_VERSION
-            self.protocol_version = version
+            if protocol_version is None:
+                # Over stdio one process serves one client, so the negotiated
+                # version belongs to the server. The HTTP transport keeps the
+                # version per session instead and must not overwrite this field.
+                self.protocol_version = version
             self.client_info = dict(params.get('clientInfo') or {})
             return {
                 'protocolVersion': version,
@@ -264,7 +271,8 @@ class MCPStdioServer:
             return self.call_tool(str(params.get('name') or ''), params.get('arguments') or {})
         raise MCPRequestError(f'method not found: {method}', code=-32601)
 
-    def handle_message(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def handle_message(self, message: Dict[str, Any],
+                       protocol_version: Optional[str] = None) -> Optional[Dict[str, Any]]:
         '''Handle one decoded JSON-RPC message.
 
         Notifications (no ``id``) are acknowledged with ``None`` and never get a
@@ -272,6 +280,8 @@ class MCPStdioServer:
 
         Args:
             message (Dict[str, Any]): The decoded message.
+            protocol_version (Optional[str]): Version of the calling session;
+                defaults to the version negotiated on this stdio server.
 
         Returns:
             Optional[Dict[str, Any]]: The response frame, or None for a notification.
@@ -288,11 +298,12 @@ class MCPStdioServer:
                 logger.debug('mcp-server: client cancelled request %s (%s)',
                              params.get('requestId'), params.get('reason', ''))
             return None  # notification (e.g. notifications/initialized)
-        if self.protocol_version and not _version_supported(self.protocol_version):
+        active = protocol_version or self.protocol_version
+        if active and not _version_supported(active):
             return _error_frame(request_id, -32600,
-                                f'unsupported protocol version: {self.protocol_version}')
+                                f'unsupported protocol version: {active}')
         try:
-            result = self.handle_request(str(method), message.get('params'))
+            result = self.handle_request(str(method), message.get('params'), active)
         except MCPRequestError as exc:
             return _error_frame(request_id, exc.code, str(exc), exc.data)
         except Exception as exc:
@@ -422,13 +433,16 @@ class MCPHTTPServer:
             from ``agent``/``tools`` when omitted.
         session_idle (float): Seconds without traffic before a session expires.
         stream_interval (float): Seconds between keep-alive comments.
+        max_sessions (int): Hard cap on live sessions; the least recently used
+            sessions are dropped beyond it, so a client that disappears without
+            ``DELETE`` cannot grow the table forever.
     '''
 
     def __init__(self, server: Optional[MCPStdioServer] = None, *, agent: Any = None,
                  tools: Optional[list] = None, expose: str = 'agent',
                  name: str = 'orchify', version: str = '0.0.1', tool_prefix: str = '',
                  page_size: int = DEFAULT_PAGE_SIZE, session_idle: float = 300.0,
-                 stream_interval: float = 15.0):
+                 stream_interval: float = 15.0, max_sessions: int = 4096):
         import threading
         import time
 
@@ -441,35 +455,65 @@ class MCPHTTPServer:
         self.server = server
         self.session_idle = float(session_idle)
         self.stream_interval = max(0.1, float(stream_interval))
+        self.max_sessions = max(1, int(max_sessions))
         self._time = time
         self._lock = threading.Lock()
-        self._sessions: Dict[str, float] = {}
+        # session_id -> {'touched': float, 'version': str}
+        self._sessions: Dict[str, Dict[str, Any]] = {}
         self._counter = 0
+        self._creates = 0
+        self.sessions_swept = 0
 
     # ------------------------------------------------------------- sessions
 
-    def _new_session(self) -> str:
-        '''Create (and register) a session id.'''
+    def _new_session(self, version: str = '') -> str:
+        '''Create (and register) a session id.
+
+        Args:
+            version (str): Protocol version negotiated by ``initialize``.
+        '''
         with self._lock:
             self._counter += 1
+            self._creates += 1
+            # Sweep periodically rather than on every request: expired and
+            # abandoned sessions would otherwise stay in the table forever.
+            if self._creates % 64 == 0 or len(self._sessions) >= self.max_sessions:
+                self._sweep_locked()
             session_id = f'orchify-{self._counter}-{int(self._time.time() * 1000)}'
-            self._sessions[session_id] = self._time.time()
+            self._sessions[session_id] = {'touched': self._time.time(),
+                                          'version': str(version or '')}
             return session_id
 
-    def _touch(self, session_id: str) -> bool:
-        '''Refresh a session and report whether it is still alive.'''
-        if not session_id:
-            return False
-        with self._lock:
-            started = self._sessions.get(session_id)
-            now = self._time.time()
-            if started is None:
-                return False
-            if now - started > self.session_idle:
+    def _sweep_locked(self) -> int:
+        '''Drop expired sessions, then the least recently used ones above the cap.'''
+        now = self._time.time()
+        dropped = 0
+        for session_id in [key for key, value in self._sessions.items()
+                           if now - value['touched'] > self.session_idle]:
+            self._sessions.pop(session_id, None)
+            dropped += 1
+        if len(self._sessions) >= self.max_sessions:
+            ordered = sorted(self._sessions.items(), key=lambda item: item[1]['touched'])
+            for session_id, _ in ordered[:len(self._sessions) - self.max_sessions + 1]:
                 self._sessions.pop(session_id, None)
-                return False
-            self._sessions[session_id] = now
-            return True
+                dropped += 1
+        self.sessions_swept += dropped
+        return dropped
+
+    def _touch(self, session_id: str) -> Optional[Dict[str, Any]]:
+        '''Refresh a session and return its record, or ``None`` when it is gone.'''
+        if not session_id:
+            return None
+        with self._lock:
+            entry = self._sessions.get(session_id)
+            now = self._time.time()
+            if entry is None:
+                return None
+            if now - entry['touched'] > self.session_idle:
+                self._sessions.pop(session_id, None)
+                return None
+            entry['touched'] = now
+            return dict(entry)
 
     def _drop(self, session_id: str) -> bool:
         '''Remove one session.'''
@@ -496,7 +540,8 @@ class MCPHTTPServer:
         except ValueError:
             return self._error(400, None, -32700, 'parse error')
         session_id = _header(headers, 'mcp-session-id')
-        if session_id and not self._touch(session_id):
+        session = self._touch(session_id) if session_id else None
+        if session_id and session is None:
             return self._error(404, None, -32000, 'session expired')
         messages = payload if isinstance(payload, list) else [payload]
         responses: List[Dict[str, Any]] = []
@@ -506,8 +551,18 @@ class MCPHTTPServer:
                 responses.append(_error_frame(None, -32600, 'invalid request'))
                 continue
             if message.get('method') == 'initialize':
-                created = self._new_session()
-            response = self.server.handle_message(message)
+                response = self.server.handle_message(message, self.server.protocol_version)
+                result = (response or {}).get('result') or {}
+                negotiated = str(result.get('protocolVersion') or PROTOCOL_VERSION)
+                created = self._new_session(negotiated)
+                active = negotiated
+            else:
+                # Every session keeps the version IT negotiated, so two clients
+                # on different versions cannot change each other's behaviour.
+                active = ((session or {}).get('version')
+                          or (version if version in SUPPORTED_PROTOCOL_VERSIONS else '')
+                          or self.server.protocol_version)
+                response = self.server.handle_message(message, active)
             if response is not None:
                 responses.append(response)
         out_headers: Dict[str, str] = {'content-type': 'application/json'}
@@ -531,10 +586,12 @@ class MCPHTTPServer:
                                                     f'unsupported protocol version: {version}')
             return status, out_headers, [body]
         session_id = _header(headers, 'mcp-session-id')
-        if session_id and not self._touch(session_id):
+        session = self._touch(session_id) if session_id else None
+        if session_id and session is None:
             status, out_headers, body = self._error(404, None, -32000, 'session expired')
             return status, out_headers, [body]
-        return 200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache'}, self.sse_stream()
+        return (200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache'},
+                self.sse_stream(session_id))
 
     def handle_delete(self, headers: Any = None) -> Tuple[int, Dict[str, str], bytes]:
         '''Handle one HTTP ``DELETE`` (terminate the session).'''
@@ -545,11 +602,21 @@ class MCPHTTPServer:
             return self._error(404, None, -32000, 'unknown session')
         return 200, {'content-type': 'application/json'}, b'{}'
 
-    def sse_stream(self) -> Iterable[bytes]:
-        '''Yield SSE keep-alives until the session idle window closes.'''
+    def sse_stream(self, session_id: str = '') -> Iterable[bytes]:
+        '''Yield SSE keep-alives until the session goes away.
+
+        Args:
+            session_id (str): Session the stream belongs to; an empty value
+                streams for the whole idle window (clients that never
+                initialized).
+        '''
         started = self._time.time()
         yield b': connected\n\n'
         while self._time.time() - started < self.session_idle:
+            if session_id and self._touch(session_id) is None:
+                # The session was dropped (DELETE or idle sweep); the stream
+                # must not outlive it.
+                return
             yield b': keep-alive\n\n'
             self._time.sleep(self.stream_interval)
 

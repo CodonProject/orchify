@@ -132,7 +132,11 @@ def test_index_event_store_indexes_finished_answers():
         hits = index.search('launch date March', k=1)
         assert 'March 14' in hits[0].document.text
         assert hits[0].document.metadata['run_id'] == run_id
-        assert index_event_store(store, index, run_id=run_id) >= 1
+        ids = [document.doc_id for document in index.documents]
+        assert index_event_store(store, index, run_id=run_id) == 0
+        assert [document.doc_id for document in index.documents] == ids
+        still = index.search('launch date March', k=1)
+        assert 'March 14' in still[0].document.text
     finally:
         _drop(directory)
 

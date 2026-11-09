@@ -82,7 +82,8 @@ token / 费用额度由 `run:finish` 事件的 usage 累加（后台 hook），�
   "auth": "open",
   "sessions": 2,
   "sessions_created": 5,
-  "events": {"runs_tracked": 3, "runs_finished": 1, "events_kept": 41, "events_dropped": 120},
+  "events": {"runs_tracked": 3, "runs_finished": 1, "events_kept": 41, "events_dropped": 120,
+             "runs_dropped": 0},
   "quota": {"active": 0, "max_concurrent": 4, "max_per_window": 60, "window": 60.0, "sessions": {}},
   "orchify": {"enabled": true, "counts": {"runs": 1}, "totals": {}, "hooks": {}}
 }
@@ -92,7 +93,9 @@ token / 费用额度由 `run:finish` 事件的 usage 累加（后台 hook），�
 - `sessions`：当前会话池里的 Agent 数（容量 32，LRU 淘汰最久未用；淘汰只丢上下文，
   不影响正在跑的 run）
 - `sessions_created`：启动以来新建过的会话总数（含已被淘汰的）
-- `events`：事件缓存概况，`events_dropped` 是被刻意过滤掉的 token 级碎片数
+- `events`：事件缓存概况。`events_dropped` 是被刻意过滤掉的 token 级碎片数；
+  `runs_dropped` 是超过 `max_runs`（默认 1000，`create_app(poll_max_runs=...)`）后被
+  淘汰的最旧已完成 run 数——正在被 SSE 订阅的 run 不会被淘汰
 - `quota`：配额实时占用
 - `orchify`：`orchify.api.status()` 原样返回，含运行计数、用量汇总、hook 数
 

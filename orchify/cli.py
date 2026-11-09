@@ -137,15 +137,23 @@ def _check_dependencies(report: _Report) -> None:
         report (_Report): Report to append the findings to.
     '''
     required = ['httpx']
-    optional = ['dotenv', 'docstring_parser']
+    optional = [
+        ('dotenv', 'some features fall back to defaults'),
+        ('docstring_parser', 'tool descriptions fall back to the first docstring line'),
+        ('fastapi', 'orchify serve / create_app need pip install "orchify[web]"'),
+        ('uvicorn', 'orchify serve needs pip install "orchify[web]"'),
+        ('redis', 'RedisRunStore needs pip install "orchify[redis]"'),
+        ('opentelemetry', 'Tracer falls back to in-memory spans; pip install "orchify[otel]"'),
+        ('mcp', 'only the official-SDK interoperability path uses it; the client is built in'),
+    ]
     for name in required:
         if importlib.util.find_spec(name) is None:
             report.add(FAIL, f'dependency {name}', 'missing; run pip install -r requirements.txt')
         else:
             report.add(PASS, f'dependency {name}', 'importable')
-    for name in optional:
+    for name, note in optional:
         if importlib.util.find_spec(name) is None:
-            report.add(WARN, f'dependency {name}', 'missing; some features fall back to defaults')
+            report.add(WARN, f'dependency {name}', f'missing; {note}')
         else:
             report.add(PASS, f'dependency {name}', 'importable')
 
@@ -274,6 +282,48 @@ def _check_plugins(report: _Report) -> None:
     report.add(PASS, 'plugins', detail)
 
 
+def _check_integrations(report: _Report) -> None:
+    '''Report the optional subsystems configured through the environment.
+
+    Args:
+        report (_Report): Report to append the findings to.
+    '''
+    from .policy import policy_from_env
+    from .store import STORE_ENV, run_store_from_env
+
+    try:
+        store = run_store_from_env()
+        report.add(PASS, 'run store',
+                   f'{type(store).__name__} ({os.environ.get(STORE_ENV) or "memory"})')
+        try:
+            store.close()
+        except Exception:
+            pass
+    except Exception as exc:
+        report.add(FAIL, 'run store', f'{os.environ.get(STORE_ENV)!r} is unusable: {exc}')
+
+    policy = policy_from_env()
+    if policy is None:
+        report.add(PASS, 'tool policy', 'off')
+    else:
+        rules = policy.as_dict().get('rules') or []
+        report.add(PASS, 'tool policy',
+                   f'{len(rules)} rule(s), default={policy.as_dict().get("default")}')
+
+    sandbox_dir = os.environ.get('ORCHIFY_SANDBOX_DIR') or '(per-call temp dir)'
+    report.add(PASS, 'sandbox', f'workdir={sandbox_dir}')
+
+    sink = os.environ.get('ORCHIFY_MANAGER_SINK', '')
+    if not sink:
+        report.add(PASS, 'manager sink', 'off')
+    else:
+        parent = os.path.dirname(os.path.abspath(sink)) or os.getcwd()
+        if os.access(parent, os.W_OK):
+            report.add(PASS, 'manager sink', f'{sink} (parent writable)')
+        else:
+            report.add(WARN, 'manager sink', f'{sink}: cannot write to {parent}')
+
+
 def _probe_provider(report: _Report) -> None:
     '''Probe the configured provider over HTTP for the models endpoint.
 
@@ -327,6 +377,7 @@ def _doctor(live: bool = False, as_json: bool = False) -> int:
         _check_runtime,
         _check_gates,
         _check_plugins,
+        _check_integrations,
     ):
         try:
             check(report)
