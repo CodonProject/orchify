@@ -95,6 +95,10 @@ def test_live_run_lifecycle_and_history():
     assert live['status'] == 'paused' and live['paused'] is True
     assert live['active'] is True and live['step'] >= 1 and live['elapsed'] >= 0
     assert live['pending_approvals'] == 0 and live['feedback_depth'] >= 0
+    # The tap buffers ``agent:answer`` chunks and joins them on read, so a live
+    # record must still expose the text streamed so far (and no private keys).
+    assert live['answer'] == 'partial', live.get('answer')
+    assert '_answer_parts' not in live and '_answer_len' not in live, sorted(live)
 
     assert orchify_manager.resume(run_id) is True
     payload = finish_payload(rec)

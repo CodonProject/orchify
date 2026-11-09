@@ -1,4 +1,4 @@
-from typing import Callable, Any, Dict, Optional, List
+from typing import Callable, Any, Dict, Optional, List, Union
 from collections import OrderedDict
 
 import asyncio
@@ -129,12 +129,18 @@ class Tool:
         name: Optional[str] = None,
         description: Optional[str] = None,
         parameters: Optional[List[Dict[str, Any]]] = None,
+        parameters_schema: Optional[Dict[str, Any]] = None,
         cache: Optional[Any] = None,
         require_approval: bool = False,
         cache_size: Optional[int] = None,
         timeout: Optional[float] = None,
         ask_question: bool = False,
         cache_store: Optional['ToolCache'] = None,
+        retry: int = 0,
+        retry_on: Optional[Union[type, tuple]] = None,
+        backoff: float = 0.5,
+        max_backoff: float = 8.0,
+        on_error: str = 'raise',
     ):
         '''Build a tool around ``func``.
 
@@ -145,6 +151,11 @@ class Tool:
                 function docstring.
             parameters (Optional[List[Dict[str, Any]]]): Explicit parameter schema;
                 inferred from the signature and docstring when omitted.
+            parameters_schema (Optional[Dict[str, Any]]): Raw JSON Schema for the
+                arguments (``{"type": "object", "properties": {...}}``), used
+                verbatim instead of ``parameters``. Needed for schemas the flat
+                ``parameters`` list cannot express (nested objects, enums) — for
+                example tools imported from an MCP server.
             cache (Union[None, bool, float]): Caching policy: ``None``, ``False`` and
                 ``0`` disable caching, ``True`` caches forever, a number is a TTL in
                 seconds.
@@ -165,6 +176,16 @@ class Tool:
             cache_store (Optional[ToolCache]): Shared store to use instead of a
                 private one; every tool given the same instance shares cached
                 results (and single-flight) while keys remain namespaced per tool.
+            retry (int): Extra attempts after a failure (0 means try once).
+            retry_on (Optional[Union[type, tuple]]): Exception classes that may be
+                retried; None retries any ``Exception``.
+            backoff (float): Seconds to wait before the first retry; doubles per
+                attempt up to ``max_backoff``.
+            max_backoff (float): Ceiling for the exponential backoff.
+            on_error (str): What to do when the attempts are exhausted:
+                ``'raise'`` (default, the Agent reports the error to the model) or
+                ``'return'`` (return ``'[tool error] ...'`` as the result so the
+                model can react).
 
         Note:
             A tool whose function returns an awaitable has its result resolved on
@@ -178,6 +199,9 @@ class Tool:
         self.name: str = name or func.__name__
         self.description: str = description or analysis.get('docstring', 'No description provided.')
         self.parameters: List[Dict[str, Any]] = parameters or analysis.get('parameters', [])
+        self.parameters_schema: Optional[Dict[str, Any]] = (
+            dict(parameters_schema) if parameters_schema else None
+        )
         self.cache = cache
         self.require_approval: bool = bool(require_approval)
         self.ask_question: bool = bool(ask_question)
@@ -186,6 +210,11 @@ class Tool:
             else _read_int_env('ORCHIFY_TOOL_CACHE_SIZE', DEFAULT_CACHE_SIZE, minimum=0)
         )
         self.timeout: Optional[float] = timeout if timeout is not None else _read_tool_timeout()
+        self.retry: int = max(0, int(retry or 0))
+        self.retry_on = retry_on
+        self.backoff: float = max(0.0, float(backoff or 0.0))
+        self.max_backoff: float = max(self.backoff, float(max_backoff or 0.0))
+        self.on_error: str = str(on_error or 'raise').strip().lower() or 'raise'
         self.is_async: bool = inspect.iscoroutinefunction(func) or inspect.isasyncgenfunction(func)
         if cache is True:
             self.cache_ttl: Optional[float] = _read_cache_default_ttl()
@@ -227,6 +256,19 @@ class Tool:
             Dict[str, Any]: A description dict that can be serialised to JSON and
             sent to the LLM API.
         '''
+        if self.parameters_schema:
+            schema = json.loads(json.dumps(self.parameters_schema))
+            schema.setdefault('type', 'object')
+            schema.setdefault('properties', {})
+            return {
+                'type': 'function',
+                'function': {
+                    'name': self.name,
+                    'description': self.description,
+                    'parameters': schema,
+                },
+            }
+
         json_schema_properties = {}
         required_params = []
         py_to_json_type_map = {
@@ -352,40 +394,35 @@ class Tool:
     def _acquire_slot(self, key: str) -> tuple:
         '''Enter the single-flight gate for a cache key.
 
-        The first caller for a key computes the result while the others wait for it.
+        The first caller for a key computes the result while the others wait for
+        it on an event (so they all wake at once instead of serialising on a
+        lock; each blocked follower costs one thread either way, but a failed
+        leader lets exactly one of them take over).
 
         Args:
             key (str): Serialised call arguments.
 
         Returns:
-            tuple: ``(lock, leader)``; every caller must hand the lock back to
+            tuple: ``(slot, leader)``; every caller must hand the slot back to
             ``_release_slot()`` so the last one out clears the in-flight entry.
         '''
         with self._cache_lock:
             slot = self._inflight.get(key)
             if slot is None:
-                slot = [threading.Lock(), 0]
+                slot = [threading.Event(), 0]
                 self._inflight[key] = slot
                 leader = True
             else:
                 leader = False
             slot[1] += 1
-            lock = slot[0]
-        lock.acquire()
-        return lock, leader
+        return slot, leader
 
-    def _release_slot(self, key: str, lock: threading.Lock) -> None:
-        try:
-            lock.release()
-        except RuntimeError:
-            pass
+    def _release_slot(self, key: str, slot: list) -> None:
         with self._cache_lock:
-            slot = self._inflight.get(key)
-            if slot is None:
-                return
             slot[1] -= 1
             if slot[1] <= 0:
                 self._inflight.pop(key, None)
+            slot[0].set()
 
     def execute(self, **kwargs: Any) -> Any:
         '''Execute the tool.
@@ -400,7 +437,7 @@ class Tool:
         self.last_cached = False
 
         if not self.cache:
-            return self._call(kwargs)
+            return self._call_with_retry(kwargs)
 
         key = f'{self.name}\x00' + json.dumps(kwargs, sort_keys=True, default=str)
 
@@ -409,20 +446,73 @@ class Tool:
             self.last_cached = True
             return value
 
-        lock, leader = self._acquire_slot(key)
-        try:
-            if not leader:
-                found, value = self._cache_lookup(key)
-                if found:
-                    self._coalesced += 1
-                    self.last_cached = True
+        retried = False
+        while True:
+            slot, leader = self._acquire_slot(key)
+            try:
+                if leader:
+                    if retried:
+                        found, value = self._cache_lookup(key)
+                        if found:
+                            self.last_cached = True
+                            return value
+                    value = self._call_with_retry(kwargs)
+                    self._cache_store(key, value)
                     return value
+                slot[0].wait()
+            finally:
+                self._release_slot(key, slot)
+            found, value = self._cache_lookup(key)
+            if found:
+                self._coalesced += 1
+                self.last_cached = True
+                return value
+            retried = True
 
-            value = self._call(kwargs)
-            self._cache_store(key, value)
-            return value
-        finally:
-            self._release_slot(key, lock)
+    def _call_with_retry(self, kwargs: Dict[str, Any]) -> Any:
+        '''Call the tool, retrying transient failures per the configured policy.
+
+        Args:
+            kwargs (Dict[str, Any]): Tool arguments.
+
+        Returns:
+            Any: The tool's result, or an error string when ``on_error='return'``.
+
+        Raises:
+            BaseException: The last failure when ``on_error='raise'`` (the default)
+                and every attempt failed.
+        '''
+        attempts = self.retry + 1
+        delay = self.backoff
+        last_exc: Optional[BaseException] = None
+        for attempt in range(attempts):
+            try:
+                return self._call(kwargs)
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                last_exc = exc
+                if attempt + 1 >= attempts or not self._retryable(exc):
+                    break
+                if delay > 0:
+                    time.sleep(delay)
+                delay = min(delay * 2, self.max_backoff) if delay else 0.0
+        if self.on_error == 'return':
+            return f'[tool error] {type(last_exc).__name__}: {last_exc}'
+        raise last_exc  # type: ignore[misc]
+
+    def _retryable(self, exc: BaseException) -> bool:
+        '''Whether an exception matches ``retry_on``.
+
+        Args:
+            exc (BaseException): The failure raised by the tool.
+
+        Returns:
+            bool: True when the call may be retried.
+        '''
+        if self.retry_on is None:
+            return True
+        return isinstance(exc, self.retry_on)
 
     def cache_info(self) -> Dict[str, Any]:
         '''Snapshot of this tool's cache: size, bound, hit/miss and eviction counters.'''
@@ -466,6 +556,11 @@ def tool(
     timeout: Optional[float] = None,
     ask_question: bool = False,
     cache_store: Optional[ToolCache] = None,
+    retry: int = 0,
+    retry_on: Optional[Union[type, tuple]] = None,
+    backoff: float = 0.5,
+    max_backoff: float = 8.0,
+    on_error: str = 'raise',
 ):
     '''Turn a function into a Tool, usable as a decorator.
 
@@ -481,6 +576,11 @@ def tool(
         timeout (Optional[float]): Seconds to wait for an async result.
         ask_question (bool): Treat the call as an open question to the operator.
         cache_store (Optional[ToolCache]): Shared store to use (see :class:`Tool`).
+        retry (int): Extra attempts after a failure (see :class:`Tool`).
+        retry_on (Optional[Union[type, tuple]]): Exception classes allowed to retry.
+        backoff (float): Initial retry delay in seconds.
+        max_backoff (float): Ceiling for the exponential backoff.
+        on_error (str): ``'raise'`` (default) or ``'return'`` an error string.
 
     Returns:
         Callable: A decorator that wraps the function in a :class:`Tool`.
@@ -505,5 +605,10 @@ def tool(
             timeout=timeout,
             ask_question=ask_question,
             cache_store=cache_store,
+            retry=retry,
+            retry_on=retry_on,
+            backoff=backoff,
+            max_backoff=max_backoff,
+            on_error=on_error,
         )
     return decorator

@@ -46,12 +46,15 @@ class FinalStatus:
         prompt_cache_hit_tokens (int): Prompt tokens served from a provider cache.
         prompt_cache_miss_tokens (int): Prompt tokens that missed the cache.
         total_tokens (int): Total tokens billed for the request.
+        finish_reason (str): Provider stop reason (``'stop'``, ``'length'``,
+            ``'tool_calls'``, ...). Empty when the provider did not report one.
     '''
 
     content: str
     reasoning: str
     tool_calls: list[dict] = field(default_factory=list)
 
+    finish_reason: str = field(default='')
     completion_tokens: int = field(default=0)
     prompt_tokens: int = field(default=0)
     prompt_cache_hit_tokens: int = field(default=0)
@@ -253,7 +256,7 @@ class LLMInterface:
         enabled_plugins = kwargs.pop('_enabled_plugins', None)
 
         def core_dispatch(k: Dict[str, Any]) -> AsyncGenerator[Response, None]:
-            k = {kk: vv for kk, vv in k.items() if kk != 'scope'}
+            k = {kk: vv for kk, vv in k.items() if kk not in ('scope', 'run_id')}
             return self._core_request(**k)
 
         chain: Callable = core_dispatch
@@ -281,6 +284,7 @@ class LLMInterface:
         extra_data: Optional[dict] = None,
         scope: str = '*',
         _enabled_plugins=None,
+        run_id: str = '',
     ) -> AsyncGenerator[Response, None]:
         '''Stream a chat completion request.
 
@@ -299,6 +303,9 @@ class LLMInterface:
                 usually the agent name.
             _enabled_plugins (Optional[Set[str]]): Plugin ids allowed to act on this
                 request.
+            run_id (Optional[str]): Run the request belongs to. Middleware may use it
+                to attribute work (cost accounting, history rewrites); it is stripped
+                before the provider call.
 
         Yields:
             Response: Streamed response items, the last one with ``is_final`` set.
@@ -316,6 +323,7 @@ class LLMInterface:
             'extra_data': extra_data,
             'scope': scope,
             '_enabled_plugins': _enabled_plugins,
+            'run_id': run_id,
         }
         async for resp in self._dispatch(kwargs, scope=scope):
             yield resp

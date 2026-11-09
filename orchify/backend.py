@@ -113,4 +113,58 @@ class WebBackend:
                 yield line
 
 
+    async def post_json_async(
+        self,
+        url: str,
+        headers: Dict[str, str],
+        json_data: Dict[str, Any],
+    ) -> Any:
+        '''POST JSON and return the decoded response body.
+
+        Args:
+            url (str): Target HTTP URL.
+            headers (Dict[str, str]): Request headers.
+            json_data (Dict[str, Any]): Request payload.
+
+        Returns:
+            Any: The decoded JSON response.
+        '''
+        response = await self._client.post(url, headers=headers, json=json_data)
+        response.raise_for_status()
+        return response.json()
+
+    def post_json(
+        self,
+        url: str,
+        headers: Dict[str, str],
+        json_data: Dict[str, Any],
+        timeout: Optional[float] = None,
+    ) -> Any:
+        '''Blocking JSON POST on the shared backend loop.
+
+        Call this from worker threads (tools, scripts). From the backend loop
+        itself use :meth:`post_json_async` instead.
+
+        Args:
+            url (str): Target HTTP URL.
+            headers (Dict[str, str]): Request headers.
+            json_data (Dict[str, Any]): Request payload.
+            timeout (Optional[float]): Seconds to wait for the response.
+
+        Returns:
+            Any: The decoded JSON response.
+        '''
+        from orchify.runtime import on_loop_thread
+
+        if on_loop_thread():
+            raise RuntimeError(
+                'post_json() blocks and cannot run on the Orchify backend loop; '
+                'await post_json_async() there instead.'
+            )
+        future = asyncio.run_coroutine_threadsafe(
+            self.post_json_async(url, headers, json_data), self._loop
+        )
+        return future.result(timeout=timeout)
+
+
 orchify_web_backend = WebBackend()

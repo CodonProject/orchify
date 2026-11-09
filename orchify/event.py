@@ -183,6 +183,7 @@ class AgentEvent(BaseEvent):
                     'prompt_cache_hit_tokens': response.final_status.prompt_cache_hit_tokens,
                     'prompt_cache_miss_tokens': response.final_status.prompt_cache_miss_tokens,
                     'total_tokens': response.final_status.total_tokens,
+                    'finish_reason': response.final_status.finish_reason,
                 }
             )
 
@@ -541,6 +542,7 @@ class ApprovalEvent(BaseEvent):
         args: Optional[dict] = None,
         step: int = 1,
         timeout: Optional[float] = None,
+        reason: str = '',
     ) -> 'ApprovalEvent':
         '''Build the ``run:approval:required`` event.
 
@@ -556,6 +558,7 @@ class ApprovalEvent(BaseEvent):
             step (int): Step number inside the run. Defaults to 1.
             timeout (Optional[float]): Seconds the agent will wait before failing
                 closed, when configured.
+            reason (str): Why the call was parked, when a policy asked for it.
 
         Returns:
             ApprovalEvent: The required event.
@@ -574,6 +577,7 @@ class ApprovalEvent(BaseEvent):
                 'args': args or {},
                 'step': step,
                 'timeout': timeout,
+                'reason': reason,
             },
         )
         event.approval_id = approval_id

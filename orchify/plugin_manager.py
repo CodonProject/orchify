@@ -3,13 +3,41 @@ import importlib
 import importlib.util
 import os
 import sys
-from typing import Dict, List, Optional, Type, Union
+from types import ModuleType
+from typing import Dict, List, Optional, Tuple, Type, Union
 
 from orchify.plugin import Plugin
 from orchify.broker import orchify_broker
 from orchify.utils import get_logger
 
 logger = get_logger(__name__)
+
+#: Entry point group installed packages use to advertise plugins.
+ENTRY_POINT_GROUP = 'orchify.plugins'
+
+
+def _entry_points(group: str) -> List[object]:
+    '''Return the installed entry points registered for ``group``.
+
+    Works on both the Python 3.9 ``entry_points()`` mapping API and the newer
+    ``entry_points(group=...)`` signature; a missing ``importlib.metadata``
+    simply yields no entry points.
+
+    Args:
+        group (str): Entry point group name.
+
+    Returns:
+        List[object]: The matching entry points (empty when there are none).
+    '''
+    try:
+        from importlib import metadata
+    except Exception:  # pragma: no cover - importlib.metadata is stdlib since 3.8
+        return []
+    try:
+        found = metadata.entry_points(group=group)
+    except TypeError:  # Python 3.9: entry_points() returns a dict of group -> entries
+        found = metadata.entry_points().get(group, ())
+    return list(found or ())
 
 
 class PluginError(Exception):
@@ -54,6 +82,7 @@ class PluginManager:
         self._order: list[str] = []
         self._order_dirty: bool = True
         self._registry: dict[str, type] = {}
+        self._entry_points_loaded: set = set()
 
 
     def _emit(self, event_type: str, payload: dict) -> None:
@@ -149,10 +178,25 @@ class PluginManager:
         return dict(self.plugins)
 
     def attach(self, name: str, agent) -> None:
-        '''Attach all tools owned by a registered plugin to a specific Agent.'''
+        '''Attach a registered plugin to an Agent: tools and middleware.
+
+        Args:
+            name (str): Registered plugin id.
+            agent (Agent): Agent to bind the plugin to.
+
+        Raises:
+            PluginError: When no plugin with that id is registered.
+        '''
         if name not in self.plugins:
             raise PluginError(f"Plugin '{name}' is not registered.")
-        self.plugins[name].attach_tools(agent)
+        # A plugin that was only registered has no hooks or middleware yet, so
+        # binding it would attach nothing. Load it on demand instead of making
+        # the caller remember a second call.
+        if not self.plugins[name].loaded:
+            self.load(name)
+        plugin = self.plugins[name]
+        plugin.bind(agent)
+        plugin.attach_tools(agent)
 
     @property
     def loaded(self) -> list[str]:
@@ -396,6 +440,117 @@ class PluginManager:
         mod_names = [f'{package}.{os.path.splitext(os.path.basename(f))[0]}' for f in self.discover(pkg_dir)]
         self._import_modules(mod_names)
         return self.load_all() if auto_load else []
+
+    def entry_points(self, group: str = ENTRY_POINT_GROUP) -> List[Dict[str, str]]:
+        '''List the installed entry points of ``group`` without importing them.
+
+        Args:
+            group (str): Entry point group to inspect.
+
+        Returns:
+            List[Dict[str, str]]: One ``{'name', 'value', 'group'}`` dict per entry
+            point, ready to print from the CLI.
+        '''
+        return [
+            {'name': ep.name, 'value': getattr(ep, 'value', ''), 'group': group}
+            for ep in _entry_points(group)
+        ]
+
+    @staticmethod
+    def _entry_point_candidates(target: object) -> List[object]:
+        '''Normalise what an entry point loaded into a list of plugin candidates.
+
+        An entry point may point at a plugin class, a plugin instance, a module
+        (using its ``PLUGINS`` list or the classes it defines), a factory that
+        returns any of those, or a list of them.
+
+        Args:
+            target (object): The object returned by ``EntryPoint.load()``.
+
+        Returns:
+            List[object]: Plugin classes or instances to register.
+        '''
+        if isinstance(target, ModuleType):
+            declared = getattr(target, 'PLUGINS', None)
+            if declared is not None:
+                return list(declared)
+            return [
+                obj for obj in vars(target).values()
+                if isinstance(obj, type) and issubclass(obj, Plugin) and obj is not Plugin
+                and getattr(obj, '__module__', '') == target.__name__
+            ]
+        if isinstance(target, Plugin) or (isinstance(target, type) and issubclass(target, Plugin)):
+            return [target]
+        if isinstance(target, (list, tuple, set, frozenset)):
+            found: List[object] = []
+            for item in target:
+                found.extend(PluginManager._entry_point_candidates(item))
+            return found
+        if callable(target):
+            return PluginManager._entry_point_candidates(target())
+        return []
+
+    def load_entry_points(self, group: str = ENTRY_POINT_GROUP, *, auto_load: bool = True) -> List[Plugin]:
+        '''Register (and by default load) the plugins installed packages advertise.
+
+        A broken entry point is reported through ``plugin:error`` and skipped; it
+        never stops the remaining plugins from loading.
+
+        Args:
+            group (str): Entry point group to read.
+            auto_load (bool): When True, load every plugin right after registering it.
+
+        Returns:
+            List[Plugin]: The plugins that were registered (loaded when
+            ``auto_load``).
+        '''
+        self._entry_points_loaded.add(group)
+        loaded: List[Plugin] = []
+        for ep in _entry_points(group):
+            try:
+                target = ep.load()
+            except Exception as e:
+                logger.warning('[plugin] entry point %s failed to import: %s', ep.name, e)
+                self._emit('plugin:error', {'plugin': ep.name, 'action': 'import', 'error': str(e)})
+                continue
+            try:
+                candidates = self._entry_point_candidates(target)
+            except Exception as e:
+                logger.warning('[plugin] entry point %s produced no plugin: %s', ep.name, e)
+                self._emit('plugin:error', {'plugin': ep.name, 'action': 'import', 'error': str(e)})
+                continue
+            for candidate in candidates:
+                try:
+                    instance = self.register(candidate)
+                except PluginError as e:
+                    logger.debug('[plugin] entry point %s: %s', ep.name, e)
+                    continue
+                if instance is not None:
+                    loaded.append(instance)
+        if auto_load:
+            for instance in loaded:
+                if not instance.loaded:
+                    self.load(instance.id)
+        return loaded
+
+    def ensure_entry_points(self, group: str = ENTRY_POINT_GROUP) -> List[str]:
+        '''Load the entry-point plugins of ``group`` once.
+
+        Called lazily when an agent enables a plugin id that is not registered yet,
+        so ``pip install orchify-plugin-x`` is enough for ``Agent(plugins=['x'])``
+        to work without an explicit ``register`` call.
+
+        Args:
+            group (str): Entry point group to read.
+
+        Returns:
+            List[str]: The ids of the plugins that entry points registered.
+        '''
+        if group in self._entry_points_loaded:
+            return []
+        before = set(self.plugins)
+        self.load_entry_points(group)
+        return sorted(set(self.plugins) - before)
 
     def _import_module(self, mod_name: str, *, suppress_errors: bool = False,
                        path: Optional[str] = None) -> Optional[object]:

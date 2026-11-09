@@ -220,3 +220,7 @@ __marimo__/
 
 
 test.py
+# Test artefacts (persistence stores, MCP scratch space)
+tests/.data/
+tests/.mcp-tmp/
+

@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Optional, Set, Union, AsyncGenerator, Literal, Callable, TYPE_CHECKING
+from typing import List, Dict, Any, Optional, Set, Tuple, Union, AsyncGenerator, Literal, Callable, TYPE_CHECKING
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
@@ -177,6 +177,7 @@ class Agent:
         pause_timeout: Optional[float] = None,
         approval_timeout: Optional[float] = None,
         require_approval: Union[bool, Callable[[Any, Dict[str, Any]], bool]] = False,
+        tool_policy: Optional[Any] = None,
         allow_concurrent_runs: bool = False,
         max_call_depth: Optional[int] = None,
         max_tool_concurrency: Optional[int] = None,
@@ -184,6 +185,9 @@ class Agent:
         budget_usd: Optional[float] = None,
         budget_seconds: Optional[float] = None,
         enable_ask_user: bool = False,
+        checkpoint: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        tool_result_limit: int = 0,
+        tool_result_dir: str = '',
     ):
         '''Create an agent.
 
@@ -224,6 +228,11 @@ class Agent:
                 Manual-confirmation policy. True parks every tool call in the
                 broker's approval pool; a callable(tool, args) decides per call.
                 Individual tools opt in with ``Tool(require_approval=True)``.
+            tool_policy (Optional[Any]): A :class:`orchify.policy.ToolPolicy`
+                deciding allow / ask / deny per call, matched on the tool name and
+                the arguments. None falls back to ``ORCHIFY_TOOL_POLICY`` (a
+                ``tool_glob=action`` list) and otherwise to plain
+                ``require_approval`` behaviour.
             allow_concurrent_runs (bool): By default an Agent refuses a second
                 ``run()`` while one is in flight, because both would share
                 ``messages`` and ``last_run_id``. Set True to allow overlapping
@@ -249,6 +258,18 @@ class Agent:
                 (default 8; 0 means unlimited). All tool calls of a step share the
                 global executor, so a cap keeps one run from occupying every worker
                 and starving other runs.
+            checkpoint (Optional[Callable[[Dict[str, Any]], Any]]): Called after
+                every finished step with ``{'run_id', 'step', 'agent', 'model',
+                'messages'}``. Persist it to resume a crashed run: see
+                ``orchify.persistence.CheckpointStore``. A failing checkpoint is
+                logged and never breaks the run.
+            tool_result_limit (int): Character budget for one tool result before it
+                is shortened to a head and tail preview (0 keeps results untouched).
+                A truncated result keeps a marker with the original size and, when
+                ``tool_result_dir`` is set, the path to the full text.
+            tool_result_dir (str): Directory that receives the full text of any
+                truncated tool result (one file per call). The model sees the path,
+                so it can read the file back with a file tool when it needs more.
 
         Note:
             Request parameters (temperature, top_p, json_format, max_tokens,
@@ -275,6 +296,10 @@ class Agent:
             else _read_timeout_env('ORCHIFY_APPROVAL_TIMEOUT')
         )
         self.require_approval = require_approval
+        self.tool_policy = tool_policy
+        self.checkpoint = checkpoint
+        self.tool_result_limit = max(0, int(tool_result_limit or 0))
+        self.tool_result_dir = str(tool_result_dir or '')
         self.last_run_id: str = ''
         self.last_answer: str = ''
         self.last_error: str = ''
@@ -286,6 +311,8 @@ class Agent:
             self.tools['ask_user'] = self.ask_user_tool()
         self.enabled_plugins: Set[str] = set(plugins) if plugins else set()
         self.plugin_config: Dict[str, Any] = dict(plugin_config or {})
+        for _plugin_name in self.enabled_plugins:
+            self._bind_registered_plugin(_plugin_name)
 
         self.messages: List[Dict[str, Any]] = [
             {'role': 'system', 'content': system_prompt} if system_prompt else {}
@@ -370,8 +397,9 @@ class Agent:
         return self.tools.pop(name, None) is not None
 
     def enable_plugin(self, name: str) -> None:
-        '''Enable a plugin for this agent.'''
+        '''Enable a plugin for this agent, binding it when it is registered.'''
         self.enabled_plugins.add(name)
+        self._bind_registered_plugin(name)
 
     def disable_plugin(self, name: str) -> None:
         '''Disable a plugin for this agent.'''
@@ -380,6 +408,118 @@ class Agent:
     def set_plugins(self, plugins: Optional[List[str]]) -> None:
         '''Set the list of enabled plugins. None or empty = no plugins.'''
         self.enabled_plugins = set(plugins) if plugins else set()
+        for name in self.enabled_plugins:
+            self._bind_registered_plugin(name)
+
+    def _bind_registered_plugin(self, name: str) -> None:
+        '''Attach a plugin that is already registered with the global manager.
+
+        Enabling a plugin by id is the documented two-step setup with
+        ``orchify_plugins.register(...)``, so the agent binds the instance here:
+        middleware lands on ``self.llm`` and plugin tools on ``self.tools``.
+        Unknown ids are only remembered, which keeps ``Agent(plugins=[...])``
+        usable before the plugin registry exists.
+        '''
+        try:
+            from .plugin_manager import orchify_plugins
+        except Exception:
+            return
+        try:
+            if name in orchify_plugins.registered():
+                orchify_plugins.attach(name, self)
+                return
+            # ``pip install orchify-plugin-x`` is enough: entry points are
+            # discovered lazily the first time an unknown id is enabled.
+            orchify_plugins.ensure_entry_points()
+            if name in orchify_plugins.registered():
+                orchify_plugins.attach(name, self)
+        except Exception as exc:
+            get_logger(__name__).warning(
+                "%s: could not bind plugin '%s': %s", self.name, name, exc
+            )
+
+    def _checkpoint_step(self, run_id: str, step: int, messages: List[Dict[str, Any]]) -> None:
+        '''Hand a finished step's conversation to the configured checkpoint callable.
+
+        The callable receives one dict — ``run_id``, ``step``, ``agent``,
+        ``model`` and a shallow copy of ``messages`` — and may persist it (see
+        :class:`orchify.persistence.CheckpointStore`). A failing checkpoint is
+        logged and never breaks the run.
+
+        Args:
+            run_id (str): Run the step belongs to.
+            step (int): 1-based step number inside the run.
+            messages (List[Dict[str, Any]]): Conversation as sent to the model,
+                with this step's tool results already appended.
+        '''
+        if self.checkpoint is None:
+            return
+        try:
+            self.checkpoint({
+                'run_id': run_id,
+                'step': step,
+                'agent': self.name,
+                'model': self.model,
+                'messages': [dict(message) for message in messages],
+            })
+        except Exception as exc:
+            get_logger(__name__).warning(
+                "%s: checkpoint after step %d failed: %s", self.name, step, exc
+            )
+
+    def _shape_tool_result(self, tool_name: str, tool_id: str, result: str,
+                           run_id: str = '') -> Tuple[str, Dict[str, Any]]:
+        '''Shorten an oversized tool result and offload its full text.
+
+        Keeping a whole page (or a whole file) in the conversation makes every
+        later request expensive, so results above ``tool_result_limit`` are
+        replaced by a head and tail preview. When ``tool_result_dir`` is set the
+        full text is written to a file whose path the model can read back.
+
+        Args:
+            tool_name (str): Tool that produced the result.
+            tool_id (str): Provider id of the call, used in the file name.
+            result (str): The tool's text result.
+            run_id (str): Run the call belongs to.
+
+        Returns:
+            Tuple[str, Dict[str, Any]]: The text handed to the model, and event
+            payload extras describing the truncation (empty when nothing changed).
+        '''
+        limit = self.tool_result_limit
+        if limit <= 0 or not isinstance(result, str) or len(result) <= limit:
+            return result, {}
+        head_len = max(1, (limit * 2) // 3)
+        tail_len = max(0, limit - head_len)
+        head = result[:head_len]
+        tail = result[-tail_len:] if tail_len else ''
+        meta: Dict[str, Any] = {
+            'truncated': True,
+            'original_chars': len(result),
+        }
+        note = f'[{tool_name} result truncated: {len(result)} characters in total]'
+        path = ''
+        directory = self.tool_result_dir
+        if directory:
+            try:
+                import os as _os
+                import re as _re
+                _os.makedirs(directory, exist_ok=True)
+                stem = _re.sub(r'[^A-Za-z0-9_-]+', '-',
+                               f'{run_id or "run"}-{tool_id or "call"}-{tool_name}')[:120]
+                path = _os.path.join(directory, f'{stem}.txt')
+                with open(path, 'w', encoding='utf-8') as handle:
+                    handle.write(result)
+                meta['path'] = path
+                note += f'; full text saved to {path}'
+            except Exception as exc:
+                get_logger(__name__).warning(
+                    "%s: could not offload tool result to %r: %s", self.name, directory, exc
+                )
+        parts = [note, '', head]
+        if tail:
+            parts.extend(['', '...', '', tail])
+        return '\n'.join(parts), meta
 
     def _apply_system_prompt(self) -> None:
         '''Recompute the effective system prompt.
@@ -461,6 +601,39 @@ class Agent:
         elif policy:
             return True
         return bool(getattr(tool, 'needs_approval', False))
+
+    def tool_decision(self, tool: Optional[Tool], args: Optional[Dict[str, Any]] = None):
+        '''Decide whether a tool call may run, must ask, or is denied.
+
+        Combines this agent's ``tool_policy`` (or ``ORCHIFY_TOOL_POLICY``) with
+        the legacy ``require_approval`` flag: a policy that allows a call can
+        still be turned into an approval request by ``require_approval``, while a
+        policy ``deny`` always wins.
+
+        Args:
+            tool (Optional[Tool]): The tool about to run.
+            args (Optional[Dict[str, Any]]): Arguments the tool would receive.
+
+        Returns:
+            :class:`orchify.policy.Decision`: ``'allow'``, ``'ask'`` or ``'deny'``
+            with a reason.
+        '''
+        from .policy import Decision, policy_from_env
+
+        policy = self.tool_policy
+        if policy is None:
+            if getattr(self, '_env_tool_policy', None) is None:
+                self._env_tool_policy = policy_from_env() or False
+            policy = self._env_tool_policy or None
+        tool_name = str(getattr(tool, 'name', '') or '')
+        if policy is None:
+            action = 'ask' if self.needs_approval(tool, args) else 'allow'
+            reason = 'require_approval' if action == 'ask' else ''
+            return Decision(action, reason, None, tool_name)
+        decision = policy.decide(tool_name, args or {})
+        if decision.allowed and self.needs_approval(tool, args):
+            return Decision('ask', 'agent require_approval', decision.rule, tool_name)
+        return decision
 
     def _configure_with_tools(self, tools: List[Tool], extra_context: Optional[Dict[str, Any]] = None) -> None:
         '''Configure the agent with extra tools and collaboration context.
@@ -691,7 +864,7 @@ class Agent:
 
     def run(
         self,
-        user_input: str,
+        user_input: Union[str, List[Dict[str, Any]]],
         max_steps: Union[int, Dict[str, Any]] = 5,
         run_id: Optional[str] = None,
         turn_id: Optional[str] = None,
@@ -706,7 +879,9 @@ class Agent:
         ``agent.run('hi', {'max_steps': 3, 'temperature': 0.2})``.
 
         Args:
-            user_input (str): The user message that starts the run.
+            user_input (Union[str, List[Dict[str, Any]]]): The user message that
+                starts the run. Pass a list of content parts (see
+                ``orchify.multimodal``) to send images alongside text.
             max_steps (Union[int, Dict[str, Any]]): Step budget, or a dict of run
                 options.
             run_id (Optional[str]): Explicit run handle.
@@ -757,6 +932,7 @@ class Agent:
             'task_name': run_id,
             'agent_name': self.name,
             'agent_code': self.code,
+            'model': self.model,
             'started_at': time.time(),
             'enabled_plugins': self.enabled_plugins,
             'plugin_config': self.plugin_config,
@@ -883,7 +1059,7 @@ class Agent:
 
     def _run_and_await_finish(
         self,
-        user_input: str,
+        user_input: Union[str, List[Dict[str, Any]]],
         timeout: Optional[float] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
@@ -895,7 +1071,9 @@ class Agent:
         the event is emitted, and waiting after the fact is harmless.
 
         Args:
-            user_input (str): The user message that starts the run.
+            user_input (Union[str, List[Dict[str, Any]]]): The user message that
+                starts the run. Pass a list of content parts (see
+                ``orchify.multimodal``) to send images alongside text.
             timeout (Optional[float]): Seconds to wait; resolved from
                 ``ORCHIFY_RUN_TIMEOUT`` when not given.
             **kwargs (Any): Any ``run()`` argument.
@@ -949,11 +1127,13 @@ class Agent:
                 return str(answer)
         return self.last_answer
 
-    def ask(self, user_input: str, *, timeout: Optional[float] = None, **kwargs: Any) -> str:
+    def ask(self, user_input: Union[str, List[Dict[str, Any]]], *, timeout: Optional[float] = None, **kwargs: Any) -> str:
         '''Run a task and return its answer: ``run()`` + ``wait()`` in one call.
 
         Args:
-            user_input (str): The user message that starts the run.
+            user_input (Union[str, List[Dict[str, Any]]]): The user message that
+                starts the run. Pass a list of content parts (see
+                ``orchify.multimodal``) to send images alongside text.
             timeout (Optional[float]): Seconds to wait; resolved from
                 ``ORCHIFY_RUN_TIMEOUT`` when not given (None = wait forever).
             **kwargs (Any): Any ``run()`` argument, such as ``max_steps``.
@@ -974,11 +1154,13 @@ class Agent:
         )
         return self._outcome_answer(self._run_and_await_finish(user_input, timeout, **kwargs))
 
-    async def aask(self, user_input: str, *, timeout: Optional[float] = None, **kwargs: Any) -> str:
+    async def aask(self, user_input: Union[str, List[Dict[str, Any]]], *, timeout: Optional[float] = None, **kwargs: Any) -> str:
         '''Async form of ``ask()``.
 
         Args:
-            user_input (str): The user message that starts the run.
+            user_input (Union[str, List[Dict[str, Any]]]): The user message that
+                starts the run. Pass a list of content parts (see
+                ``orchify.multimodal``) to send images alongside text.
             timeout (Optional[float]): Seconds to wait.
             **kwargs (Any): Any ``run()`` argument.
 
@@ -987,11 +1169,13 @@ class Agent:
         '''
         return await asyncio.to_thread(self.ask, user_input, timeout=timeout, **kwargs)
 
-    async def arun(self, user_input: str, *, timeout: Optional[float] = None, **kwargs: Any) -> str:
+    async def arun(self, user_input: Union[str, List[Dict[str, Any]]], *, timeout: Optional[float] = None, **kwargs: Any) -> str:
         '''Async form of ``run()``: start a run and await its finish.
 
         Args:
-            user_input (str): The user message that starts the run.
+            user_input (Union[str, List[Dict[str, Any]]]): The user message that
+                starts the run. Pass a list of content parts (see
+                ``orchify.multimodal``) to send images alongside text.
             timeout (Optional[float]): Seconds to wait.
             **kwargs (Any): Any ``run()`` argument.
 
@@ -1109,7 +1293,7 @@ class Agent:
 
     async def _run(
         self,
-        user_input: str,
+        user_input: Union[str, List[Dict[str, Any]]],
         max_steps: int = 5,
         messages: Optional[List[Dict[str, Any]]] = None,
         llm_kwargs: Optional[Dict[str, Any]] = None,
@@ -1214,6 +1398,7 @@ class Agent:
             tool_id: str,
             tool_name: str,
             args: Dict[str, Any],
+            reason: str = '',
         ) -> AsyncGenerator[Union[ApprovalEvent, RuntimeEvent], None]:
             '''Park one tool call in the broker's approval pool.
 
@@ -1228,6 +1413,7 @@ class Agent:
                 tool_id (str): Model-assigned tool call id.
                 tool_name (str): Name of the tool being confirmed.
                 args (dict): Arguments the tool would be called with.
+                reason (str): Why the call was parked, when a policy asked for it.
 
             Yields:
                 Union[ApprovalEvent, RuntimeEvent]: The 'run:approval:required' and
@@ -1257,6 +1443,7 @@ class Agent:
                 args=args,
                 step=step,
                 timeout=approval_timeout,
+                reason=reason,
             )
             try:
                 resolved = await orchify_broker.wait_approval(
@@ -1469,7 +1656,7 @@ class Agent:
             agent_code=self.code,
             turn_id=turn_id,
             event_type='run:start',
-            payload={'user_input': user_input},
+            payload={'user_input': user_input, 'model': self.model},
             turn=1
         )
 
@@ -1573,7 +1760,7 @@ class Agent:
                 Args:
                     content (str): Text of the new chunk.
                     kind (str): ``'answer'`` or ``'cot'``.
-                    shown (dict): Text already emitted per kind.
+                    shown (dict): Text fragments already emitted per kind.
                     suppress (dict): Remaining characters to drop per kind.
 
                 Returns:
@@ -1585,8 +1772,9 @@ class Agent:
                 '''
                 left = suppress[kind]
                 take = min(len(content), left)
-                matched = len(shown[kind]) - left
-                expected = shown[kind][matched:matched + take]
+                previous = ''.join(shown[kind])
+                matched = len(previous) - left
+                expected = previous[matched:matched + take]
                 if content[:take] != expected:
                     raise RuntimeError(
                         'stream retry diverged from the text already shown; the '
@@ -1597,7 +1785,12 @@ class Agent:
 
             stream_retries = _read_int_env('ORCHIFY_STREAM_RETRIES', 1)
             stream_retried = 0
-            shown = {'answer': '', 'cot': ''}
+            # Fragments, not one growing string: ``shown[kind] += content`` inside a
+            # per-chunk loop is O(n^2) because the dict entry is never the single
+            # reference CPython needs for its in-place append fast path. The joined
+            # text is only needed on the (rare) retry-suppression path.
+            shown = {'answer': [], 'cot': []}
+            shown_len = {'answer': 0, 'cot': 0}
             suppress = {'answer': 0, 'cot': 0}
             tool_events_emitted = 0
             final_status = None
@@ -1627,6 +1820,7 @@ class Agent:
                     extra_data=extra_data,
                     scope=self.name,
                     _enabled_plugins=self.enabled_plugins,
+                    run_id=run_id,
                     **req_kwargs,
                 )
                 try:
@@ -1679,7 +1873,8 @@ class Agent:
                                             response,
                                             current_chunk=dataclasses.replace(chunk, content=content)
                                         )
-                                    shown[kind] += content
+                                    shown[kind].append(content)
+                                    shown_len[kind] += len(content)
                                     yield AgentEvent.build_from_resp(
                                         response,
                                         agent_name=self.name,
@@ -1701,18 +1896,18 @@ class Agent:
                     if retry_fb is not None and retries < int(retry_fb.payload.get('max_retries', 1)):
                         retries += 1
                         req_overrides.update(retry_fb.payload.get('kwargs', {}) or {})
-                        suppress['answer'] = len(shown['answer'])
-                        suppress['cot'] = len(shown['cot'])
+                        suppress['answer'] = shown_len['answer']
+                        suppress['cot'] = shown_len['cot']
                         continue
                     if (
                         stream_retried < stream_retries
                         and tool_events_emitted == 0
-                        and (shown['answer'] or shown['cot'])
+                        and (shown_len['answer'] or shown_len['cot'])
                         and not isinstance(exc, MissingCredentials)
                     ):
                         stream_retried += 1
-                        suppress['answer'] = len(shown['answer'])
-                        suppress['cot'] = len(shown['cot'])
+                        suppress['answer'] = shown_len['answer']
+                        suppress['cot'] = shown_len['cot']
                         logger.warning(
                             'stream retry %s/%s after a mid-answer failure: %s',
                             stream_retried, stream_retries, exc,
@@ -1761,6 +1956,12 @@ class Agent:
             accumulated_usage['prompt_cache_miss_tokens'] += final_status.prompt_cache_miss_tokens
             accumulated_usage['total_tokens'] += final_status.total_tokens
 
+            if final_status.finish_reason == 'length':
+                logger.warning(
+                    '%s: step %d stopped at the token limit (finish_reason=length); '
+                    'the answer and streamed tool arguments are truncated.',
+                    self.name, step)
+
             assistant_msg = {
                 'role': 'assistant',
                 'content': final_status.content or None
@@ -1776,7 +1977,8 @@ class Agent:
             runs.append({
                 'step': step,
                 'content': assistant_msg,
-                'tool_calls': final_status.tool_calls
+                'tool_calls': final_status.tool_calls,
+                'finish_reason': final_status.finish_reason,
             })
 
             budget_now = budget_event(current_model(), step)
@@ -1798,7 +2000,10 @@ class Agent:
 
                 try:
                     args = json.loads(args_str) if args_str.strip() else {}
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        '%s: tool %r received arguments that are not valid JSON (%s); '
+                        'calling it with {} instead.', self.name, tool_name, exc)
                     args = {}
 
                 yield ToolEvent.build_call_start(
@@ -1873,8 +2078,27 @@ class Agent:
                     )
                     continue
 
-                if self.needs_approval(tool, args) and tool is not None:
-                    async for ev in request_approval(step, tool_id, tool_name, args):
+                decision = self.tool_decision(tool, args)
+                if decision.denied:
+                    reason = decision.reason or 'denied by policy'
+                    result = f'[policy denied] {reason}'
+                    completed_results[tool_id] = (tool_name, result)
+                    yield ToolEvent.build_call_finish(
+                        agent_name=self.name,
+                        agent_code=self.code,
+                        turn_id=turn_id,
+                        tool_id=tool_id,
+                        tool_name=tool_name,
+                        result=result,
+                        payload={'approved': False, 'denied_by_policy': True,
+                                 'policy': decision.as_dict()},
+                        turn=step
+                    )
+                    continue
+
+                if decision.needs_approval and tool is not None:
+                    async for ev in request_approval(step, tool_id, tool_name, args,
+                                                     reason=decision.reason):
                         yield ev
                     if stop_state['stopped']:
                         stopped = True
@@ -1958,6 +2182,8 @@ class Agent:
                 tool_id = tool_call.get('id') or ''
                 tool_name = tool_call.get('function', {}).get('name') or ''
                 t_name, result = completed_results.get(tool_id, (tool_name, f"Tool '{tool_name}' execution failed."))
+                result, truncation = self._shape_tool_result(
+                    t_name or tool_name, tool_id, result, run_id)
 
                 working_messages.append({
                     'role': 'tool',
@@ -1965,9 +2191,24 @@ class Agent:
                     'name': tool_name,
                     'content': result
                 })
+                if truncation:
+                    yield ToolEvent.build_call_finish(
+                        agent_name=self.name,
+                        agent_code=self.code,
+                        turn_id=turn_id,
+                        tool_id=tool_id,
+                        tool_name=t_name or tool_name,
+                        result=result,
+                        payload={'truncated': True,
+                                 'original_chars': truncation.get('original_chars', 0),
+                                 'path': truncation.get('path', '')},
+                        turn=step
+                    )
 
             if stopped:
                 break
+
+            self._checkpoint_step(run_id, step, working_messages)
 
         if not stopped:
             if pop_feedback({'control:stop'}) is not None:
@@ -1977,6 +2218,8 @@ class Agent:
                     yield ev
                 if suspend_result['status'] == 'stopped':
                     stopped = True
+
+        self._checkpoint_step(run_id, executed_step, working_messages)
 
         self.last_answer = last_answer
         yield RuntimeEvent(

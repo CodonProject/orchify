@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import json
 import os
+import threading
 from typing import Any, Dict, List, Optional
 
 
@@ -41,7 +42,9 @@ def _parse_price_table(raw: Optional[str]) -> Dict[str, Dict[str, float]]:
     if not raw or not raw.strip():
         return {}
     text = raw.strip()
-    if os.path.exists(text):
+    # Only touch the filesystem when the value cannot be inline JSON: an inline
+    # table handed to os.path.exists() would be stat()ed as a path.
+    if not text.startswith('{') and os.path.exists(text):
         try:
             with open(text, 'r', encoding='utf-8') as handle:
                 data = json.load(handle)
@@ -67,22 +70,38 @@ def _parse_price_table(raw: Optional[str]) -> Dict[str, Dict[str, float]]:
     return table
 
 
+_TABLE_LOCK = threading.Lock()
+_TABLE_CACHE: Dict[str, Dict[str, Dict[str, float]]] = {}
+_PRICE_CACHE: Dict[Any, Optional['Price']] = {}
+
+
 def load_price_table() -> Dict[str, Dict[str, float]]:
-    '''Built-in prices merged with ORCHIFY_PRICE_TABLE (the env wins per model).'''
+    '''Built-in prices merged with ORCHIFY_PRICE_TABLE (the env wins per model).
+
+    The merged table is cached per raw env value: the budget is sampled every
+    step, so re-parsing the table for each sample would be pure overhead.
+    '''
+    raw = os.getenv('ORCHIFY_PRICE_TABLE') or ''
+    with _TABLE_LOCK:
+        cached = _TABLE_CACHE.get(raw)
+        if cached is not None:
+            return {model: dict(entry) for model, entry in cached.items()}
     table = {model: dict(entry) for model, entry in DEFAULT_PRICE_TABLE.items()}
-    for model, entry in _parse_price_table(os.getenv('ORCHIFY_PRICE_TABLE')).items():
+    for model, entry in _parse_price_table(raw).items():
         merged = dict(table.get(model) or {})
         merged.update(entry)
         table[model] = merged
+    with _TABLE_LOCK:
+        if len(_TABLE_CACHE) > 8:
+            _TABLE_CACHE.clear()
+            _PRICE_CACHE.clear()
+        _TABLE_CACHE[raw] = {model: dict(entry) for model, entry in table.items()}
     return table
 
 
-def price_for(model: Optional[str], table: Optional[Dict[str, Dict[str, float]]] = None) -> Optional[Price]:
-    '''Longest-prefix price lookup for a model name; None when unknown.'''
-    if not model:
-        return None
-    table = load_price_table() if table is None else table
-    needle = str(model).lower()
+def _lookup_price(model: str, table: Dict[str, Dict[str, float]]) -> Optional['Price']:
+    '''Longest-prefix price lookup inside one table; None when unknown.'''
+    needle = model.lower()
     best_key: Optional[str] = None
     for key in table:
         lowered = str(key).lower()
@@ -94,6 +113,25 @@ def price_for(model: Optional[str], table: Optional[Dict[str, Dict[str, float]]]
     entry = table.get(best_key, {})
     cache_hit = entry.get('cache_hit', entry.get('prompt', 0.0))
     return Price(prompt=entry.get('prompt', 0.0), completion=entry.get('completion', 0.0), cache_hit=cache_hit)
+
+
+def price_for(model: Optional[str], table: Optional[Dict[str, Dict[str, float]]] = None) -> Optional[Price]:
+    '''Longest-prefix price lookup for a model name; None when unknown.'''
+    if not model:
+        return None
+    if table is not None:
+        return _lookup_price(str(model), table)
+    key = (os.getenv('ORCHIFY_PRICE_TABLE') or '', str(model).lower())
+    with _TABLE_LOCK:
+        if key in _PRICE_CACHE:
+            return _PRICE_CACHE[key]
+    price = _lookup_price(str(model), load_price_table())
+    with _TABLE_LOCK:
+        if len(_PRICE_CACHE) > 512:
+            _PRICE_CACHE.clear()
+        _PRICE_CACHE[key] = price
+    return price
+
 
 
 def cost_of(usage: Optional[Dict[str, Any]], price: Optional[Price]) -> float:

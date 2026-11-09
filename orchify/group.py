@@ -563,6 +563,7 @@ class Group:
             'kind': 'group',
             'group_name': self.name,
             'group_code': self.code,
+            'model': getattr(self, 'model', '') or '',
             'mode': self.mode,
             'started_at': time.time(),
         })

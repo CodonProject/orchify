@@ -236,6 +236,9 @@ class OpenAICompat(LLMInterface):
         total_content = ''
         total_cot_content = ''
         tool_calls_map = {}
+        arg_parts: dict[int, list] = {}
+        dirty_args: set = set()
+        finish_reason = ''
 
         completion_tokens = 0
         prompt_tokens = 0
@@ -246,12 +249,24 @@ class OpenAICompat(LLMInterface):
         has_cot = False
         cot_ended = False
 
-        def make_chunk(**kwargs) -> Response:
+        def tool_calls_snapshot() -> list:
+            # Join streamed argument fragments only when a snapshot is taken.
+            # A list plus one join is far cheaper than re-concatenating a
+            # growing string on every fragment.
+            while dirty_args:
+                idx = dirty_args.pop()
+                tool_calls_map[idx]['function']['arguments'] = ''.join(arg_parts[idx])
+            return list(tool_calls_map.values())
+
+        def make_chunk(content_total: str, cot_total: str, **kwargs) -> Response:
+            # The accumulators are passed in rather than captured: a closure
+            # cell would force every ``+=`` below to copy the whole string,
+            # turning long streams into O(n^2) work.
             return Response(
                 current_chunk=Chunk(
-                    total_content=total_content,
-                    total_cot_content=total_cot_content,
-                    total_tool_call=list(tool_calls_map.values()),
+                    total_content=content_total,
+                    total_cot_content=cot_total,
+                    total_tool_call=tool_calls_snapshot(),
                     **kwargs
                 ),
                 is_final=False
@@ -264,10 +279,11 @@ class OpenAICompat(LLMInterface):
                     continue
 
                 line_str = line_bytes.decode('utf-8') if isinstance(line_bytes, bytes) else line_bytes
-                if not line_str.startswith('data: '):
+                # Accept both ``data: {...}`` and the legal SSE form ``data:{...}``.
+                if not line_str.startswith('data:'):
                     continue
 
-                raw_data = line_str[6:].strip()
+                raw_data = line_str[5:].strip()
                 if raw_data == '[DONE]':
                     break
 
@@ -296,6 +312,10 @@ class OpenAICompat(LLMInterface):
                 choices = chunk.get('choices', [])
                 if not choices:
                     continue
+
+                choice_finish = choices[0].get('finish_reason')
+                if choice_finish:
+                    finish_reason = choice_finish
 
                 delta = choices[0].get('delta', {})
 
@@ -330,7 +350,8 @@ class OpenAICompat(LLMInterface):
                             tool_calls_map[idx]['function']['name'] += func_delta['name']
                         if func_delta.get('arguments'):
                             arg_part = func_delta['arguments']
-                            tool_calls_map[idx]['function']['arguments'] += arg_part
+                            arg_parts.setdefault(idx, []).append(arg_part)
+                            dirty_args.add(idx)
                             assembly_chunk += arg_part
 
                 if cot_chunk:
@@ -346,21 +367,23 @@ class OpenAICompat(LLMInterface):
                     cot_ended = True
 
                 if is_cot_end:
-                    yield make_chunk(is_cot=False, content="", is_cot_end=True)
+                    yield make_chunk(total_content, total_cot_content, is_cot=False, content="", is_cot_end=True)
                     is_cot_end = False
 
                 if cot_chunk:
-                    yield make_chunk(is_cot=True, content=cot_chunk)
+                    yield make_chunk(total_content, total_cot_content, is_cot=True, content=cot_chunk)
 
                 if content_chunk:
-                    yield make_chunk(is_cot=False, content=content_chunk, is_cot_end=is_cot_end)
+                    yield make_chunk(total_content, total_cot_content, is_cot=False, content=content_chunk,
+                                     is_cot_end=is_cot_end)
 
                 if is_assembly_tool and not (cot_chunk or content_chunk):
-                    yield make_chunk(is_cot=False, content="", is_assembly_tool=True,
-                                     assembly_chunk=assembly_chunk, is_cot_end=is_cot_end)
+                    yield make_chunk(total_content, total_cot_content, is_cot=False, content="",
+                                     is_assembly_tool=True, assembly_chunk=assembly_chunk,
+                                     is_cot_end=is_cot_end)
 
             if has_cot and not cot_ended:
-                yield make_chunk(is_cot=False, content="", is_cot_end=True)
+                yield make_chunk(total_content, total_cot_content, is_cot=False, content="", is_cot_end=True)
         except httpx.HTTPStatusError as e:
             try:
                 error_detail = e.response.json()
@@ -379,7 +402,8 @@ class OpenAICompat(LLMInterface):
             final_status=FinalStatus(
                 content=total_content,
                 reasoning=total_cot_content,
-                tool_calls=list(tool_calls_map.values()),
+                tool_calls=tool_calls_snapshot(),
+                finish_reason=finish_reason,
                 completion_tokens=completion_tokens,
                 prompt_tokens=prompt_tokens,
                 prompt_cache_hit_tokens=prompt_cache_hit_tokens,

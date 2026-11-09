@@ -11,8 +11,8 @@ from . import broker as _broker_module
 from .backend import orchify_web_backend
 from .broker import POLL_INTERVAL, orchify_broker
 from .gate import gate_stats
+from .store import STORE_ENV, RunStore, run_store_from_env
 from .utils import get_logger
-
 __all__ = ['OrchifyManager', 'orchify_manager', 'RUN_STATUSES', 'read_sink']
 
 logger = get_logger(__name__)
@@ -36,6 +36,7 @@ MAX_STRING = 2000
 MAX_ANSWER = 20000
 MAX_PAYLOAD_DEPTH = 6
 MAX_START_CONTEXTS = 4096
+MAX_INBOX = 50000
 RECORD_CREATING_EVENTS = ('run:start', 'run:queued')
 
 
@@ -87,6 +88,35 @@ def _truncate(value: Any, limit: int = MAX_STRING) -> str:
     return text[:limit] + '...(truncated)'.format()
 
 
+ANSWER_PARTS = '_answer_parts'
+ANSWER_LEN = '_answer_len'
+
+
+def _answer_of(live: dict) -> str:
+    '''Return a live record's answer, joining buffered ``agent:answer`` chunks.
+
+    ``agent:answer`` arrives once per streamed chunk; buffering the chunks and
+    joining them here keeps the tap thread from copying the whole answer for
+    every chunk. The buffer is cleared once the text is materialised, so the
+    join runs at most once per read (and once when the run finishes).
+    '''
+    parts = live.get(ANSWER_PARTS)
+    if not parts:
+        return str(live.get('answer') or '')
+    text = (str(live.get('answer') or '') + ''.join(parts))[-MAX_ANSWER:]
+    live['answer'] = text
+    live[ANSWER_LEN] = 0
+    parts.clear()
+    return text
+
+
+def _public_record(record: dict) -> dict:
+    '''Drop the internal chunk-buffer keys from a record copy.'''
+    record.pop(ANSWER_PARTS, None)
+    record.pop(ANSWER_LEN, None)
+    return record
+
+
 def _jsonable(value: Any, depth: int = 0) -> Any:
     '''Best-effort conversion of any event payload into JSON-safe data.'''
     if value is None or isinstance(value, (bool, int, float)):
@@ -115,6 +145,57 @@ def _elapsed(started_at: Any, now: float, finished_at: Any = None) -> float:
         return round(max(0.0, end - float(started_at)), 3)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _usage_total(usage: Any) -> int:
+    '''Total tokens of a usage dict, 0 when unknown.'''
+    if not isinstance(usage, dict):
+        return 0
+    for key in ('total_tokens', 'prompt_tokens', 'completion_tokens'):
+        value = usage.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    return 0
+
+
+def _record_cost(record: dict) -> float:
+    '''Price one run record: the agent's budget wins, otherwise price the usage.
+
+    Args:
+        record (dict): A run record, possibly carrying ``usage``, ``budget`` and
+            ``model``.
+
+    Returns:
+        float: Cost in USD, 0.0 when the model has no price.
+    '''
+    budget = record.get('budget')
+    if isinstance(budget, dict):
+        cost = budget.get('cost_usd')
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            return float(cost)
+    usage = record.get('usage')
+    if not isinstance(usage, dict) or not usage:
+        return 0.0
+    try:
+        from .budget import cost_of, price_for
+        price = price_for(str(record.get('model') or ''))
+        if price is None:
+            return 0.0
+        return float(cost_of(usage, price))
+    except Exception:
+        return 0.0
+
+
+def _default_store() -> Optional[RunStore]:
+    '''Build the store named by ``ORCHIFY_RUN_STORE``, or None when unset.'''
+    if not os.environ.get(STORE_ENV):
+        return None
+    try:
+        return run_store_from_env()
+    except Exception as exc:
+        logger.warning('%s=%r is unusable (%s); finished runs stay in memory.',
+                       STORE_ENV, os.environ.get(STORE_ENV), exc)
+        return None
 
 
 def _kind_of(obj: Any) -> str:
@@ -189,7 +270,8 @@ class OrchifyManager:
     '''
 
     def __init__(self, *, enabled: Optional[bool] = None, history: Optional[int] = None,
-                 events: Optional[int] = None, sink: Optional[str] = None):
+                 events: Optional[int] = None, sink: Optional[str] = None,
+                 store: Optional[RunStore] = None):
         '''Create a manager, optionally overriding the environment.
 
         Args:
@@ -201,9 +283,13 @@ class OrchifyManager:
                 ``ORCHIFY_MANAGER_EVENTS`` (500); 0 keeps no events in memory.
             sink (Optional[str]): JSONL append path; defaults to
                 ``ORCHIFY_MANAGER_SINK``; '' disables file IO.
+            store (Optional[RunStore]): Durable run store shared with other
+                replicas; defaults to ``ORCHIFY_RUN_STORE`` and stays in-memory
+                (None) when neither is set.
         '''
         self._lock = threading.RLock()
         self._created_at = time.time()
+        self._store = store if store is not None else _default_store()
         self._enabled = _read_bool_env('ORCHIFY_MANAGER_ENABLED', True) if enabled is None else bool(enabled)
         history_capacity = (_read_int_env('ORCHIFY_MANAGER_HISTORY', DEFAULT_HISTORY)
                             if history is None else max(0, int(history)))
@@ -236,12 +322,15 @@ class OrchifyManager:
         self._sink = None
         self._sink_lock = threading.Lock()
         self._sink_written = 0
+        self._sink_dirty = False
         self._tap = None
         self._closed = False
         self._inbox: deque = deque()
         self._inbox_lock = threading.Lock()
+        self._inbox_dropped = 0
         self._start_contexts: Dict[str, dict] = {}
         self._tap_stop = threading.Event()
+        self._tap_wakeup = threading.Event()
         self._worker: Optional[threading.Thread] = None
         if self._enabled:
             self._install_tap()
@@ -303,19 +392,51 @@ class OrchifyManager:
             if worker is not None and worker.is_alive():
                 return
             self._tap_stop.clear()
+            # The tap thread clears the flag before it drains the queue, so a set
+            # flag already means "someone is awake"; checking first avoids one
+            # Event.set() (a lock plus a wakeup) per event.
+            if not self._tap_wakeup.is_set():
+                self._tap_wakeup.set()
+
             worker = threading.Thread(target=self._tap_worker,
                                       name='OrchifyManagerTap', daemon=True)
             self._worker = worker
         worker.start()
 
+    def _enqueue(self, source: str, event: Any) -> None:
+        '''Queue one event for the consumer and wake it.
+
+        The inbox is bounded: if the consumer falls behind, the newest events are
+        dropped (with a throttled warning) instead of growing without limit.
+
+        Args:
+            source (str): ``'broker'`` or ``'group'``.
+            event (Any): The event to record.
+        '''
+        dropped = False
+        with self._inbox_lock:
+            if len(self._inbox) >= MAX_INBOX:
+                self._inbox_dropped += 1
+                dropped = self._inbox_dropped == 1 or self._inbox_dropped % 1000 == 0
+            else:
+                self._inbox.append((source, event, time.time()))
+                dropped = False
+        if dropped:
+            logger.warning('OrchifyManager inbox is full (%d events); dropped %d so far.',
+                           MAX_INBOX, self._inbox_dropped)
+        self._tap_wakeup.set()
+
     def _tap_worker(self) -> None:
         '''Drain the inbox on a background thread until close() stops it.'''
         while not self._tap_stop.is_set():
+            # Clear before draining so an event enqueued during the drain wakes
+            # the wait below instead of being missed.
+            self._tap_wakeup.clear()
             try:
                 self._drain_inbox()
             except Exception as exc:
                 logger.error('Error in OrchifyManager event consumer: %s', exc)
-            self._tap_stop.wait(_poll_seconds())
+            self._tap_wakeup.wait(_poll_seconds())
 
     def _drain_inbox(self, limit: Optional[int] = None) -> int:
         '''Apply queued events to the manager state in order.
@@ -344,6 +465,10 @@ class OrchifyManager:
                 logger.error('Error in OrchifyManager event tap: %s', exc)
             if record is not None and self._sink_path:
                 self._write_sink({'record': 'event', **record})
+        if applied:
+            # One flush per drain keeps a fast event stream from paying a
+            # write syscall per record while readers still see a whole batch.
+            self._flush_sink()
         return applied
 
     def _sync(self) -> None:
@@ -388,6 +513,7 @@ class OrchifyManager:
         '''Detach the event tap and every group callback. Read APIs keep working.'''
         self._drain_inbox()
         self._tap_stop.set()
+        self._tap_wakeup.set()
         with self._lock:
             worker, self._worker = self._worker, None
         if worker is not None and worker is not threading.current_thread():
@@ -398,6 +524,13 @@ class OrchifyManager:
             for key in list(self._group_taps):
                 self._detach_group(key)
         self._close_sink()
+        if self._store is not None:
+            try:
+                self._store.close()
+            except Exception as exc:
+                logger.warning('run store %s did not close cleanly: %s',
+                               getattr(self._store, 'name', '?'), exc)
+            self._store = None
         if tap is None:
             return False
         remover = getattr(orchify_broker, 'remove_binding', None)
@@ -413,11 +546,18 @@ class OrchifyManager:
         '''Path of the JSONL sink in use ('' when disabled).'''
         return self._sink_path
 
+    @property
+    def store(self) -> Optional[RunStore]:
+        '''The durable run store in use (None when finished runs stay in memory).'''
+        return self._store
+
     def _write_sink(self, record: dict) -> None:
         '''Append one JSON object to the sink file, best-effort.
 
         Called from the event tap, so it must never raise: the first write error
-        is logged and the sink is switched off for the rest of the process.
+        is logged and the sink is switched off for the rest of the process. The
+        buffer is flushed once per drained batch (see ``_flush_sink``), not per
+        record.
 
         Args:
             record (dict): The record to append as one JSON line.
@@ -430,16 +570,32 @@ class OrchifyManager:
                 if self._sink is None:
                     self._sink = open(path, 'a', encoding='utf-8')
                 self._sink.write(json.dumps(record, ensure_ascii=False, default=str) + '\n')
-                self._sink.flush()
+                self._sink_dirty = True
                 self._sink_written += 1
         except Exception as exc:
             logger.warning('OrchifyManager sink disabled after write error: %s', exc)
             self._close_sink()
             self._sink_path = ''
 
+    def _flush_sink(self) -> None:
+        '''Push buffered sink records to disk (no-op when nothing is pending).'''
+        with self._sink_lock:
+            sink = self._sink
+            if sink is None or not self._sink_dirty:
+                return
+            try:
+                sink.flush()
+                self._sink_dirty = False
+            except Exception as exc:
+                logger.warning('OrchifyManager sink disabled after flush error: %s', exc)
+                self._sink_path = ''
+        if not self._sink_path:
+            self._close_sink()
+
     def _close_sink(self) -> None:
         with self._sink_lock:
             sink, self._sink = self._sink, None
+            self._sink_dirty = False
         if sink is not None:
             try:
                 sink.close()
@@ -560,8 +716,7 @@ class OrchifyManager:
             event_type = str(getattr(event, 'event_type', '') or '')
             if event_type in RECORD_CREATING_EVENTS:
                 self._stash_context(event)
-            with self._inbox_lock:
-                self._inbox.append(('broker', event, time.time()))
+            self._enqueue('broker', event)
         except Exception as exc:
             logger.error('Error in OrchifyManager event tap: %s', exc)
 
@@ -646,6 +801,7 @@ class OrchifyManager:
             'agent_name': str(context.get('agent_name', '') or ''),
             'agent_code': str(context.get('agent_code', '') or context.get('group_code', '') or ''),
             'mode': str(context.get('mode', '') or ''),
+            'model': str(context.get('model', '') or ''),
             'status': RUNNING,
             'started_at': context.get('started_at') or now,
             'last_event_at': now,
@@ -658,6 +814,8 @@ class OrchifyManager:
             'error': '',
             'answer': '',
             'usage': {},
+            'tokens': 0,
+            'cost_usd': 0.0,
             'stopped': False,
             'overridden': False,
             'winner': None,
@@ -697,7 +855,19 @@ class OrchifyManager:
         elif event_type == 'agent:answer':
             content = str(getattr(event, 'content', '') or '')
             if content:
-                live['answer'] = (str(live.get('answer') or '') + content)[-MAX_ANSWER:]
+                # Chunks are buffered and joined on demand: appending to the
+                # answer string copied up to ``MAX_ANSWER`` characters for every
+                # chunk of every run (a 20k-character answer streamed in 16-byte
+                # chunks copied ~32 MB). ``_answer_of`` materialises it for the
+                # readers instead.
+                parts = live.get('_answer_parts')
+                if parts is None:
+                    parts = live['_answer_parts'] = []
+                    live['_answer_len'] = 0
+                parts.append(content)
+                live['_answer_len'] = int(live.get('_answer_len') or 0) + len(content)
+                if len(parts) > 4096 or live['_answer_len'] > MAX_ANSWER:
+                    _answer_of(live)
 
     def _archive(self, live: dict, event: Any, now: float) -> None:
         payload = getattr(event, 'payload', None) or {}
@@ -717,6 +887,8 @@ class OrchifyManager:
         answer = payload.get('answer')
         if answer:
             live['answer'] = _truncate(answer, MAX_ANSWER)
+            live.pop(ANSWER_PARTS, None)
+            live[ANSWER_LEN] = 0
         self._finish_run(live, now)
 
     def _archive_error(self, live: dict, event: Any, now: float) -> None:
@@ -738,7 +910,12 @@ class OrchifyManager:
         live['elapsed'] = _elapsed(live.get('started_at'), now)
         live['active'] = False
         live['pending_approvals'] = 0
-        record = dict(live)
+        _answer_of(live)
+        record = _public_record(dict(live))
+        record['tokens'] = _usage_total(record.get('usage'))
+        record['cost_usd'] = _record_cost(record)
+        live['tokens'] = record['tokens']
+        live['cost_usd'] = record['cost_usd']
         self._runs.pop(run_id, None)
         if previous is not None and self._history.maxlen != 0:
             self._history = deque(
@@ -750,6 +927,12 @@ class OrchifyManager:
         self._add_totals(record)
         if self._sink_path:
             self._write_sink({'record': 'run', **record})
+        if self._store is not None:
+            try:
+                self._store.save(record)
+            except Exception as exc:
+                logger.warning('run store %s rejected run %s: %s',
+                               getattr(self._store, 'name', '?'), run_id, exc)
         if self._history.maxlen is not None:
             keep = {item.get('run_id') for item in self._history}
             for stale in [key for key in self._finished if key not in keep]:
@@ -769,10 +952,7 @@ class OrchifyManager:
             value = usage.get(key)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 totals[key] += value
-        budget = record.get('budget') or {}
-        cost = budget.get('cost_usd') if isinstance(budget, dict) else None
-        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-            totals['cost_usd'] += cost
+        totals['cost_usd'] += float(record.get('cost_usd') or 0.0)
 
 
     def _on_group_event(self, event: Any) -> None:
@@ -783,8 +963,7 @@ class OrchifyManager:
             run_id = str(getattr(event, 'run_id', '') or payload.get('run_id') or '')
             if event_type == 'start' and run_id:
                 self._stash_context(event, run_id)
-            with self._inbox_lock:
-                self._inbox.append(('group', event, time.time()))
+            self._enqueue('group', event)
         except Exception as exc:
             logger.error('Error in OrchifyManager group tap: %s', exc)
 
@@ -883,7 +1062,12 @@ class OrchifyManager:
         with self._lock:
             live = self._runs.get(run_id)
             finished = self._finished.get(run_id)
-            record = dict(live) if live is not None else (dict(finished) if finished is not None else None)
+            if live is not None:
+                _answer_of(live)
+            record = (dict(live) if live is not None
+                      else (dict(finished) if finished is not None else None))
+        if record is not None:
+            _public_record(record)
         if record is None:
             context = orchify_broker.get_run_context(run_id)
             if context is None:
@@ -918,7 +1102,7 @@ class OrchifyManager:
         return out
 
     def run(self, run_id: str) -> Optional[dict]:
-        '''One run by id: live if it is still registered, else its history record.'''
+        '''One run by id: live if it is still registered, else its stored record.'''
         if not run_id:
             return None
         now = self._reconcile()
@@ -931,12 +1115,26 @@ class OrchifyManager:
             record['pending_approvals'] = 0
             record['feedback_depth'] = 0
             return record
+        if self._store is not None:
+            stored = self._store.get(run_id)
+            if stored is not None:
+                return stored
         return self._live_record(run_id, now)
 
     def history(self, *, limit: Optional[int] = 50, kind: Optional[str] = None,
                 status: Optional[str] = None) -> List[dict]:
-        '''Finished runs, newest first.'''
+        '''Finished runs, newest first.
+
+        With a durable store configured the store is the source of truth, so runs
+        finished by another replica are visible too.
+        '''
         self._reconcile()
+        if self._store is not None:
+            try:
+                return self._store.list(limit=limit, kind=kind, status=status)
+            except Exception as exc:
+                logger.warning('run store %s could not list runs (%s); using memory.',
+                               getattr(self._store, 'name', '?'), exc)
         with self._lock:
             items = [dict(item) for item in reversed(self._history)]
         if kind is not None:
@@ -1280,6 +1478,7 @@ class OrchifyManager:
             'gates': gate_stats(),
             'sink': self._sink_path or None,
             'sink_records': self._sink_written,
+            'store': self._store.snapshot() if self._store is not None else None,
         }
 
     def snapshot(self, *, history_limit: int = 50, event_limit: int = 50) -> dict:
@@ -1361,8 +1560,9 @@ class OrchifyManager:
         lines.append('')
         lines.append('HISTORY (last {})'.format(history_limit))
         lines.append(_table(
-            ['run_id', 'kind', 'status', 'steps', 'elapsed', 'answer'],
+            ['run_id', 'kind', 'status', 'steps', 'tokens', 'usd', 'elapsed', 'answer'],
             [[_clip(item['run_id'], 30), item['kind'], item['status'], item['total_steps'],
+              item.get('tokens') or 0, '{:.6f}'.format(float(item.get('cost_usd') or 0.0)),
               item['elapsed'], _clip(item['answer'], 32)]
              for item in self.history(limit=history_limit)],
         ))
@@ -1372,6 +1572,8 @@ class OrchifyManager:
         totals = self.totals()
         lines.append('  runs={runs} stopped={stopped} errors={errors} steps={steps} tokens={total_tokens}'.format(**totals))
         lines.append('  prompt={prompt_tokens} completion={completion_tokens} cache_hit={prompt_cache_hit_tokens} cache_miss={prompt_cache_miss_tokens}'.format(**totals))
+        lines.append('  cost=${:.6f} (priced from the run model; unpriced models count as 0)'.format(
+            float(totals.get('cost_usd') or 0.0)))
 
         lines.append('')
         lines.append('BACKEND')

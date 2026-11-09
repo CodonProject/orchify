@@ -32,7 +32,14 @@ def _poll_interval() -> float:
 
 
 class LimitGate:
-    '''At most `limit` holders at a time (limit 0 = unlimited, no bookkeeping).'''
+    '''At most `limit` holders at a time (limit 0 = unlimited, no bookkeeping).
+
+    Waiters park on an ``asyncio.Event`` that ``release()`` sets, so a freed slot
+    is handed over immediately instead of after a poll interval. Waiting is FIFO:
+    an arriving caller may not jump the queue. When a ``stop`` callable is given
+    it is re-checked at most every ``poll`` seconds (the wait itself is still
+    event driven, so a release wakes it at once).
+    '''
 
     def __init__(self, limit: int = 0, name: str = 'gate') -> None:
         '''Create a gate.
@@ -48,6 +55,7 @@ class LimitGate:
         self._in_use = 0
         self._acquired = 0
         self._waited = 0
+        self._waiters: deque = deque()
 
     @property
     def enabled(self) -> bool:
@@ -71,7 +79,25 @@ class LimitGate:
     def would_block(self) -> bool:
         '''True when a caller arriving now would have to wait.'''
         with self._lock:
-            return self.limit > 0 and self._in_use >= self.limit
+            return self.limit > 0 and (self._in_use >= self.limit or bool(self._waiters))
+
+    def _drop_waiter_locked(self, waiter: list) -> bool:
+        '''Remove `waiter` from the queue; True when it was still queued.'''
+        for index, current in enumerate(self._waiters):
+            if current is waiter:
+                del self._waiters[index]
+                return True
+        return False
+
+    def _wake_next_locked(self) -> None:
+        '''Wake the oldest waiter so it can take a free slot (caller holds the lock).'''
+        while self._waiters:
+            loop, event = self._waiters[0]
+            try:
+                loop.call_soon_threadsafe(event.set)
+                return
+            except RuntimeError:
+                self._waiters.popleft()
 
     async def acquire(
         self,
@@ -83,8 +109,8 @@ class LimitGate:
         Args:
             stop (Optional[Callable[[], bool]]): Polled while waiting; returning True
                 gives up without taking a slot. It is not called when a slot is free.
-            poll (Optional[float]): Seconds to sleep between retries; defaults to the
-                configured poll interval.
+            poll (Optional[float]): How often ``stop`` may be re-checked while
+                waiting; defaults to the configured poll interval.
 
         Returns:
             bool: True when a slot was taken, False when ``stop`` asked to give up.
@@ -92,25 +118,52 @@ class LimitGate:
         if not self.enabled:
             return True
         interval = poll if poll is not None and poll > 0 else _poll_interval()
+        loop = asyncio.get_running_loop()
+        waiter: Optional[list] = None
         waited = False
-        while True:
-            with self._lock:
-                if self._in_use < self.limit:
-                    self._in_use += 1
-                    self._acquired += 1
-                    if waited:
-                        self._waited += 1
-                    return True
-            if stop is not None and stop():
-                return False
-            waited = True
-            await asyncio.sleep(interval)
+        try:
+            while True:
+                with self._lock:
+                    if waiter is None:
+                        waiter = [loop, asyncio.Event()]
+                        self._waiters.append(waiter)
+                    # Clear before checking so a wake-up cannot be lost between
+                    # the check and the wait below.
+                    waiter[1].clear()
+                    if self._in_use < self.limit and self._waiters[0] is waiter:
+                        self._drop_waiter_locked(waiter)
+                        self._in_use += 1
+                        self._acquired += 1
+                        if waited:
+                            self._waited += 1
+                        return True
+                waited = True
+                if stop is None:
+                    await waiter[1].wait()
+                else:
+                    try:
+                        await asyncio.wait_for(waiter[1].wait(), timeout=interval)
+                    except asyncio.TimeoutError:
+                        pass
+                    if stop():
+                        return False
+        finally:
+            if waiter is not None:
+                with self._lock:
+                    self._drop_waiter_locked(waiter)
+                    if self._in_use < self.limit:
+                        # We left the queue (with or without a slot) and there is
+                        # room left, so the next waiter must not wait for a
+                        # release() that may never come.
+                        self._wake_next_locked()
 
     def release(self) -> None:
         '''Release a slot taken by acquire() (never drops below zero).'''
         with self._lock:
             if self._in_use > 0:
                 self._in_use -= 1
+            if self._in_use < self.limit:
+                self._wake_next_locked()
 
     def stats(self) -> Dict[str, Any]:
         '''Snapshot for the manager / status output.'''
@@ -164,12 +217,26 @@ class RateLimiter:
                 return True
         return False
 
+    def _wait_time(self) -> float:
+        '''Seconds until the rolling window has room again (0 when it already has).'''
+        now = time.monotonic()
+        with self._lock:
+            self._trim(now)
+            if len(self._times) < self.per_minute:
+                return 0.0
+            return max(0.0, self._times[0] + 60.0 - now)
+
     async def acquire(
         self,
         stop: Optional[Callable[[], bool]] = None,
         poll: Optional[float] = None,
     ) -> bool:
-        '''Wait for a free slot in the window; False when `stop()` said to give up.'''
+        '''Wait for a free slot in the window; False when `stop()` said to give up.
+
+        The wait is timed to the moment the oldest request leaves the window
+        instead of re-checking every poll interval; ``poll`` only bounds how
+        often ``stop`` is looked at.
+        '''
         if not self.enabled:
             return True
         interval = poll if poll is not None and poll > 0 else _poll_interval()
@@ -178,7 +245,12 @@ class RateLimiter:
                 return True
             if stop is not None and stop():
                 return False
-            await asyncio.sleep(interval)
+            delay = self._wait_time()
+            if delay <= 0:
+                delay = interval
+            elif stop is not None:
+                delay = min(delay, interval)
+            await asyncio.sleep(delay)
 
     def stats(self) -> Dict[str, Any]:
         '''Snapshot for the manager / status output.'''

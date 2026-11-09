@@ -1,12 +1,14 @@
 from orchify.event import BaseEvent, EventFeedback, FEEDBACK_TYPES
 from orchify.utils import get_logger
+import re
 import threading as td
 import asyncio
 import uuid
 import time
 from collections import deque
 from dataclasses import dataclass
-from fnmatch import fnmatchcase
+from fnmatch import translate
+from functools import lru_cache
 from queue import Queue
 from typing import Any, Callable, Optional, Union, get_args
 
@@ -27,6 +29,73 @@ def _read_poll_interval() -> float:
 
 
 POLL_INTERVAL = _read_poll_interval()
+
+#: Characters that make an fnmatch pattern a glob instead of a literal type.
+_GLOB_CHARS = frozenset('*?[')
+
+#: Upper bound on the per-event-type candidate cache (keys are event types).
+_MAX_CANDIDATE_CACHE = 256
+
+
+@lru_cache(maxsize=512)
+def _compile_glob(pattern: str):
+    '''Compile an fnmatch pattern once, so ``emit()`` never re-translates it.
+
+    Args:
+        pattern (str): An fnmatch glob such as ``'tool:*'``.
+
+    Returns:
+        re.Pattern: The compiled pattern; call ``.match(event_type)`` on it.
+    '''
+    return re.compile(translate(pattern))
+
+
+def _set_async_event(event, loop) -> None:
+    '''Set an asyncio.Event that belongs to another thread's loop, if possible.
+
+    A closed loop (interpreter shutdown, a backend that was already stopped) must
+    not turn a bookkeeping call into an exception, so the failure is swallowed.
+
+    Args:
+        event (Optional[asyncio.Event]): The event to set; None is a no-op.
+        loop (Optional[asyncio.AbstractEventLoop]): The loop that owns ``event``.
+    '''
+    if event is None or loop is None:
+        return
+    try:
+        loop.call_soon_threadsafe(event.set)
+    except RuntimeError:
+        pass
+
+
+def _prepare_types(event_type: tuple):
+    '''Split bound event types into literals, compiled globs and a match-all flag.
+
+    Most hooks bind literal types (``'run:finish'``), which ``emit()`` can look up
+    in a dict instead of glob-matching every hook. Only patterns that actually
+    contain fnmatch metacharacters need the compiled-regex path.
+
+    Args:
+        event_type (tuple): The patterns a binding listens for.
+
+    Returns:
+        tuple: ``(literals, globs, star)`` where ``literals`` is a de-duplicated
+        tuple of exact type strings, ``globs`` a tuple of compiled patterns and
+        ``star`` is True when the binding listens for ``'*'``.
+    '''
+    literals = []
+    globs = []
+    star = False
+    for pattern in event_type:
+        if pattern == '*':
+            star = True
+        elif _GLOB_CHARS.isdisjoint(pattern):
+            if pattern not in literals:
+                literals.append(pattern)
+        else:
+            globs.append(_compile_glob(pattern))
+    return tuple(literals), tuple(globs), star
+
 
 _TERMINAL_EVENT_TYPES = ('run:finish', 'agent:abort')
 
@@ -177,10 +246,16 @@ class HookBinding:
             order.
         background (bool): True runs the hook later on the shared dispatcher, so
             a slow hook never delays the emitting run.
+        seq (int): Registration sequence, used to merge the per-type index back
+            into registration order.
+        literals (tuple[str, ...]): Event types matched by exact string.
+        globs (tuple[re.Pattern, ...]): Compiled patterns for glob event types.
+        star (bool): True when the binding listens for ``'*'`` (everything).
     '''
 
     __slots__ = ('func', 'event_type', 'run_id', 'mode', 'count', 'disposed', 'agent_name', 'match',
-                 'owner', 'plugin', 'priority', 'background')
+                 'owner', 'plugin', 'priority', 'background',
+                 'seq', 'literals', 'globs', 'star')
 
     def __init__(
         self,
@@ -207,6 +282,8 @@ class HookBinding:
         self.plugin = bool(plugin)
         self.priority = int(priority or 0)
         self.background = bool(background)
+        self.seq = 0
+        self.literals, self.globs, self.star = _prepare_types(event_type)
 
     @property
     def turn_id(self) -> Optional[str]:
@@ -238,6 +315,17 @@ class Broker:
         self.runs: dict[str, Any] = {}
         self.run_contexts: dict[str, dict] = {}
 
+        # Hook dispatch index (rebuilt from ``hooks`` whenever a binding is
+        # disposed): exact-type buckets + one glob bucket, both kept in
+        # registration order so ``emit()`` can merge them in O(matched).
+        self._hook_seq = 0
+        self._literal_index: dict[str, list[HookBinding]] = {}
+        self._glob_bindings: list[HookBinding] = []
+        self._agent_bindings: dict[str, list[HookBinding]] = {}
+        self._priority_count = 0
+        # Merged candidate list per event type; cleared with the index.
+        self._candidates_cache: dict[str, tuple] = {}
+
         self._feedback: dict[str, deque] = {}
         self._feedback_lock = td.Lock()
         self._pause_events: dict[str, asyncio.Event] = {}
@@ -245,9 +333,11 @@ class Broker:
         self._pause_lock = td.Lock()
 
         self._turn_index: dict[str, str] = {}
+        self._turns_by_run: dict[str, list] = {}
         self._turn_lock = td.Lock()
 
         self._approvals: dict[str, PendingApproval] = {}
+        self._approvals_by_run: dict[str, set] = {}
         self._approval_events: dict[str, asyncio.Event] = {}
         self._approval_loops: dict[str, Any] = {}
         self._approval_lock = td.Lock()
@@ -255,6 +345,9 @@ class Broker:
         self._emit_lock = td.RLock()
 
         self._run_done: dict[str, td.Event] = {}
+        #: ``run_id -> [(asyncio.Event, loop), ...]``; a run may be awaited from
+        #: more than one loop, so every waiter gets its own event and loop.
+        self._run_done_async: dict[str, list] = {}
         self._run_done_lock = td.Lock()
 
         self._run_outcome_limit = _read_run_outcome_limit()
@@ -419,14 +512,127 @@ class Broker:
         with self._hook_cond:
             return self._hook_pending
 
+    def _index_binding(self, binding: HookBinding) -> None:
+        '''Add one binding to the dispatch index; call it under ``_emit_lock``.
+
+        Args:
+            binding (HookBinding): The binding to index (its match rules are
+                already prepared by ``HookBinding.__init__``).
+        '''
+        self._hook_seq += 1
+        binding.seq = self._hook_seq
+        for literal in binding.literals:
+            self._literal_index.setdefault(literal, []).append(binding)
+        if binding.star or binding.globs:
+            self._glob_bindings.append(binding)
+        if binding.mode == 'agent' and binding.run_id is not None:
+            self._agent_bindings.setdefault(binding.run_id, []).append(binding)
+        if binding.priority:
+            self._priority_count += 1
+        self._candidates_cache.clear()
+
+    def _rebuild_hooks(self) -> None:
+        '''Drop disposed bindings and rebuild the dispatch index.
+
+        Called under ``_emit_lock`` only when a binding was actually disposed, so
+        the per-event path never copies the hook list.
+        '''
+        self.hooks = [b for b in self.hooks if not b.disposed]
+        self._literal_index = {}
+        self._glob_bindings = []
+        self._agent_bindings = {}
+        self._priority_count = 0
+        self._hook_seq = 0
+        self._candidates_cache.clear()
+        for binding in self.hooks:
+            self._index_binding(binding)
+
+    def _candidates_for(self, event_type: str):
+        '''Return the bindings that can match ``event_type``, in registration order.
+
+        Literal bindings come from the per-type bucket and glob bindings from the
+        wildcard bucket; a binding listed for both appears once. This is what
+        keeps ``emit()`` proportional to the hooks that can match instead of to
+        every registered hook. The common case (no wildcard bindings at all)
+        returns the literal bucket as is, without building anything.
+
+        The merged list is cached per event type: a streaming run emits the same
+        few types thousands of times, and the index only changes when a hook is
+        registered or removed (both clear the cache). Disposed bindings stay in
+        the cached list; ``_candidate_ok`` filters them out.
+
+        Args:
+            event_type (str): The emitted event type.
+
+        Returns:
+            tuple: Candidate bindings, still to be filtered by run/agent.
+        '''
+        cached = self._candidates_cache.get(event_type)
+        if cached is not None:
+            return cached
+        literals = self._literal_index.get(event_type)
+        globs = self._glob_bindings
+        if not globs:
+            result = tuple(literals or ())
+        elif not literals:
+            result = tuple(globs)
+        else:
+            merged = []
+            i = 0
+            j = 0
+            n = len(literals)
+            m = len(globs)
+            while i < n and j < m:
+                a = literals[i]
+                b = globs[j]
+                if a is b:
+                    merged.append(a)
+                    i += 1
+                    j += 1
+                elif a.seq < b.seq:
+                    merged.append(a)
+                    i += 1
+                else:
+                    merged.append(b)
+                    j += 1
+            if i < n:
+                merged.extend(literals[i:])
+            if j < m:
+                merged.extend(globs[j:])
+            result = tuple(merged)
+        if len(self._candidates_cache) > _MAX_CANDIDATE_CACHE:
+            self._candidates_cache.clear()
+        self._candidates_cache[event_type] = result
+        return result
+
     def _matches(self, binding: HookBinding, event: BaseEvent) -> bool:
+        '''True when ``event`` matches ``binding`` (pure predicate, no bookkeeping).
+
+        Args:
+            binding (HookBinding): The binding to test.
+            event (BaseEvent): The event to test against.
+
+        Returns:
+            bool: True when the hook should fire.
+        '''
+        return self._candidate_ok(binding, event, None, check_plugins=False)
+
+    def _candidate_ok(self, binding: HookBinding, event: BaseEvent,
+                      enabled_plugins, check_plugins: bool = True) -> bool:
+        '''Full match test for one candidate binding.'''
+        if binding.disposed:
+            return False
         if binding.run_id is not None and event.run_id != binding.run_id:
             return False
         if binding.agent_name is not None and event.agent_name != binding.agent_name:
             return False
-        if not any(fnmatchcase(event.event_type, t) for t in binding.event_type):
-            return False
+        if not binding.star and event.event_type not in binding.literals:
+            if not any(rx.match(event.event_type) for rx in binding.globs):
+                return False
         if binding.match is not None and not binding.match(event):
+            return False
+        if check_plugins and enabled_plugins is not None and binding.plugin \
+                and binding.owner and binding.owner not in enabled_plugins:
             return False
         return True
 
@@ -465,27 +671,30 @@ class Broker:
                 event.metadata.setdefault('run_context', ctx)
                 enabled_plugins = ctx.get('enabled_plugins')
 
+            event_type = event.event_type
             candidates = []
-            for b in self.hooks:
-                if b.disposed or not self._matches(b, event):
-                    continue
-                if enabled_plugins is not None and b.plugin and b.owner and b.owner not in enabled_plugins:
-                    continue
-                candidates.append(b)
+            for b in self._candidates_for(event_type):
+                if self._candidate_ok(b, event, enabled_plugins):
+                    candidates.append(b)
 
+            once_matched = False
             for binding in candidates:
                 binding.count += 1
                 if binding.mode == 'once':
                     binding.disposed = True
+                    once_matched = True
 
-            is_finish = event.event_type == 'run:finish'
-            self.hooks = [
-                b for b in self.hooks
-                if not b.disposed and not (is_finish and b.mode == 'agent' and b.run_id == event.run_id)
-            ]
+            is_finish = event_type == 'run:finish'
+            drop_agents = is_finish and event.run_id in self._agent_bindings
+            if drop_agents:
+                for binding in self._agent_bindings.get(event.run_id, ()):
+                    binding.disposed = True
+            if once_matched or drop_agents:
+                self._rebuild_hooks()
 
-        if any(b.priority for b in candidates):
-            candidates.sort(key=lambda b: -b.priority)
+        if self._priority_count:
+            if any(b.priority for b in candidates):
+                candidates.sort(key=lambda b: -b.priority)
         for binding in candidates:
             if binding.background:
                 self._dispatch_hook(binding, event)
@@ -533,8 +742,17 @@ class Broker:
         '''
         if run_id is None:
             run_id = turn_id
+        if mode == 'background':
+            # ``mode='background'`` predates the ``background`` flag: it was
+            # accepted here and silently ran the hook on the emitting thread,
+            # which put telemetry and persistence work in the middle of a run.
+            # Keep the spelling working, but route it through the dispatcher.
+            mode = 'normal'
+            background = True
         if not callable(hook):
             raise ValueError(f'Hook must be callable, got {type(hook)}')
+        if mode not in ('normal', 'once', 'agent'):
+            raise ValueError(f"mode must be 'normal', 'once', 'agent' or 'background', got {mode!r}")
         if mode == 'agent' and run_id is None:
             raise ValueError("Hook mode 'agent' requires a run_id so it can be destroyed on that run's finish.")
         if match is not None and not callable(match):
@@ -547,6 +765,7 @@ class Broker:
                               background=background)
         with self._emit_lock:
             self.hooks.append(binding)
+            self._index_binding(binding)
         return binding
 
     def remove_hooks(self, owner: str) -> int:
@@ -559,10 +778,13 @@ class Broker:
             int: Number of bindings removed.
         '''
         with self._emit_lock:
+            doomed = [b for b in self.hooks if b.owner == owner]
+            if not doomed:
+                return 0
             kept = [b for b in self.hooks if b.owner != owner]
-            removed = len(self.hooks) - len(kept)
             self.hooks = kept
-        return removed
+            self._rebuild_hooks()
+        return len(doomed)
 
     def remove_binding(self, binding: HookBinding) -> bool:
         '''Dispose and remove one hook binding.
@@ -578,12 +800,12 @@ class Broker:
             bool: True when the binding was present and removed.
         '''
         with self._emit_lock:
-            removed = False
-            if binding in self.hooks:
-                self.hooks.remove(binding)
-                removed = True
-        binding.disposed = True
-        return removed
+            if binding not in self.hooks:
+                binding.disposed = True
+                return False
+            binding.disposed = True
+            self._rebuild_hooks()
+        return True
 
     def hook(
         self,
@@ -697,6 +919,9 @@ class Broker:
             return
         with self._turn_lock:
             self._turn_index[turn_id] = run_id
+            turns = self._turns_by_run.setdefault(run_id, [])
+            if turn_id not in turns:
+                turns.append(turn_id)
 
     def run_id_of_turn(self, turn_id: str) -> Optional[str]:
         '''Resolve a turn_id (or a run_id, for convenience) to its run_id.'''
@@ -778,11 +1003,14 @@ class Broker:
             fb = EventFeedback(ftype='control:resume', payload=payload)
             with self._feedback_lock:
                 self._feedback.setdefault(target, deque()).append(fb)
+            self._wake_run_waiters(target)
             return True
 
         fb = EventFeedback(ftype=ftype, payload=payload)
         with self._feedback_lock:
             self._feedback.setdefault(target, deque()).append(fb)
+        if ftype == 'control:stop':
+            self._wake_run_waiters(target)
         return True
 
     def drain_feedback(self, run_id: str, types: Optional[set] = None) -> list:
@@ -900,9 +1128,15 @@ class Broker:
                     return 'stopped'
                 if event.is_set():
                     return 'resumed'
-                if deadline is not None and time.monotonic() >= deadline:
+                remaining = None
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return 'timeout'
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
                     return 'timeout'
-                await asyncio.sleep(POLL_INTERVAL)
         finally:
             with self._pause_lock:
                 if self._pause_events.get(run_id) is event:
@@ -917,6 +1151,28 @@ class Broker:
             return False
         loop.call_soon_threadsafe(event.set)
         return True
+
+    def _wake_run_waiters(self, run_id: str) -> None:
+        '''Wake every coroutine parked on a run: its pause wait and its approvals.
+
+        Queued feedback (``control:stop`` above all) has to interrupt a parked
+        waiter immediately; without this wake-up the waiter could only notice the
+        feedback on its next poll. Callers must queue the feedback *before*
+        calling this, since a waiter that wakes up re-reads the queue first.
+
+        Args:
+            run_id (str): The run whose waiters should be re-checked.
+        '''
+        with self._pause_lock:
+            pause_event = self._pause_events.get(run_id)
+            pause_loop = self._pause_loops.get(run_id)
+        _set_async_event(pause_event, pause_loop)
+
+        with self._approval_lock:
+            waiters = [(self._approval_events.get(aid), self._approval_loops.get(aid))
+                       for aid in tuple(self._approvals_by_run.get(run_id, ()))]
+        for approval_event, approval_loop in waiters:
+            _set_async_event(approval_event, approval_loop)
 
 
     def request_approval(
@@ -972,6 +1228,7 @@ class Broker:
         )
         with self._approval_lock:
             self._approvals[approval.approval_id] = approval
+            self._approvals_by_run.setdefault(run_id, set()).add(approval.approval_id)
         return approval
 
     def get_approval(self, approval_id: str) -> Optional[PendingApproval]:
@@ -1039,9 +1296,19 @@ class Broker:
             loop = self._approval_loops.pop(approval_id, None)
             if remove:
                 self._approvals.pop(approval_id, None)
+                self._forget_approval_locked(approval)
         if event is not None and loop is not None:
             loop.call_soon_threadsafe(event.set)
         return True
+
+    def _forget_approval_locked(self, approval: PendingApproval) -> None:
+        '''Drop an approval id from its run's index; call under ``_approval_lock``.'''
+        ids = self._approvals_by_run.get(approval.run_id)
+        if ids is None:
+            return
+        ids.discard(approval.approval_id)
+        if not ids:
+            self._approvals_by_run.pop(approval.run_id, None)
 
     def approve(self, approval_id: str, *, reason: str = '', remove: bool = False) -> bool:
         '''Convenience wrapper: accept a pending approval.'''
@@ -1120,6 +1387,7 @@ class Broker:
             loop = self._approval_loops.pop(approval_id, None)
             if remove:
                 self._approvals.pop(approval_id, None)
+                self._forget_approval_locked(approval)
         if event is not None and loop is not None:
             loop.call_soon_threadsafe(event.set)
         return True
@@ -1138,7 +1406,11 @@ class Broker:
     def release_approval(self, approval_id: str) -> bool:
         '''Drop an approval from the pool (used to clean up after a task ends).'''
         with self._approval_lock:
-            return self._approvals.pop(approval_id, None) is not None
+            approval = self._approvals.pop(approval_id, None)
+            if approval is None:
+                return False
+            self._forget_approval_locked(approval)
+            return True
 
     async def wait_approval(
         self,
@@ -1189,11 +1461,19 @@ class Broker:
                 if run_id and self.pop_feedback(run_id, {'control:stop'}) is not None:
                     self.resolve_approval(approval_id, False, reason='run stopped')
                     raise RunStopped(f'Run stopped while awaiting approval {approval_id!r}.')
-                if deadline is not None and time.monotonic() >= deadline:
+                remaining = None
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
                     raise ApprovalTimeout(
                         f'Approval {approval_id!r} ({approval.tool_name or approval.kind}) '
                         f'not resolved within {timeout}s.')
-                await asyncio.sleep(POLL_INTERVAL)
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    raise ApprovalTimeout(
+                        f'Approval {approval_id!r} ({approval.tool_name or approval.kind}) '
+                        f'not resolved within {timeout}s.')
         finally:
             with self._approval_lock:
                 if self._approval_events.get(approval_id) is event:
@@ -1234,33 +1514,37 @@ class Broker:
         if run_id in self.run_contexts:
             del self.run_contexts[run_id]
         with self._turn_lock:
-            for tid in [t for t, r in self._turn_index.items() if r == run_id]:
-                self._turn_index.pop(tid, None)
+            for tid in self._turns_by_run.pop(run_id, ()):
+                if self._turn_index.get(tid) == run_id:
+                    self._turn_index.pop(tid, None)
         with self._feedback_lock:
             self._feedback.pop(run_id, None)
         with self._pause_lock:
             event = self._pause_events.pop(run_id, None)
             loop = self._pause_loops.pop(run_id, None)
-        if event is not None and loop is not None:
-            loop.call_soon_threadsafe(event.set)
+        _set_async_event(event, loop)
         with self._approval_lock:
-            stale = [aid for aid, a in self._approvals.items() if a.run_id == run_id]
+            stale = list(self._approvals_by_run.pop(run_id, ()))
+            waiters = []
             for aid in stale:
                 self._approvals.pop(aid, None)
-            waiters = [(aid, self._approval_events.pop(aid, None),
-                        self._approval_loops.pop(aid, None)) for aid in stale]
-        for _aid, a_event, a_loop in waiters:
-            if a_event is not None and a_loop is not None:
-                a_loop.call_soon_threadsafe(a_event.set)
+                waiters.append((self._approval_events.pop(aid, None),
+                                self._approval_loops.pop(aid, None)))
+        for a_event, a_loop in waiters:
+            _set_async_event(a_event, a_loop)
         with self._run_done_lock:
             done = self._run_done.get(run_id)
             if done is not None:
                 done.set()
+            async_waiters = self._run_done_async.pop(run_id, ())
             if len(self._run_done) > _MAX_REMEMBERED_RUNS:
                 for rid in [r for r, ev in self._run_done.items() if ev.is_set()]:
                     if len(self._run_done) <= _MAX_REMEMBERED_RUNS:
                         break
                     self._run_done.pop(rid, None)
+                    self._run_done_async.pop(rid, None)
+        for async_event, async_loop in async_waiters:
+            _set_async_event(async_event, async_loop)
 
     def is_run_active(self, run_id: str) -> bool:
         '''True while `run_id` is registered (its run has not finished).'''
@@ -1294,10 +1578,10 @@ class Broker:
     async def await_run(self, run_id: str, timeout: Optional[float] = None) -> bool:
         '''Await a run without blocking the calling thread.
 
-        The completion flag is a thread event, so it is polled with
-        ``asyncio.sleep`` from the caller's loop instead of a blocking wait. Use
-        this from async code (``await`` a group's members) and ``wait_run`` from
-        synchronous code.
+        The completion flag is a thread event, but ``finish_task()`` also sets a
+        per-run ``asyncio.Event`` owned by the caller's loop, so awaiting a run
+        costs nothing until it finishes. Use this from async code (``await`` a
+        group's members) and ``wait_run`` from synchronous code.
 
         Args:
             run_id (str): The run id.
@@ -1307,16 +1591,37 @@ class Broker:
             bool: True when the run is finished (including one that had already
             finished), False for an unknown run id or on timeout.
         '''
+        loop = asyncio.get_running_loop()
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
-            event = self.run_done_event(run_id)
-            if event is None:
-                return False
-            if event.is_set():
+            with self._run_done_lock:
+                thread_event = self._run_done.get(run_id)
+                if thread_event is None:
+                    return False
+                if thread_event.is_set():
+                    return True
+                entry = (asyncio.Event(), loop)
+                self._run_done_async.setdefault(run_id, []).append(entry)
+            try:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                try:
+                    await asyncio.wait_for(entry[0].wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return False
+            finally:
+                with self._run_done_lock:
+                    waiters = self._run_done_async.get(run_id)
+                    if waiters is not None:
+                        try:
+                            waiters.remove(entry)
+                        except ValueError:
+                            pass
+                        if not waiters:
+                            self._run_done_async.pop(run_id, None)
+            if entry[0].is_set():
                 return True
-            if deadline is not None and time.monotonic() >= deadline:
-                return False
-            await asyncio.sleep(POLL_INTERVAL)
 
 
 orchify_broker = Broker()

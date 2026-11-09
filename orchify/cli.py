@@ -19,6 +19,8 @@ STATUS_TEXT = {PASS: 'ok', WARN: 'warn', FAIL: 'fail'}
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_MISSING_KEY = 2
+#: Alias used by the commands that only report ``ok``/``error`` (runs, plugins, mcp).
+EXIT_ERROR = EXIT_FAILED
 
 
 class _Report:
@@ -446,6 +448,407 @@ def _demo_live() -> int:
     return EXIT_OK
 
 
+def _runs(sink: str = '', limit: int = 20, as_json: bool = False) -> int:
+    '''Print finished runs with their token usage and cost.
+
+    Without ``--sink`` this reads the in-process manager, which is only useful
+    from inside a running application; with ``--sink`` it reads a JSONL file
+    written by ``ORCHIFY_MANAGER_SINK``, which is the usual way to inspect a
+    finished server.
+
+    Args:
+        sink (str): Path of a JSONL sink file; empty means the live manager.
+        limit (int): How many of the newest runs to show.
+        as_json (bool): Print JSON instead of a table.
+
+    Returns:
+        int: :data:`EXIT_OK`, or :data:`EXIT_ERROR` when the sink is unreadable.
+    '''
+    from .manager import orchify_manager, read_sink
+
+    limit = max(1, int(limit))
+    if sink:
+        records = read_sink(sink, kinds=('run',))
+        if not records:
+            print(f'No finished runs in {sink!r} (missing, empty or never finished).')
+            return EXIT_ERROR
+        rows = [record for record in records if record.get('finished_at')][-limit:]
+    else:
+        rows = orchify_manager.history(limit=limit)
+
+    if as_json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+        return EXIT_OK
+    if not rows:
+        print('No finished runs yet.')
+        return EXIT_OK
+
+    headers = ['run_id', 'kind', 'status', 'steps', 'tokens', 'usd', 'model', 'name']
+    widths = {header: len(header) for header in headers}
+    cells: List[List[str]] = []
+    for record in rows:
+        row = [
+            str(record.get('run_id') or ''),
+            str(record.get('kind') or ''),
+            str(record.get('status') or ''),
+            str(record.get('total_steps') or 0),
+            str(record.get('tokens') or 0),
+            '{:.6f}'.format(float(record.get('cost_usd') or 0.0)),
+            str(record.get('model') or ''),
+            str(record.get('name') or ''),
+        ]
+        cells.append(row)
+        for header, value in zip(headers, row):
+            widths[header] = max(widths[header], len(value))
+    print('  '.join(header.ljust(widths[header]) for header in headers))
+    for row in cells:
+        print('  '.join(value.ljust(widths[header]) for header, value in zip(headers, row)))
+    total = sum(float(record.get('cost_usd') or 0.0) for record in rows)
+    print(f'{len(rows)} run(s), ${total:.6f} total (unpriced models count as 0)')
+    return EXIT_OK
+
+
+def _plugins(group: str = '', as_json: bool = False, load: bool = False) -> int:
+    '''List installed plugin entry points and the registered plugins.
+
+    Args:
+        group (str): Entry point group to inspect; empty means the default group.
+        as_json (bool): Print JSON instead of text.
+        load (bool): Also import and load every entry point plugin.
+
+    Returns:
+        int: :data:`EXIT_OK`, or :data:`EXIT_ERROR` when a plugin fails to load.
+    '''
+    from .plugin_manager import ENTRY_POINT_GROUP, PluginError, orchify_plugins
+
+    group = group or ENTRY_POINT_GROUP
+    entries = orchify_plugins.entry_points(group)
+    error = ''
+    if load:
+        try:
+            orchify_plugins.load_entry_points(group)
+        except PluginError as exc:
+            error = str(exc)
+    registered = sorted(orchify_plugins.registered())
+    if as_json:
+        payload = {
+            'group': group,
+            'entry_points': entries,
+            'registered': registered,
+            'error': error,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return EXIT_ERROR if error else EXIT_OK
+
+    print(f'entry point group: {group}')
+    if not entries:
+        print('  (none installed - pip install orchify-plugin-<name> to advertise one)')
+    for item in entries:
+        print('  {:<24} {}'.format(item.get('name', ''), item.get('value', '')))
+    print(f'registered plugins: {len(registered)}')
+    for name in registered:
+        print(f'  {name}')
+    if error:
+        print(f'error: {error}')
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+def _mcp(setup: str = '', agent_name: str = 'orchify', expose: str = 'agent',
+         name: str = 'orchify', tool_prefix: str = '') -> int:
+    '''Serve an agent over MCP on stdio, for Claude Desktop and other clients.
+
+    Args:
+        setup (str): Python file that defines ``agent`` and/or ``tools``.
+        agent_name (str): Agent name used when ``--setup`` is not given.
+        expose (str): ``agent``, ``tools`` or ``both``.
+        name (str): MCP server name reported during ``initialize``.
+        tool_prefix (str): Prefix applied to exposed agent tool names.
+
+    Returns:
+        int: :data:`EXIT_ERROR` when the setup file cannot be imported, otherwise
+        the process keeps running as a server until stdin reaches EOF.
+    '''
+    from .mcp_server import serve_stdio
+
+    agent = None
+    tools = None
+    if setup:
+        module = _load_setup_file(setup)
+        if module is None:
+            return EXIT_ERROR
+        agent = getattr(module, 'agent', None)
+        tools = getattr(module, 'tools', None) or None
+    if agent is None and not tools:
+        from .agent import Agent
+        try:
+            agent = Agent.from_env(name=agent_name)
+        except Exception as exc:
+            print(f'Cannot build an agent: {exc}')
+            print('Pass --setup FILE with an "agent" or "tools" object, or set the API env vars.')
+            return EXIT_ERROR
+    try:
+        serve_stdio(agent, tools=tools, expose=expose, name=name, tool_prefix=tool_prefix)
+    except KeyboardInterrupt:
+        return EXIT_OK
+    return EXIT_OK
+
+
+def _serve(host: str = '127.0.0.1', port: int = 8010, setup: str = '',
+           agent_name: str = 'orchify', keys: str = '', sessions: int = 32,
+           tokens: int = 0, cost: float = 0.0) -> int:
+    '''Serve the HTTP API (``orchify/server.py``) with uvicorn.
+
+    Args:
+        host (str): Bind address.
+        port (int): Bind port.
+        setup (str): Python file that defines ``agent``, ``agent_factory`` or
+            ``tools``.
+        agent_name (str): Agent name used when the section above supplies none.
+        keys (str): Comma-separated API keys; defaults to ``ORCHIFY_API_KEYS``.
+        sessions (int): How many conversations the session pool keeps alive.
+
+    Returns:
+        int: :data:`EXIT_OK` on a clean shutdown, :data:`EXIT_ERROR` when the
+        server cannot start (FastAPI missing, unusable setup file).
+    '''
+    try:
+        from .server import create_app, serve
+    except ImportError as exc:
+        print(f'Cannot start the API server: {exc}')
+        return EXIT_ERROR
+    from .agent import Agent
+
+    factory = None
+    agent = None
+    tools = None
+    if setup:
+        module = _load_setup_file(setup)
+        if module is None:
+            return EXIT_ERROR
+        factory = getattr(module, 'agent_factory', None)
+        agent = getattr(module, 'agent', None)
+        tools = getattr(module, 'tools', None) or None
+    if factory is None:
+        if agent is not None:
+            factory = lambda session, _agent=agent: _agent  # noqa: E731
+        elif tools:
+            factory = lambda session, _tools=list(tools): Agent.from_env(  # noqa: E731
+                name=session, tools=_tools)
+        else:
+            factory = lambda session: Agent.from_env(name=session)  # noqa: E731
+    api_keys = [part.strip() for part in (keys or '').split(',') if part.strip()]
+    quota = None
+    if tokens or cost:
+        from .server import Quota
+        quota = Quota(max_concurrent=int(os.environ.get('ORCHIFY_MAX_CONCURRENT_RUNS', '0') or 0),
+                      max_per_window=int(os.environ.get('ORCHIFY_SESSION_RUNS', '0') or 0),
+                      window=float(os.environ.get('ORCHIFY_SESSION_WINDOW', '60') or 60),
+                      max_tokens=tokens, max_cost=cost)
+    app = create_app(agent_factory=factory, api_keys=api_keys or None,
+                     session_capacity=max(1, int(sessions)), quota=quota,
+                     title='Orchify API')
+    print(f'orchify serve: http://{host}:{port} (Ctrl+C to stop)')
+    try:
+        serve(app, host=host, port=port)
+    except KeyboardInterrupt:
+        return EXIT_OK
+    return EXIT_OK
+
+
+_CHAT_HELP = '''Commands:
+  /help     show this help
+  /reset    forget the conversation history
+  /status   print the manager status as JSON
+  /report   print the manager report
+  /runs     list the five most recent runs
+  /stop     ask the current run to stop
+  /quit     leave the chat'''
+
+
+def _chat(setup: str = '', agent_name: str = 'orchify', prompt: str = '',
+          max_steps: int = 8, agent: Optional[Any] = None) -> int:
+    '''Talk to an agent in the terminal.
+
+    Args:
+        setup (str): Python file that defines ``agent`` and/or ``tools``.
+        agent_name (str): Agent name used when ``--setup`` is not given.
+        prompt (str): Run one task and exit instead of starting a REPL.
+        max_steps (int): Step budget per message.
+        agent (Optional[Any]): Pre-built agent, mainly for tests.
+
+    Returns:
+        int: :data:`EXIT_OK`, :data:`EXIT_MISSING_KEY` without credentials, or
+        :data:`EXIT_ERROR` when the agent or setup file cannot be built.
+    '''
+    from .agent import Agent
+    from .errors import MissingCredentials
+
+    if agent is None:
+        tools = None
+        if setup:
+            module = _load_setup_file(setup)
+            if module is None:
+                return EXIT_ERROR
+            agent = getattr(module, 'agent', None)
+            tools = getattr(module, 'tools', None) or None
+        if agent is None:
+            try:
+                agent = Agent.from_env(name=agent_name, tools=tools)
+            except Exception as exc:
+                print(f'Cannot build an agent: {exc}')
+                print('Pass --setup FILE with an "agent" or "tools" object, or set the API env vars.')
+                return EXIT_ERROR
+
+    if prompt:
+        try:
+            print(agent.ask(prompt, max_steps=max_steps))
+        except MissingCredentials as exc:
+            print(f'Missing credentials: {exc}')
+            return EXIT_MISSING_KEY
+        except Exception as exc:
+            print(f'error: {type(exc).__name__}: {exc}')
+            return EXIT_ERROR
+        return EXIT_OK
+
+    print(f'{agent.name} ready (model {getattr(agent, "model", "?")}). '
+          f'/help for commands, /quit to leave.')
+    while True:
+        try:
+            line = input('you> ')
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        text = line.strip()
+        if not text:
+            continue
+        if text in ('/quit', '/exit'):
+            break
+        if text == '/help':
+            print(_CHAT_HELP)
+            continue
+        if text == '/reset':
+            agent.reset()
+            print('history cleared')
+            continue
+        if text == '/status':
+            from .api import status
+            print(json.dumps(status(), ensure_ascii=False, indent=2, default=str))
+            continue
+        if text == '/report':
+            from .api import report
+            print(report())
+            continue
+        if text == '/runs':
+            from .manager import orchify_manager
+            rows = orchify_manager.history(limit=5)
+            if not rows:
+                print('no finished runs yet')
+            for row in rows:
+                print(f"{row.get('run_id')}  {row.get('status')}  "
+                      f"{row.get('total_steps')} step(s)  ${row.get('cost_usd', 0):.6f}")
+            continue
+        if text == '/stop':
+            print('stop requested' if agent.cancel() else 'no live run')
+            continue
+
+        try:
+            print(agent.ask(text, max_steps=max_steps))
+        except MissingCredentials as exc:
+            print(f'Missing credentials: {exc}')
+            return EXIT_MISSING_KEY
+        except KeyboardInterrupt:
+            return EXIT_OK
+        except Exception as exc:
+            print(f'error: {type(exc).__name__}: {exc}')
+    return EXIT_OK
+
+
+def _eval(data: str = '', setup: str = '', agent_name: str = 'orchify',
+          scorer: str = 'contains', max_steps: int = 8,
+          as_json: bool = False, agent: Optional[Any] = None) -> int:
+    '''Run an evaluation dataset and print the score.
+
+    Args:
+        data (str): Dataset file (JSON array or JSONL).
+        setup (str): Python file that defines an ``agent`` and/or ``tools``.
+        agent_name (str): Agent name used when ``--setup`` is not given.
+        scorer (str): ``contains``, ``exact``, ``json`` or ``regex``.
+        max_steps (int): Step budget per case.
+        as_json (bool): Print the summary as JSON instead of a table.
+        agent (Optional[Any]): Pre-built agent, mainly for tests.
+
+    Returns:
+        int: :data:`EXIT_OK` when every case passed, :data:`EXIT_FAILED`
+        otherwise, :data:`EXIT_ERROR` when the dataset or agent is unusable.
+    '''
+    from .eval import EvalError, load_dataset, run_dataset
+
+    try:
+        cases = load_dataset(data)
+    except EvalError as exc:
+        print(exc)
+        return EXIT_ERROR
+    if not cases:
+        print(f'{data!r} has no cases.')
+        return EXIT_ERROR
+
+    factory = None
+    if agent is None:
+        if setup:
+            module = _load_setup_file(setup)
+            if module is None:
+                return EXIT_ERROR
+            agent = getattr(module, 'agent', None)
+            factory = getattr(module, 'agent_factory', None)
+            tools = getattr(module, 'tools', None) or None
+            if agent is None and factory is None:
+                from .agent import Agent
+                fixed = tools
+                factory = lambda case, _tools=fixed: Agent.from_env(  # noqa: E731
+                    name=agent_name, tools=list(_tools or []))
+        if agent is None and factory is None:
+            from .agent import Agent
+            agent = Agent.from_env(name=agent_name)
+
+    from .eval import EvalError as _EvalError
+    try:
+        report = run_dataset(cases, agent=agent, agent_factory=factory,
+                             scorer=scorer, max_steps=max_steps)
+    except _EvalError as exc:
+        print(exc)
+        return EXIT_ERROR
+    if as_json:
+        print(json.dumps(report.summary(), ensure_ascii=False, indent=2))
+    else:
+        print(report.render())
+    return EXIT_OK if report.passed == len(report) else EXIT_FAILED
+
+
+def _load_setup_file(path: str) -> Optional[object]:
+    '''Import a Python file that supplies an agent or a list of tools.
+
+    Args:
+        path (str): File to execute.
+
+    Returns:
+        Optional[object]: The imported module, or None when it cannot be loaded.
+    '''
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location('orchify_mcp_setup', path)
+    if spec is None or spec.loader is None:
+        print(f'Cannot import setup file: {path}')
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        print(f'Setup file {path} failed: {type(exc).__name__}: {exc}')
+        return None
+    return module
+
+
 def _version() -> int:
     '''Print the orchify and interpreter versions.
 
@@ -470,6 +873,46 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor.add_argument('--json', action='store_true', help='print the report as JSON')
     demo = commands.add_parser('demo', help='run a short walkthrough of agents, tools and approvals')
     demo.add_argument('--live', action='store_true', help='use the provider from the environment')
+    runs = commands.add_parser('runs', help='list finished runs with token usage and cost')
+    runs.add_argument('--sink', default='', help='JSONL sink file to read (default: the live manager)')
+    runs.add_argument('--limit', type=int, default=20, help='how many of the newest runs to show')
+    runs.add_argument('--json', action='store_true', help='print the records as JSON')
+    evaluate = commands.add_parser('eval', help='run an evaluation dataset through an agent')
+    evaluate.add_argument('--data', required=True, help='dataset file (JSON array or JSONL)')
+    evaluate.add_argument('--setup', default='', help='Python file defining an "agent" and/or "tools" object')
+    evaluate.add_argument('--agent', default='orchify', help='agent name used when --setup is not given')
+    evaluate.add_argument('--scorer', default='contains',
+                          choices=['contains', 'exact', 'json', 'regex'],
+                          help='how answers are scored (default: contains)')
+    evaluate.add_argument('--max-steps', type=int, default=8, help='step budget per case')
+    evaluate.add_argument('--json', action='store_true', help='print the summary as JSON')
+    plugins = commands.add_parser('plugins', help='list plugin entry points and registered plugins')
+    plugins.add_argument('--group', default='', help='entry point group (default: orchify.plugins)')
+    plugins.add_argument('--json', action='store_true', help='print the report as JSON')
+    plugins.add_argument('--load', action='store_true', help='also import and load every entry point plugin')
+    mcp = commands.add_parser('mcp', help='serve an agent over MCP on stdio (for Claude Desktop and other clients)')
+    mcp.add_argument('--setup', default='', help='Python file defining an "agent" and/or "tools" object')
+    mcp.add_argument('--agent', default='orchify', help='agent name used when --setup is not given')
+    mcp.add_argument('--expose', choices=['agent', 'tools', 'both'], default='agent',
+                     help='what to expose: the whole agent as "ask", its tools, or both')
+    mcp.add_argument('--name', default='orchify', help='server name reported during initialize')
+    mcp.add_argument('--tool-prefix', default='', help='prefix applied to exposed agent tool names')
+    serve = commands.add_parser('serve', help='serve the HTTP API with uvicorn')
+    serve.add_argument('--host', default='127.0.0.1', help='bind address (default: 127.0.0.1)')
+    serve.add_argument('--port', type=int, default=8010, help='bind port (default: 8010)')
+    serve.add_argument('--setup', default='', help='Python file defining "agent", "agent_factory" and/or "tools"')
+    serve.add_argument('--agent', default='orchify', help='agent name used when --setup supplies none')
+    serve.add_argument('--keys', default='', help='comma-separated API keys (default: ORCHIFY_API_KEYS)')
+    serve.add_argument('--sessions', type=int, default=32, help='conversations kept in the session pool')
+    serve.add_argument('--tokens', type=int, default=0,
+                       help='token budget per session (default: ORCHIFY_SESSION_TOKENS or unlimited)')
+    serve.add_argument('--cost', type=float, default=0.0,
+                       help='USD budget per session (default: ORCHIFY_SESSION_COST or unlimited)')
+    chat = commands.add_parser('chat', help='talk to an agent in the terminal')
+    chat.add_argument('--setup', default='', help='Python file defining an "agent" and/or "tools" object')
+    chat.add_argument('--agent', default='orchify', help='agent name used when --setup is not given')
+    chat.add_argument('--prompt', default='', help='run one task and exit instead of starting a REPL')
+    chat.add_argument('--max-steps', type=int, default=8, help='step budget per message (default: 8)')
     commands.add_parser('version', help='print the orchify and Python versions')
     return parser
 
@@ -492,6 +935,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _doctor(live=args.live, as_json=args.json)
     if args.command == 'demo':
         return _demo_live() if args.live else _demo_offline()
+    if args.command == 'runs':
+        return _runs(sink=args.sink, limit=args.limit, as_json=args.json)
+    if args.command == 'plugins':
+        return _plugins(group=args.group, as_json=args.json, load=args.load)
+    if args.command == 'mcp':
+        return _mcp(setup=args.setup, agent_name=args.agent, expose=args.expose,
+                    name=args.name, tool_prefix=args.tool_prefix)
+    if args.command == 'serve':
+        return _serve(host=args.host, port=args.port, setup=args.setup,
+                      agent_name=args.agent, keys=args.keys, sessions=args.sessions,
+                      tokens=args.tokens, cost=args.cost)
+    if args.command == 'eval':
+        return _eval(data=args.data, setup=args.setup, agent_name=args.agent,
+                     scorer=args.scorer, max_steps=args.max_steps, as_json=args.json)
+    if args.command == 'chat':
+        return _chat(setup=args.setup, agent_name=args.agent, prompt=args.prompt,
+                     max_steps=args.max_steps)
     if args.command == 'version':
         return _version()
     parser.print_help()

@@ -72,6 +72,7 @@ class Plugin:
             self.scope = self.scope.__func__
         self._bindings: list = []
         self._tools: List[Tool] = []
+        self._middlewares: list = []
         self._attached_agents: Set[Any] = set()
         self._llm = None
 
@@ -297,6 +298,26 @@ class Plugin:
             self._attached_agents.add(agent)
         return tool
 
+    def bind(self, agent) -> Any:
+        '''Attach this plugin to an Agent: tools, middleware, model.
+
+        Calling it also installs any middleware registered through
+        :meth:`middleware` on the agent's LLM, which is what makes deferred
+        installations work for agents that build their own LLM.
+
+        Args:
+            agent (Agent): The agent to bind to.
+
+        Returns:
+            Any: The same agent, for chaining.
+        '''
+        self._attached_agents.add(agent)
+        llm = getattr(agent, 'llm', None)
+        if llm is not None:
+            for mw in list(self._middlewares):
+                self._install_middleware(llm, mw)
+        return agent
+
     def attach_tools(self, agent, replace: bool = True) -> Any:
         '''Attach every tool this plugin owns to the given Agent.'''
         for t in self._tools:
@@ -316,7 +337,9 @@ class Plugin:
 
         The middleware is installed on the given LLM (or on the plugin's attached
         agents' LLM) with ``owner`` set to this plugin's id, so per-agent plugin
-        filtering skips it while the plugin is disabled.
+        filtering skips it while the plugin is disabled. Installations are
+        remembered: :meth:`bind` replays them onto an agent's own LLM, and
+        :meth:`cleanup` removes them again.
 
         Args:
             mw (Union[Middleware, Callable]): Middleware instance, or a plain
@@ -330,14 +353,69 @@ class Plugin:
             from orchify.llm.base import _FuncMiddleware
             mw = _FuncMiddleware(mw)
         mw.owner = self.id
+        if all(existing is not mw for existing in self._middlewares):
+            self._middlewares.append(mw)
         if llm is not None:
-            llm.use(mw, scope=self.scope)
+            self._install_middleware(llm, mw)
             return
         for agent in list(self._attached_agents):
-            agent.llm.use(mw, scope=self.scope)
+            self._install_middleware(getattr(agent, 'llm', None), mw)
         if not self._attached_agents:
             self.log('middleware deferred: no llm available (configure the manager '
                      'with an llm or attach your plugin to an agent)')
+
+    def _install_middleware(self, llm, mw) -> bool:
+        '''Install ``mw`` on ``llm`` once.
+
+        Args:
+            llm (Optional[LLMInterface]): Target LLM; None is a no-op.
+            mw (Middleware): The middleware to install.
+
+        Returns:
+            bool: True when the LLM already had it or it was just added.
+        '''
+        if llm is None:
+            return False
+        middlewares = getattr(llm, 'middlewares', None)
+        if middlewares is None:
+            return False
+        if any(existing is mw for existing in middlewares):
+            return True
+        llm.use(mw, scope=self.scope)
+        return True
+
+    def _detach_middleware(self, mw=None) -> int:
+        '''Remove one middleware (or all of them) from every LLM this plugin used.
+
+        Args:
+            mw (Optional[Middleware]): Middleware to remove; None removes every
+                middleware this plugin registered.
+
+        Returns:
+            int: How many entries were removed.
+        '''
+        targets = []
+        if self._llm is not None:
+            targets.append(self._llm)
+        for agent in list(self._attached_agents):
+            llm = getattr(agent, 'llm', None)
+            if llm is not None and all(llm is not existing for existing in targets):
+                targets.append(llm)
+        doomed = [mw] if mw is not None else list(self._middlewares)
+        removed = 0
+        for llm in targets:
+            current = getattr(llm, 'middlewares', None)
+            if not current:
+                continue
+            kept = [item for item in current if all(item is not expired for expired in doomed)]
+            if len(kept) != len(current):
+                removed += len(current) - len(kept)
+                llm.middlewares = kept
+        if mw is None:
+            self._middlewares.clear()
+        else:
+            self._middlewares = [item for item in self._middlewares if item is not mw]
+        return removed
 
     def log(self, msg: str) -> None:
         '''Namespaced logging with this plugin's id.'''
@@ -383,10 +461,11 @@ class Plugin:
 
 
     def cleanup(self) -> None:
-        '''Full teardown: lifecycle, hooks, tools. Called by the PluginManager.'''
+        '''Full teardown: lifecycle, middleware, hooks, tools. Called by the PluginManager.'''
         if self.loaded:
             self._run_lifecycle('on_unload')
             self.loaded = False
+        self._detach_middleware()
         self.broker.remove_hooks(self.id)
         self.detach_tools()
         self._bindings.clear()

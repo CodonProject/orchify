@@ -1,7 +1,8 @@
 from .agent import Agent, get_tool_executor, shutdown_tool_executor
 from .budget import Budget, Price, price_for
 from .call_chain import CallChain, CallFrame
-from .llm import Middleware, OpenAICompat
+from .llm import (Middleware, OpenAICompat, AnthropicLLM, GeminiLLM, FallbackLLM,
+                  is_retryable, retry_delay, RecordLLM, ReplayLLM, ReplayError)
 from .tool import Tool, ToolCache, tool
 from .plugin import Plugin
 from .plugin_manager import PluginManager, PluginError, orchify_plugins
@@ -19,6 +20,25 @@ from .api import (on, off, console, ConsoleLoop, approvals, pending_approvals,
                   questions, approve, reject, answer, status, report, runs, run,
                   history)
 from .utils import get_logger, configure_logging
+from .policy import ToolPolicy, ToolRule, Decision, policy_from_env
+from .mcp import MCPClient, MCPError
+from .persistence import EventStore, CheckpointStore, save_agent, load_agent
+from .store import (RunStore, MemoryRunStore, SQLiteRunStore, RedisRunStore,
+                    run_store_from_env)
+from .telemetry import (LLMInstrumentation, Metrics, Tracer, instrument_llm,
+                        setup_telemetry)
+from .tokens import estimate_tokens
+from .embeddings import Embeddings, HashingEmbeddings, OpenAIEmbeddings, cosine
+from .rag import Document, Hit, VectorIndex, retrieve_tool, index_event_store
+from .multimodal import (as_data_url, content, describe, image_part, image_parts,
+                         text_of, text_part)
+from .eval import (Case, EvalError, EvalReport, load_dataset, run_dataset,
+                   save_dataset, contains, exact_match, json_match, regex_scorer)
+from .delegation import Delegation, DelegationError
+from .structured import (StructuredOutputError, ask_structured, extract_json,
+                         parse_structured, schema_instruction, validate)
+from .sandbox import (Sandbox, SandboxError, SandboxTimeout, run_sandboxed,
+                      sandbox_tool)
 
 __version__ = '0.0.1'
 
@@ -30,6 +50,11 @@ __all__ = [
     'CallChain',
     'CallFrame',
     'OpenAICompat',
+    'AnthropicLLM',
+    'GeminiLLM',
+    'FallbackLLM',
+    'is_retryable',
+    'retry_delay',
     'Middleware',
     'Tool',
     'ToolCache',
@@ -84,4 +109,67 @@ __all__ = [
     'make_turn_id',
     'get_logger',
     'configure_logging',
+    'ToolPolicy',
+    'ToolRule',
+    'Decision',
+    'policy_from_env',
+    'MCPClient',
+    'MCPError',
+    'EventStore',
+    'CheckpointStore',
+    'save_agent',
+    'load_agent',
+    'RunStore',
+    'MemoryRunStore',
+    'SQLiteRunStore',
+    'RedisRunStore',
+    'run_store_from_env',
+    'Metrics',
+    'Tracer',
+    'setup_telemetry',
+    'estimate_tokens',
+    'Embeddings',
+    'HashingEmbeddings',
+    'OpenAIEmbeddings',
+    'cosine',
+    'Document',
+    'Hit',
+    'VectorIndex',
+    'retrieve_tool',
+    'index_event_store',
+    'as_data_url',
+    'content',
+    'describe',
+    'image_part',
+    'image_parts',
+    'text_of',
+    'text_part',
+    'RecordLLM',
+    'ReplayLLM',
+    'ReplayError',
+    'Case',
+    'EvalError',
+    'EvalReport',
+    'load_dataset',
+    'run_dataset',
+    'save_dataset',
+    'contains',
+    'exact_match',
+    'json_match',
+    'regex_scorer',
+    'Delegation',
+    'DelegationError',
+    'StructuredOutputError',
+    'ask_structured',
+    'extract_json',
+    'parse_structured',
+    'schema_instruction',
+    'validate',
+    'Sandbox',
+    'SandboxError',
+    'SandboxTimeout',
+    'run_sandboxed',
+    'sandbox_tool',
+    'LLMInstrumentation',
+    'instrument_llm',
 ]

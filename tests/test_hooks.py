@@ -167,6 +167,20 @@ def test_hook_binding_repr_shows_the_new_fields():
     print('ok  HookBinding exposes priority and background')
 
 
+def test_candidate_cache_sees_hooks_registered_later():
+    seen = []
+    orchify_broker.emit(_event('hook:cache'))
+    binding = orchify_broker.register_hook('hook:cache', lambda e: seen.append('late'))
+    try:
+        orchify_broker.emit(_event('hook:cache'))
+        assert seen == ['late'], seen
+    finally:
+        orchify_broker.remove_binding(binding)
+    orchify_broker.emit(_event('hook:cache'))
+    assert seen == ['late'], seen
+    print('ok  the candidate cache follows hook registration')
+
+
 def main():
     tests = [
         test_priority_orders_dispatch_and_keeps_registration_order,
@@ -177,6 +191,7 @@ def main():
         test_a_whole_run_with_a_background_hook,
         test_drain_hooks_times_out,
         test_hook_binding_repr_shows_the_new_fields,
+        test_candidate_cache_sees_hooks_registered_later,
     ]
     failed = []
     for test in tests:
