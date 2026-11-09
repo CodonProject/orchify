@@ -3,6 +3,8 @@ import shutil
 import sys
 import uuid
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from orchify import Agent, orchify_broker
@@ -173,9 +175,10 @@ def test_redis_store_uses_hash_and_index():
     assert store.list(status='error') == []
     assert store.delete('r0') is True
     assert store.snapshot()['prefix'] == 'test'
+    assert store.clear() == 2
+    assert store.count() == 0
     store.close()
     assert client.closed is True
-    assert store.clear() == 2
 
 
 def test_run_store_from_env_parses_specs():
@@ -202,8 +205,22 @@ def test_run_store_from_env_parses_specs():
         {'ORCHIFY_RUN_STORE': 'redis://localhost:6379/2'})
     try:
         assert redis_store.name == 'redis'
+        assert redis_store.url == 'redis://localhost:6379/2'
     finally:
         redis_store.close()
+
+
+def test_redis_store_connects_lazily(monkeypatch):
+    '''Building a Redis store must not need the redis package until first use.'''
+    monkeypatch.setitem(sys.modules, 'redis', None)   # import redis -> ImportError
+    store = RedisRunStore('redis://localhost:6379/2')
+    assert store.name == 'redis'
+    with pytest.raises(RuntimeError) as caught:
+        store.count()
+    assert 'pip install redis' in str(caught.value)
+    snapshot = store.snapshot()
+    assert snapshot['runs'] is None and 'pip install redis' in snapshot['error']
+    store.close()
 
 
 def test_manager_writes_finished_runs_to_the_store():

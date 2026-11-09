@@ -256,10 +256,33 @@ orchify_run_duration_seconds_count 2
 ```
 
 覆盖：`events_total{type}`、`runs_started_total`、`runs_finished_total{status}`、
-`runs_active`、`steps_total`、`llm_tokens_total{kind}`、`run_duration_seconds`、
-`tool_calls_total{tool}`、`tool_cache_hits_total`、`tool_errors_total`、
-`approvals_total{decision}`、`budget_exceeded_total`、`llm_retries_total`。
+`runs_active`、`steps_total`、`llm_tokens_total{kind}`、
+`llm_tokens_by_model_total{model,kind}`、`llm_cost_usd_total{model}`、
+`llm_requests_total{model,status}`、`llm_request_seconds{model}`、
+`run_duration_seconds`、`tool_calls_total{tool}`、`tool_cache_hits_total`、
+`tool_errors_total`、`approvals_total{decision}`、`budget_exceeded_total`、
+`llm_retries_total`。
 工具标签做了基数上限（64 个，超出归入 `other`），避免用户自定义工具名撑爆时间序列。
+
+### POST|GET|DELETE /mcp
+
+把 Agent 或工具按 MCP（Model Context Protocol）暴露给支持 MCP 的客户端
+（Claude Desktop、Cursor、MCP Inspector 等）。只有在 `create_app(mcp=...)` 或
+`orchify serve --mcp` 时才挂载，默认路径 `/mcp`（`mcp_path` 可改）。
+
+- `POST`：一条消息或一批消息。初始化（`initialize`）成功时返回
+  `Mcp-Session-Id` 响应头，之后的请求必须带回；会话过期返回 `404`
+  （错误码 `-32000`）；`MCP-Protocol-Version` 不受支持返回 `400`（`-32600`）；
+  JSON 解析失败返回 `400`（`-32700`）。只含通知的请求返回 `202`（空响应体）。
+- `GET`：可选的服务器→客户端 SSE 流（本实现返回 `text/event-stream`），
+  `Accept` 不匹配时返回 `405`。
+- `DELETE`：结束会话，返回 `200`；缺少会话头 `400`，会话不存在 `404`。
+- 支持的方法：`initialize`、`ping`、`tools/list`（游标分页，非法游标 `-32602`）、
+  `tools/call`。未知方法返回 `-32601`；工具执行失败用 `isError: true` 而不是
+  JSON-RPC 错误。
+- 与 `/api/*` 共用鉴权：配置了 `ORCHIFY_API_KEYS` 时同样需要 `Authorization:
+  Bearer` 或 `X-API-Key`。配额（token / 费用）只作用于 `/api/chat` 发起的 run，
+  不限制 MCP 工具调用。
 
 ### GET /api/approvals?run_id=
 

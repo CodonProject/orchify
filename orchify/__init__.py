@@ -22,6 +22,7 @@ from .api import (on, off, console, ConsoleLoop, approvals, pending_approvals,
 from .utils import get_logger, configure_logging
 from .policy import ToolPolicy, ToolRule, Decision, policy_from_env
 from .mcp import MCPClient, MCPError
+from .mcp_server import (MCPHTTPServer, MCPRequestError, MCPStdioServer, serve_stdio)
 from .persistence import EventStore, CheckpointStore, save_agent, load_agent
 from .store import (RunStore, MemoryRunStore, SQLiteRunStore, RedisRunStore,
                     run_store_from_env)
@@ -115,6 +116,10 @@ __all__ = [
     'policy_from_env',
     'MCPClient',
     'MCPError',
+    'MCPHTTPServer',
+    'MCPRequestError',
+    'MCPStdioServer',
+    'serve_stdio',
     'EventStore',
     'CheckpointStore',
     'save_agent',

@@ -132,3 +132,18 @@ def test_mcp_reports_protocol_errors():
         with pytest.raises(MCPError) as raised:
             client.request('does/not/exist', {})
         assert raised.value.code == -32601
+
+
+def test_stdio_failure_reports_the_server_stderr():
+    '''A server that dies before the handshake explains why in the error.'''
+    with pytest.raises(MCPError) as raised:
+        MCPClient(
+            command=sys.executable,
+            args=['-c', 'import sys; sys.stderr.write("boom: missing config\\n"); '
+                         'sys.stderr.flush(); sys.exit(1)'],
+            name='broken',
+            timeout=10.0,
+        )
+    message = str(raised.value)
+    assert 'closed the connection' in message
+    assert 'boom: missing config' in message

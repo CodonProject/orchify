@@ -25,7 +25,8 @@ import os
 import re
 import subprocess
 import threading
-from typing import Any, Dict, List, Optional
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional
 
 from orchify.errors import OrchifyError
 from orchify.tool import Tool
@@ -34,6 +35,7 @@ from orchify.utils import get_logger
 logger = get_logger(__name__)
 
 PROTOCOL_VERSION = '2025-06-18'
+SUPPORTED_PROTOCOL_VERSIONS = ('2025-11-25', '2025-06-18', '2025-03-26')
 DEFAULT_TIMEOUT = 30.0
 _CLIENT_INFO = {'name': 'orchify', 'version': '0.0.1'}
 _NAME_RE = re.compile(r'[^A-Za-z0-9_-]+')
@@ -127,6 +129,8 @@ class MCPClient:
         name: str = 'mcp',
         timeout: float = DEFAULT_TIMEOUT,
         auto_start: bool = True,
+        client: Any = None,
+        resume_stream: bool = True,
     ):
         '''Configure a client.
 
@@ -143,6 +147,10 @@ class MCPClient:
             timeout (float): Default per-request timeout in seconds.
             auto_start (bool): Start the transport immediately; when False the
                 first request starts it.
+            client (Any): Pre-built ``httpx.Client`` for the HTTP transport
+                (mainly for tests); one is created when omitted.
+            resume_stream (bool): Open the optional GET event stream over HTTP
+                and resume it with ``Last-Event-ID`` after a disconnect.
 
         Raises:
             ValueError: When neither ``command`` nor ``url`` is given.
@@ -160,9 +168,17 @@ class MCPClient:
         self.server_info: Dict[str, Any] = {}
         self.capabilities: Dict[str, Any] = {}
         self.tools_cache: List[Dict[str, Any]] = []
+        self.protocol_version = PROTOCOL_VERSION
+        self.resume_stream = bool(resume_stream)
+        self._client = client
 
         self._proc: Optional[subprocess.Popen] = None
         self._reader: Optional[threading.Thread] = None
+        self._stderr_reader: Optional[threading.Thread] = None
+        self._stderr_tail: Deque[str] = deque(maxlen=20)
+        self._stream: Optional[threading.Thread] = None
+        self._stream_stop = threading.Event()
+        self._last_event_id = ''
         self._http = None
         self._session_id = ''
         self._pending: Dict[int, list] = {}
@@ -210,20 +226,45 @@ class MCPClient:
                 [self.command] + self.args,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 cwd=self.cwd,
                 env=environ,
                 bufsize=0,
             )
         except OSError as exc:
             raise MCPError(f'MCP server {self.command!r} could not be started: {exc}') from exc
+        self._stderr_reader = threading.Thread(
+            target=self._stderr_loop, name=f'OrchifyMCPStderr-{self.name}', daemon=True
+        )
+        self._stderr_reader.start()
         self._reader = threading.Thread(
             target=self._read_loop, name=f'OrchifyMCP-{self.name}', daemon=True
         )
         self._reader.start()
 
+    def _stderr_loop(self) -> None:
+        '''Keep the last stderr lines so a startup failure can be explained.'''
+        stream = self._proc.stderr if self._proc is not None else None
+        if stream is None:
+            return
+        for raw in stream:
+            line = raw.decode('utf-8', 'replace').strip() if isinstance(raw, bytes) else str(raw).strip()
+            if line:
+                self._stderr_tail.append(line)
+
+    def _stderr_hint(self) -> str:
+        '''Return the child's last stderr lines, ready to append to an error.'''
+        lines = [line for line in self._stderr_tail if line]
+        if not lines:
+            return ''
+        detail = ' | '.join(lines)[-600:]
+        return f' (server stderr: {detail})'
+
     def _start_http(self) -> None:
-        '''Open the HTTP client.'''
+        '''Open the HTTP client (or reuse the injected one).'''
+        if self._client is not None:
+            self._http = self._client
+            return
         import httpx
 
         headers = {
@@ -232,6 +273,78 @@ class MCPClient:
         }
         headers.update(self.headers)
         self._http = httpx.Client(timeout=self.timeout, headers=headers, follow_redirects=True)
+
+    def _http_headers(self, *, stream: bool = False) -> Dict[str, str]:
+        '''Build the per-request headers, including session and version.
+
+        Args:
+            stream (bool): Headers for the long-lived GET event stream.
+
+        Returns:
+            Dict[str, str]: Headers to merge over the client defaults.
+        '''
+        headers = {}
+        if self._session_id:
+            headers['Mcp-Session-Id'] = self._session_id
+        if self._initialized:
+            headers['MCP-Protocol-Version'] = self.protocol_version
+        if stream:
+            headers['Accept'] = 'text/event-stream'
+            if self._last_event_id:
+                headers['Last-Event-ID'] = self._last_event_id
+        return headers
+
+    def _start_stream(self) -> None:
+        '''Start the optional server-to-client SSE stream (HTTP transport).'''
+        if not self.resume_stream or self._stream is not None:
+            return
+        self._stream_stop.clear()
+        self._stream = threading.Thread(
+            target=self._stream_loop, name=f'OrchifyMCPStream-{self.name}', daemon=True
+        )
+        self._stream.start()
+
+    def _stream_loop(self) -> None:
+        '''Consume the GET event stream, resuming it after a disconnect.'''
+        delay = 1.0
+        while not self._stream_stop.is_set() and not self._closed:
+            try:
+                with self._http.stream('GET', self.url,
+                                       headers=self._http_headers(stream=True)) as response:
+                    if response.status_code == 405:
+                        logger.debug('%s: server offers no event stream', self.name)
+                        return
+                    if response.status_code >= 400:
+                        raise MCPError(
+                            f'MCP event stream for {self.name!r} returned '
+                            f'HTTP {response.status_code}'
+                        )
+                    delay = 1.0
+                    for line in response.iter_lines():
+                        if self._stream_stop.is_set():
+                            return
+                        line = (line or '').strip()
+                        if not line or line.startswith(':'):
+                            continue
+                        if line.startswith('id:'):
+                            self._last_event_id = line[3:].strip()
+                            continue
+                        if not line.startswith('data:'):
+                            continue
+                        data = line[5:].strip()
+                        if not data:
+                            continue
+                        try:
+                            self._handle_message(json.loads(data))
+                        except ValueError:
+                            continue
+            except Exception as exc:  # the stream is best effort
+                if self._stream_stop.is_set() or self._closed:
+                    return
+                logger.debug('%s: event stream dropped (%s); resuming soon', self.name, exc)
+            if self._stream_stop.wait(delay):
+                return
+            delay = min(delay * 2, 10.0)
 
     def _read_loop(self) -> None:
         '''Read newline-delimited JSON-RPC messages until the server exits.'''
@@ -248,7 +361,12 @@ class MCPClient:
                 logger.debug('%s: ignoring non-JSON MCP output: %s', self.name, line[:200])
                 continue
             self._handle_message(message)
-        self._fail_pending(MCPError(f'MCP server {self.name!r} closed the connection'))
+        if self._stderr_reader is not None:
+            # The child is gone, so its stderr closes too; give the collector a
+            # moment to drain the final lines before explaining the failure.
+            self._stderr_reader.join(timeout=2.0)
+        self._fail_pending(MCPError(
+            f'MCP server {self.name!r} closed the connection{self._stderr_hint()}'))
 
     def _handle_message(self, message: Dict[str, Any]) -> None:
         '''Route one decoded JSON-RPC message.
@@ -308,31 +426,42 @@ class MCPClient:
             except (BrokenPipeError, ValueError) as exc:
                 raise MCPError(f'MCP server {self.name!r} stopped accepting input: {exc}') from exc
 
-    def _http_post(self, message: Dict[str, Any]) -> None:
+    def _http_post(self, message: Dict[str, Any], timeout: Optional[float] = None,
+                   retry: bool = True) -> None:
         '''Send one message over HTTP and absorb the reply.
 
         The streamable-HTTP transport answers either with ``application/json``
         or with an SSE stream; both shapes are decoded here and routed through
-        the same handler the stdio reader uses.
+        the same handler the stdio reader uses. A ``404`` means the session
+        expired, so the client re-initialises once and retries the message.
 
         Args:
             message (Dict[str, Any]): The JSON-RPC message.
+            timeout (Optional[float]): Override the client timeout.
+            retry (bool): Re-initialise and retry once after a 404.
 
         Raises:
             MCPError: On transport failure.
         '''
         if self._http is None:
             raise MCPError(f'MCP server {self.name!r} is not connected')
-        headers = {}
-        if self._session_id:
-            headers['Mcp-Session-Id'] = self._session_id
         try:
-            response = self._http.post(self.url, json=message, headers=headers)
+            response = self._http.post(
+                self.url, json=message, headers=self._http_headers(),
+                timeout=timeout if timeout is not None else self.timeout,
+            )
         except Exception as exc:  # httpx raises a wide family of errors
             raise MCPError(f'MCP server {self.name!r} request failed: {exc}') from exc
         session = response.headers.get('mcp-session-id')
         if session:
             self._session_id = session
+        if response.status_code == 404 and retry and message.get('method') != 'initialize':
+            logger.debug('%s: session expired; re-initialising', self.name)
+            self._session_id = ''
+            self._initialized = False
+            self._initialize()
+            self._http_post(message, timeout=timeout, retry=False)
+            return
         if response.status_code >= 400:
             raise MCPError(
                 f'MCP server {self.name!r} returned HTTP {response.status_code}: '
@@ -357,6 +486,15 @@ class MCPClient:
                 self._handle_message(json.loads(body))
             except ValueError:
                 logger.debug('%s: ignoring non-JSON MCP HTTP body: %s', self.name, body[:200])
+
+    def _http_delete(self) -> None:
+        '''Best-effort ``DELETE`` that terminates the HTTP session.'''
+        if self._http is None or not self.url:
+            return
+        try:
+            self._http.delete(self.url, headers=self._http_headers(), timeout=5.0)
+        except Exception as exc:  # terminating a session must never raise
+            logger.debug('%s: could not terminate the MCP session: %s', self.name, exc)
 
     # ------------------------------------------------------------- JSON-RPC API
 
@@ -385,19 +523,20 @@ class MCPClient:
         message = {'jsonrpc': '2.0', 'id': request_id, 'method': method}
         if params is not None:
             message['params'] = params
+        wait_for = self.timeout if timeout is None else float(timeout)
         try:
             if self.url:
-                self._http_post(message)
+                self._http_post(message, timeout=wait_for)
             else:
                 self._send(message)
         except Exception:
             with self._lock:
                 self._pending.pop(request_id, None)
             raise
-        wait_for = self.timeout if timeout is None else float(timeout)
         if not entry['event'].wait(wait_for):
             with self._lock:
                 self._pending.pop(request_id, None)
+            self._cancel(request_id, method)
             raise MCPError(f'MCP request {method!r} timed out after {wait_for}s')
         if entry['error'] is not None:
             raise entry['error']
@@ -411,18 +550,38 @@ class MCPClient:
             )
         return response.get('result')
 
-    def notify(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
+    def _cancel(self, request_id: int, method: str) -> None:
+        '''Tell the server a request is no longer wanted (best effort).
+
+        Args:
+            request_id (int): The JSON-RPC id that timed out.
+            method (str): Method name, used in the cancellation reason.
+        '''
+        if method == 'initialize':
+            return  # the specification forbids cancelling the handshake
+        try:
+            self.notify('notifications/cancelled',
+                        {'requestId': request_id,
+                         'reason': f'orchify timed out waiting for {method!r}'},
+                        timeout=5.0)
+        except Exception as exc:  # the request already failed; never mask that
+            logger.debug('%s: could not send notifications/cancelled: %s', self.name, exc)
+
+    def notify(self, method: str, params: Optional[Dict[str, Any]] = None,
+               timeout: Optional[float] = None) -> None:
         '''Send a notification (no response expected).
 
         Args:
             method (str): JSON-RPC method name.
             params (Optional[Dict[str, Any]]): Method parameters.
+            timeout (Optional[float]): HTTP timeout override; defaults to the
+                client timeout.
         '''
         message = {'jsonrpc': '2.0', 'method': method}
         if params is not None:
             message['params'] = params
         if self.url:
-            self._http_post(message)
+            self._http_post(message, timeout=timeout, retry=False)
         else:
             self._send(message)
 
@@ -433,9 +592,20 @@ class MCPClient:
             'capabilities': {},
             'clientInfo': dict(_CLIENT_INFO),
         })
-        self.server_info = dict((result or {}).get('serverInfo') or {})
-        self.capabilities = dict((result or {}).get('capabilities') or {})
+        result = result or {}
+        version = str(result.get('protocolVersion') or PROTOCOL_VERSION)
+        if version not in SUPPORTED_PROTOCOL_VERSIONS:
+            raise MCPError(
+                f'MCP server {self.name!r} negotiated protocol version {version!r}, '
+                f'which orchify does not support (supported: '
+                f'{", ".join(SUPPORTED_PROTOCOL_VERSIONS)})'
+            )
+        self.protocol_version = version
+        self.server_info = dict(result.get('serverInfo') or {})
+        self.capabilities = dict(result.get('capabilities') or {})
         self._initialized = True
+        if self.url:
+            self._start_stream()
         try:
             self.notify('notifications/initialized')
         except MCPError:
@@ -465,8 +635,12 @@ class MCPClient:
         return list(collected)
 
     def call_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None,
-                  timeout: Optional[float] = None) -> str:
-        '''Invoke one MCP tool and flatten its content to text.
+                  timeout: Optional[float] = None) -> Any:
+        '''Invoke one MCP tool and return its result.
+
+        Structured content (the MCP 2025-06-18 ``structuredContent`` field) is
+        returned as the decoded Python object; otherwise the text content is
+        concatenated and returned as one string.
 
         Args:
             name (str): MCP tool name (as advertised by ``tools/list``).
@@ -474,7 +648,7 @@ class MCPClient:
             timeout (Optional[float]): Override the client timeout.
 
         Returns:
-            str: The concatenated text content of the result.
+            Any: The structured result, or the concatenated text content.
 
         Raises:
             MCPError: When the server reports ``isError`` or the call fails.
@@ -492,11 +666,14 @@ class MCPClient:
                 pieces.append(str(resource.get('text') or resource.get('uri') or ''))
             else:
                 pieces.append(json.dumps(item, ensure_ascii=False))
-        if not pieces and result.get('structuredContent') is not None:
-            pieces.append(json.dumps(result['structuredContent'], ensure_ascii=False))
         text = '\n'.join(piece for piece in pieces if piece)
         if result.get('isError'):
             raise MCPError(f"MCP tool {name!r} failed: {text or 'no detail'}")
+        structured = result.get('structuredContent')
+        if isinstance(structured, dict):
+            return structured
+        if structured is not None and not pieces:
+            return structured
         return text
 
     def tools(self, prefix: Optional[str] = None, require_approval: bool = False,
@@ -545,8 +722,15 @@ class MCPClient:
         client = self
 
         def _call(**kwargs):
-            '''Call the MCP tool with the model-provided arguments.'''
-            return client.call_tool(tool_name, kwargs)
+            '''Call the MCP tool with the model-provided arguments.
+
+            Structured results are rendered as JSON text so a tool message is
+            always a string, which every provider accepts.
+            '''
+            value = client.call_tool(tool_name, kwargs)
+            if isinstance(value, str):
+                return value
+            return json.dumps(value, ensure_ascii=False, default=str)
 
         _call.__name__ = _tool_name(tool_name) or 'mcp_tool'
         return _call
@@ -580,11 +764,14 @@ class MCPClient:
     # ------------------------------------------------------------------ cleanup
 
     def close(self) -> None:
-        '''Stop the transport and fail any in-flight request.'''
+        '''Stop the transport, end the HTTP session and fail in-flight calls.'''
         self._closed = True
         self._connected = False
-        proc = self._proc
+        self._stream_stop.set()
+        stream = self._stream
+        self._stream = None
         self._fail_pending(MCPError(f'MCP server {self.name!r} was closed'))
+        proc = self._proc
         if proc is not None and proc.poll() is None:
             try:
                 proc.terminate()
@@ -595,13 +782,21 @@ class MCPClient:
                 except Exception:
                     pass
         self._proc = None
+        if self.url:
+            self._http_delete()
         http = self._http
         self._http = None
-        if http is not None:
+        if http is not None and http is not self._client:
             try:
                 http.close()
             except Exception:
                 pass
+        if stream is not None:
+            try:
+                stream.join(timeout=2)
+            except Exception:
+                pass
+        self._session_id = ''
         self._initialized = False
 
     def __enter__(self) -> 'MCPClient':

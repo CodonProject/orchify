@@ -715,8 +715,31 @@ agent.ask("What is in the working directory?")
 client.close()                    # or: with MCPClient(...) as client:
 ```
 
+The same works with `uvx`, which is how many MCP servers are published:
+
+```python
+client = MCPClient(command='uvx', args=['mcp-server-time'], name='time')
+client.tools()[0].execute(timezone='Asia/Tokyo')
+client.close()
+```
+
+`env=` is merged over the current environment, which is the place for whatever a
+stdio server needs (for `uvx`: `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_DEFAULT_INDEX`
+behind a proxy or a mirror).
+
 * Transport: `command=`/`args=`/`env=`/`cwd=` for stdio, or `url=`/`headers=`
   for streamable HTTP with session ids. Both do the `initialize` handshake.
+  The client negotiates `2025-11-25`, `2025-06-18` or `2025-03-26`, rejects a
+  version it does not speak, and sends `MCP-Protocol-Version` on every HTTP
+  request after the handshake.
+* HTTP sessions are handled for you: `Mcp-Session-Id` is captured from
+  `initialize` and echoed afterwards, `404` triggers a transparent
+  re-initialisation and retry, and `close()` sends `DELETE` to end the session.
+  A timed-out request also sends `notifications/cancelled` (never for
+  `initialize`, which the specification forbids cancelling).
+* With `resume_stream=True` (the default) the client opens the optional `GET`
+  SSE stream and resumes it with `Last-Event-ID` after a disconnect; pass
+  `resume_stream=False` when the server answers `405` or you do not need it.
 * Names are sanitised to `[A-Za-z0-9_-]` and capped at 64 characters (MCP allows
   arbitrary strings; OpenAI does not), so `tools(prefix='fs_')` is the escape
   hatch when two servers would collide.
@@ -725,7 +748,12 @@ client.close()                    # or: with MCPClient(...) as client:
   them into strings.
 * A tool that answers with `isError` raises `MCPError` (`.code`, `.data`), so
   the usual `on_error`/`retry` policy applies. `tools(require_approval=True)`
-  routes every call through the approval pool.
+  routes every call through the approval pool. `structuredContent` comes back as
+  the decoded Python object from `call_tool()`; the generated `Tool` renders it
+  as JSON text so a tool message is always a string.
+* A stdio server that dies during startup reports its last stderr lines in the
+  `MCPError`, so a missing package, a bad interpreter or an unwritable cache
+  directory is visible instead of a bare "closed the connection".
 * `client.list_tools()` / `call_tool()` / `prompts()` / `resources()` are there
   when you want to drive the protocol yourself, pagination included.
 
@@ -965,10 +993,46 @@ serve_stdio(Agent.from_env(name='assistant'), expose='agent')
   an `agent_` prefix so names cannot collide.
 * A setup file (`--setup setup.py` defining `agent=` and/or `tools=`) avoids
   writing your own entry point; `--tool-prefix` renames the published tools.
+* `initialize` negotiates the protocol version: a version the server supports is
+  echoed, anything else falls back to `2025-06-18` instead of failing.
+* `tools/list` is paginated (`page_size`, opaque `cursor`/`nextCursor`, an
+  invalid cursor is `-32602`), tool entries carry `title`, `annotations` and
+  `outputSchema` when the tool exposes them, and `tools/call` results that are
+  dictionaries come back as `structuredContent` next to the serialised text.
 * Requests are answered with the standard MCP methods (`initialize`, `ping`,
-  `tools/list`, `tools/call`, `prompts/list`, `resources/list`); unknown methods
-  return `-32601`, tool failures come back as `isError: true` content instead of
-  killing the connection.
+  `tools/list`, `tools/call`); unknown methods return `-32601`, tool failures
+  come back as `isError: true` content instead of killing the connection, and
+  `notifications/cancelled` is logged rather than answered.
+
+The same server also speaks **streamable HTTP**, so it can live next to the
+normal API instead of a child process:
+
+```bash
+orchify mcp --transport http --port 8010           # standalone: POST/GET/DELETE /mcp
+orchify serve --mcp                                # mount /mcp on the API app
+```
+
+```python
+from orchify import MCPHTTPServer
+from orchify.mcp_server import MCPStdioServer
+from orchify.server import create_app
+
+app = create_app(mcp=MCPHTTPServer(MCPStdioServer(tools=my_tools, expose='tools')))
+```
+
+One endpoint answers `POST` (a message or a batch, JSON in, JSON out), `GET`
+(the optional server-to-client SSE stream) and `DELETE` (end the session).
+`initialize` returns `Mcp-Session-Id`; later requests must echo it, an expired
+session gets `404`, an unsupported `MCP-Protocol-Version` gets `400`.
+`create_app(mcp=..., mcp_path='/mcp')` mounts it next to the API and shares its
+auth (a configured `api_keys` makes `/mcp` require `Authorization: Bearer` or
+`X-API-Key`, like every other route).
+
+Interoperability was checked against the official `mcp` Python SDK (1.29.0):
+its streamable-HTTP client negotiates `2025-11-25` with this server, lists the
+tools with their titles and calls them, and this package's client drives a
+public streamable-HTTP server (`MCPClient(url='https://…/mcp')`) through the
+same handshake, tool listing and structured tool call.
 
 ## Run Store
 
@@ -986,7 +1050,7 @@ manager.history(limit=20)     # served by the store, so other replicas' runs app
 | --- | --- | --- |
 | `MemoryRunStore(max_runs=500)` | in-process `OrderedDict` | tests, single process |
 | `SQLiteRunStore(path, max_runs=0)` | sqlite3 (WAL) | one host, several workers |
-| `RedisRunStore(url=None)` | redis hash + sorted set | a real cluster (`pip install redis`) |
+| `RedisRunStore(url=None)` | redis hash + sorted set | several hosts (`pip install redis`; the connection is lazy, so a missing package only shows up when a run is actually stored) |
 
 `ORCHIFY_RUN_STORE` selects one without code: unset/`memory` → memory,
 `sqlite:var/runs.db` → SQLite, `redis://host:6379/0` → Redis, any other value is
@@ -1375,6 +1439,7 @@ python tests/test_telemetry.py
 python tests/test_server.py
 python tests/test_entrypoints.py
 python tests/test_mcp_server.py
+python tests/test_mcp_http.py
 python tests/test_llm_providers.py
 python tests/test_rag.py
 python tests/test_store.py
@@ -1389,8 +1454,9 @@ python tests/test_sandbox.py
 ```
 
 The suite is fully offline: a scripted fake LLM stands in for the provider, and
-the MCP tests start a real (but local, inline) MCP server over stdio.
-378 tests, no network — the four pause points (including mid-stream and the last
+the MCP tests start a real (but local, inline) MCP server over stdio or mount the
+streamable-HTTP transport in-process.
+400 tests, no network — the four pause points (including mid-stream and the last
 step), the lost-resume race, stop-while-parked, approval approve/reject/timeout,
 run/turn identity, group member handles and the voting tally, the per-instance
 run guard (`allow_concurrent_runs`), run-completion handles and their reuse,

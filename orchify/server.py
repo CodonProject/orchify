@@ -36,7 +36,7 @@ from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
 try:  # optional extra
     from fastapi import Depends, FastAPI, HTTPException, Query, Request
-    from fastapi.responses import PlainTextResponse, StreamingResponse
+    from fastapi.responses import PlainTextResponse, Response, StreamingResponse
     from pydantic import BaseModel, Field
 except ImportError as exc:  # pragma: no cover - depends on the environment
     raise ImportError(
@@ -757,6 +757,8 @@ def create_app(*, agent: Optional[Agent] = None,
                tracer: Any = None,
                events: Optional[EventLog] = None,
                poll_per_run: int = 300,
+               mcp: Any = None,
+               mcp_path: str = '/mcp',
                title: str = 'Orchify API') -> FastAPI:
     '''Create the FastAPI application.
 
@@ -772,6 +774,9 @@ def create_app(*, agent: Optional[Agent] = None,
         tracer (Any): :class:`orchify.telemetry.Tracer` to trace runs.
         events (Optional[EventLog]): Event buffer to reuse.
         poll_per_run (int): Ring size per run in a new buffer.
+        mcp (Any): An :class:`orchify.mcp_server.MCPHTTPServer`, an
+            ``MCPStdioServer`` to wrap, or ``None`` to skip the endpoint.
+        mcp_path (str): Path of the MCP endpoint (streamable HTTP).
         title (str): OpenAPI title.
 
     Returns:
@@ -828,6 +833,34 @@ def create_app(*, agent: Optional[Agent] = None,
     app.state.quota = quota
     app.state.auth = auth
     app.state.metrics = local_metrics
+    app.state.mcp = None
+    if mcp is not None:
+        from orchify.mcp_server import MCPHTTPServer
+
+        transport = mcp if isinstance(mcp, MCPHTTPServer) else MCPHTTPServer(mcp)
+        app.state.mcp = transport
+
+        @app.post(mcp_path, dependencies=[Depends(auth)])
+        async def mcp_post(request: Request) -> Response:
+            '''Handle one JSON-RPC message (or batch) over streamable HTTP.'''
+            status, headers, body = transport.handle_post(await request.body(), request.headers)
+            return Response(content=body, status_code=status, headers=headers)
+
+        @app.get(mcp_path, dependencies=[Depends(auth)])
+        def mcp_get(request: Request) -> Response:
+            '''Open the optional server-to-client SSE stream.'''
+            status, headers, stream = transport.handle_get(request.headers)
+            if status != 200 or stream is None:
+                return Response(content=b''.join(stream or [b'']), status_code=status,
+                                headers=headers)
+            return StreamingResponse(stream, status_code=status, headers=headers,
+                                     media_type='text/event-stream')
+
+        @app.delete(mcp_path, dependencies=[Depends(auth)])
+        def mcp_delete(request: Request) -> Response:
+            '''Terminate an MCP session.'''
+            status, headers, body = transport.handle_delete(request.headers)
+            return Response(content=body, status_code=status, headers=headers)
 
     class ChatIn(BaseModel):
         '''Request body of ``POST /api/chat``.'''
@@ -868,6 +901,7 @@ def create_app(*, agent: Optional[Agent] = None,
             'sessions_created': pool.created,
             'events': log.stats(),
             'quota': quota.snapshot(),
+            'mcp': bool(getattr(app.state, 'mcp', None)),
             'orchify': api.status(),
         }
 

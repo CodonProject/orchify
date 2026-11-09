@@ -486,8 +486,15 @@ class Agent:
             Tuple[str, Dict[str, Any]]: The text handed to the model, and event
             payload extras describing the truncation (empty when nothing changed).
         '''
+        if not isinstance(result, str):
+            # Structured results (for example an MCP tool's structuredContent)
+            # are not valid message content, so render them as JSON text.
+            try:
+                result = json.dumps(result, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                result = str(result)
         limit = self.tool_result_limit
-        if limit <= 0 or not isinstance(result, str) or len(result) <= limit:
+        if limit <= 0 or len(result) <= limit:
             return result, {}
         head_len = max(1, (limit * 2) // 3)
         tail_len = max(0, limit - head_len)

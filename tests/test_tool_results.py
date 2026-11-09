@@ -117,3 +117,27 @@ def test_results_are_untouched_by_default():
     assert agent.ask('read it', max_steps=2) == 'done'
     tool_message = [m for m in agent.messages if m.get('role') == 'tool'][-1]
     assert tool_message['content'] == _LONG
+
+
+def test_structured_results_become_json_text():
+    '''A dict result (an MCP ``structuredContent``) is valid message content.'''
+    agent = _agent()
+    text, meta = agent._shape_tool_result('tool', 'call_1', {'echoed': 'hi'}, 'run')
+    assert text == json.dumps({'echoed': 'hi'})
+    assert meta == {}
+
+
+def test_structured_results_are_truncated_and_offloaded_as_text():
+    '''A big structured result goes through the same limit and offload path.'''
+    directory = _directory()
+    try:
+        agent = _agent(tool_result_limit=40, tool_result_dir=directory)
+        payload = {'items': ['z' * 400]}
+        text, meta = agent._shape_tool_result('tool', 'call_2', payload, 'run')
+        assert meta['truncated'] is True
+        assert meta['original_chars'] == len(json.dumps(payload))
+        with open(meta['path'], 'r', encoding='utf-8') as handle:
+            assert handle.read() == json.dumps(payload)
+    finally:
+        _drop(directory)
+

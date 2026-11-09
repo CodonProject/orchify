@@ -1,21 +1,19 @@
 """Expose an Orchify agent (or its tools) as an MCP server.
 
 The counterpart of :mod:`orchify.mcp`: instead of calling somebody else's MCP
-server, this module speaks the same JSON-RPC protocol over stdio so any MCP
-client (Claude Desktop, an IDE plugin, ``orchify.mcp.MCPClient`` itself) can
-call the agent.
+server, this module speaks the same JSON-RPC protocol so any MCP client
+(Claude Desktop, an IDE plugin, ``orchify.mcp.MCPClient`` itself) can call the
+agent.
 
-Usage::
+Two transports are available:
 
-    from orchify import Agent
-    from orchify.mcp_server import serve_stdio
-
-    agent = Agent.from_env('assistant')
-    serve_stdio(agent)
-
-or from the command line::
-
-    orchify mcp --agent assistant --expose both
+stdio
+    Newline-delimited JSON on stdin/stdout, started with
+    :func:`serve_stdio` or ``orchify mcp``.
+streamable HTTP
+    One endpoint answering POST (JSON or an SSE body), GET (a server-to-client
+    SSE stream) and DELETE (terminate the session), mounted into a FastAPI app
+    by :class:`MCPHTTPServer` (``orchify serve --mcp``).
 
 Exposure modes:
 
@@ -31,16 +29,19 @@ single-run guard: an MCP client that sends two calls at once gets them in order,
 not interleaved.
 """
 
+import base64
 import json
 import sys
 import traceback
-from typing import Any, Dict, List, Optional, TextIO
+from typing import Any, Dict, Iterable, List, Optional, TextIO, Tuple
 
 from orchify.utils import get_logger
 
 logger = get_logger(__name__)
 
 PROTOCOL_VERSION = '2025-06-18'
+SUPPORTED_PROTOCOL_VERSIONS = ('2025-11-25', PROTOCOL_VERSION, '2025-03-26')
+DEFAULT_PAGE_SIZE = 50
 
 _MODES = ('agent', 'tools', 'both')
 
@@ -65,6 +66,7 @@ def build_ask_tool(agent: Any) -> Dict[str, Any]:
     '''
     return {
         'name': 'ask',
+        'title': f'Ask {getattr(agent, "name", "the agent")}',
         'description': (
             f'Ask the "{getattr(agent, "name", "agent")}" Orchify agent a question and '
             'return its final answer. The agent may call tools and wait for approvals.'
@@ -95,11 +97,19 @@ def build_tool_entry(tool: Any, *, prefix: str = '') -> Dict[str, Any]:
     '''
     info = tool.info.get('function', {}) if isinstance(tool.info, dict) else {}
     name = f'{prefix}{tool.name}' if prefix else tool.name
-    return {
+    entry: Dict[str, Any] = {
         'name': name,
+        'title': str(getattr(tool, 'title', '') or tool.name),
         'description': info.get('description', '') or getattr(tool, 'description', '') or tool.name,
         'inputSchema': info.get('parameters') or {'type': 'object', 'properties': {}},
     }
+    annotations = getattr(tool, 'annotations', None)
+    if isinstance(annotations, dict):
+        entry['annotations'] = dict(annotations)
+    output_schema = getattr(tool, 'output_schema', None)
+    if isinstance(output_schema, dict):
+        entry['outputSchema'] = dict(output_schema)
+    return entry
 
 
 class MCPStdioServer:
@@ -119,7 +129,7 @@ class MCPStdioServer:
 
     def __init__(self, agent: Any = None, *, tools: Optional[list] = None,
                  expose: str = 'agent', name: str = 'orchify', version: str = '0.0.1',
-                 tool_prefix: str = ''):
+                 tool_prefix: str = '', page_size: int = DEFAULT_PAGE_SIZE):
         if expose not in _MODES:
             raise ValueError(f'expose must be one of {_MODES}, got {expose!r}')
         if agent is None and tools is None:
@@ -129,6 +139,9 @@ class MCPStdioServer:
         self.name = name
         self.version = version
         self.tool_prefix = tool_prefix or ('agent_' if expose == 'both' else '')
+        self.page_size = max(1, int(page_size or DEFAULT_PAGE_SIZE))
+        self.protocol_version = PROTOCOL_VERSION
+        self.client_info: Dict[str, Any] = {}
         source_tools = tools if tools is not None else list(getattr(agent, 'tools', {}).values())
         self._tools = {tool.name: tool for tool in source_tools}
         self._by_mcp_name = {
@@ -145,6 +158,28 @@ class MCPStdioServer:
             for tool in self._tools.values():
                 entries.append(build_tool_entry(tool, prefix=self.tool_prefix))
         return entries
+
+    def tool_page(self, cursor: Optional[str] = None) -> Dict[str, Any]:
+        '''Return one ``tools/list`` page.
+
+        Args:
+            cursor (Optional[str]): Opaque cursor from a previous page.
+
+        Returns:
+            Dict[str, Any]: ``{'tools': [...]}`` plus ``nextCursor`` when more
+            pages follow.
+
+        Raises:
+            MCPRequestError: When the cursor cannot be decoded.
+        '''
+        offset = _decode_cursor(cursor) if cursor else 0
+        entries = self.tool_list()
+        page = entries[offset:offset + self.page_size]
+        result: Dict[str, Any] = {'tools': page}
+        following = offset + len(page)
+        if following < len(entries):
+            result['nextCursor'] = _encode_cursor(following)
+        return result
 
     def call_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         '''Execute one MCP ``tools/call`` request.
@@ -183,7 +218,15 @@ class MCPStdioServer:
             logger.warning('mcp-server: tool %s failed: %s', name, exc)
             return {'content': [{'type': 'text', 'text': f'{type(exc).__name__}: {exc}'}],
                     'isError': True}
-        return {'content': [{'type': 'text', 'text': _as_text(result)}], 'isError': False}
+        payload: Dict[str, Any] = {
+            'content': [{'type': 'text', 'text': _as_text(result)}],
+            'isError': False,
+        }
+        if isinstance(result, dict):
+            # The specification pairs structured content with serialised JSON
+            # text so clients that only understand text still get every value.
+            payload['structuredContent'] = result
+        return payload
 
     def handle_request(self, method: str, params: Optional[Dict[str, Any]] = None) -> Any:
         '''Dispatch one JSON-RPC request method.
@@ -200,21 +243,25 @@ class MCPStdioServer:
         '''
         params = dict(params or {})
         if method == 'initialize':
+            requested = str(params.get('protocolVersion') or '')
+            version = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else PROTOCOL_VERSION
+            self.protocol_version = version
+            self.client_info = dict(params.get('clientInfo') or {})
             return {
-                'protocolVersion': PROTOCOL_VERSION,
+                'protocolVersion': version,
                 'capabilities': {'tools': {'listChanged': False}},
-                'serverInfo': {'name': self.name, 'version': self.version},
+                'serverInfo': {
+                    'name': self.name,
+                    'title': self.name,
+                    'version': self.version,
+                },
             }
         if method == 'ping':
             return {}
         if method == 'tools/list':
-            return {'tools': self.tool_list()}
+            return self.tool_page(params.get('cursor'))
         if method == 'tools/call':
             return self.call_tool(str(params.get('name') or ''), params.get('arguments') or {})
-        if method == 'prompts/list':
-            return {'prompts': []}
-        if method == 'resources/list':
-            return {'resources': []}
         raise MCPRequestError(f'method not found: {method}', code=-32601)
 
     def handle_message(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -236,7 +283,14 @@ class MCPStdioServer:
         if method is None:
             return None
         if request_id is None:
+            if method == 'notifications/cancelled':
+                params = message.get('params') or {}
+                logger.debug('mcp-server: client cancelled request %s (%s)',
+                             params.get('requestId'), params.get('reason', ''))
             return None  # notification (e.g. notifications/initialized)
+        if self.protocol_version and not _version_supported(self.protocol_version):
+            return _error_frame(request_id, -32600,
+                                f'unsupported protocol version: {self.protocol_version}')
         try:
             result = self.handle_request(str(method), message.get('params'))
         except MCPRequestError as exc:
@@ -304,8 +358,210 @@ def _error_frame(request_id: Any, code: int, message: str, data: Any = None) -> 
     return {'jsonrpc': '2.0', 'id': request_id, 'error': error}
 
 
+def _encode_cursor(offset: int) -> str:
+    '''Encode a pagination cursor (opaque to clients).'''
+    raw = json.dumps({'offset': int(offset)}, separators=(',', ':')).encode('utf-8')
+    return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+
+
+def _decode_cursor(cursor: str) -> int:
+    '''Decode a pagination cursor.
+
+    Args:
+        cursor (str): The cursor from the client.
+
+    Returns:
+        int: The offset it encodes.
+
+    Raises:
+        MCPRequestError: When the cursor is not one of ours (-32602).
+    '''
+    try:
+        padded = str(cursor) + '=' * (-len(str(cursor)) % 4)
+        data = json.loads(base64.urlsafe_b64decode(padded.encode('ascii')).decode('utf-8'))
+        offset = int(data['offset'])
+    except Exception:
+        raise MCPRequestError(f'invalid cursor: {cursor!r}', code=-32602)
+    if offset < 0:
+        raise MCPRequestError(f'invalid cursor: {cursor!r}', code=-32602)
+    return offset
+
+
+def _version_supported(version: str) -> bool:
+    '''Report whether this server speaks a protocol version.'''
+    return str(version or '') in SUPPORTED_PROTOCOL_VERSIONS
+
+
+def _header(headers: Any, name: str) -> str:
+    '''Read one header case-insensitively from a mapping or header list.'''
+    if headers is None:
+        return ''
+    lowered = name.lower()
+    try:
+        items = headers.items()
+    except AttributeError:
+        items = headers
+    for key, value in items:
+        if str(key).lower() == lowered:
+            return str(value)
+    return ''
+
+
+class MCPHTTPServer:
+    '''Streamable-HTTP transport around :class:`MCPStdioServer`.
+
+    One endpoint serves ``POST`` (JSON or an SSE body), ``GET`` (the optional
+    server-to-client stream) and ``DELETE`` (end the session). The class has no
+    FastAPI dependency: :meth:`handle_post`, :meth:`handle_get` and
+    :meth:`handle_delete` return plain ``(status, headers, body)`` tuples that
+    :mod:`orchify.server` turns into responses, so the transport can also be
+    driven from tests or another framework.
+
+    Args:
+        server (Optional[MCPStdioServer]): The protocol handler; one is built
+            from ``agent``/``tools`` when omitted.
+        session_idle (float): Seconds without traffic before a session expires.
+        stream_interval (float): Seconds between keep-alive comments.
+    '''
+
+    def __init__(self, server: Optional[MCPStdioServer] = None, *, agent: Any = None,
+                 tools: Optional[list] = None, expose: str = 'agent',
+                 name: str = 'orchify', version: str = '0.0.1', tool_prefix: str = '',
+                 page_size: int = DEFAULT_PAGE_SIZE, session_idle: float = 300.0,
+                 stream_interval: float = 15.0):
+        import threading
+        import time
+
+        if server is None:
+            server = MCPStdioServer(agent, tools=tools, expose=expose, name=name,
+                                    version=version, tool_prefix=tool_prefix,
+                                    page_size=page_size)
+        elif page_size != DEFAULT_PAGE_SIZE:
+            server.page_size = max(1, int(page_size))
+        self.server = server
+        self.session_idle = float(session_idle)
+        self.stream_interval = max(0.1, float(stream_interval))
+        self._time = time
+        self._lock = threading.Lock()
+        self._sessions: Dict[str, float] = {}
+        self._counter = 0
+
+    # ------------------------------------------------------------- sessions
+
+    def _new_session(self) -> str:
+        '''Create (and register) a session id.'''
+        with self._lock:
+            self._counter += 1
+            session_id = f'orchify-{self._counter}-{int(self._time.time() * 1000)}'
+            self._sessions[session_id] = self._time.time()
+            return session_id
+
+    def _touch(self, session_id: str) -> bool:
+        '''Refresh a session and report whether it is still alive.'''
+        if not session_id:
+            return False
+        with self._lock:
+            started = self._sessions.get(session_id)
+            now = self._time.time()
+            if started is None:
+                return False
+            if now - started > self.session_idle:
+                self._sessions.pop(session_id, None)
+                return False
+            self._sessions[session_id] = now
+            return True
+
+    def _drop(self, session_id: str) -> bool:
+        '''Remove one session.'''
+        with self._lock:
+            return self._sessions.pop(session_id, None) is not None
+
+    # ------------------------------------------------------------ transports
+
+    def handle_post(self, body: bytes, headers: Any = None) -> Tuple[int, Dict[str, str], bytes]:
+        '''Handle one HTTP ``POST``.
+
+        Args:
+            body (bytes): The raw request body.
+            headers (Any): Incoming headers (mapping or item list).
+
+        Returns:
+            Tuple[int, Dict[str, str], bytes]: Status, response headers, body.
+        '''
+        version = _header(headers, 'mcp-protocol-version')
+        if version and not _version_supported(version):
+            return self._error(400, None, -32600, f'unsupported protocol version: {version}')
+        try:
+            payload = json.loads(body.decode('utf-8') if isinstance(body, bytes) else body)
+        except ValueError:
+            return self._error(400, None, -32700, 'parse error')
+        session_id = _header(headers, 'mcp-session-id')
+        if session_id and not self._touch(session_id):
+            return self._error(404, None, -32000, 'session expired')
+        messages = payload if isinstance(payload, list) else [payload]
+        responses: List[Dict[str, Any]] = []
+        created = ''
+        for message in messages:
+            if not isinstance(message, dict):
+                responses.append(_error_frame(None, -32600, 'invalid request'))
+                continue
+            if message.get('method') == 'initialize':
+                created = self._new_session()
+            response = self.server.handle_message(message)
+            if response is not None:
+                responses.append(response)
+        out_headers: Dict[str, str] = {'content-type': 'application/json'}
+        if created:
+            out_headers['mcp-session-id'] = created
+        if not responses:
+            return 202, out_headers, b''
+        return 200, out_headers, json.dumps(responses[0] if not isinstance(payload, list) else responses,
+                                            ensure_ascii=False).encode('utf-8')
+
+    def handle_get(self, headers: Any = None) -> Tuple[int, Dict[str, str], Optional[Iterable[bytes]]]:
+        '''Handle one HTTP ``GET`` (the server-to-client stream).
+
+        Returns:
+            Tuple[int, Dict[str, str], Optional[Iterable[bytes]]]: Status,
+            headers and the SSE body generator (``None`` when nothing streams).
+        '''
+        version = _header(headers, 'mcp-protocol-version')
+        if version and not _version_supported(version):
+            status, out_headers, body = self._error(400, None, -32600,
+                                                    f'unsupported protocol version: {version}')
+            return status, out_headers, [body]
+        session_id = _header(headers, 'mcp-session-id')
+        if session_id and not self._touch(session_id):
+            status, out_headers, body = self._error(404, None, -32000, 'session expired')
+            return status, out_headers, [body]
+        return 200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache'}, self.sse_stream()
+
+    def handle_delete(self, headers: Any = None) -> Tuple[int, Dict[str, str], bytes]:
+        '''Handle one HTTP ``DELETE`` (terminate the session).'''
+        session_id = _header(headers, 'mcp-session-id')
+        if not session_id:
+            return self._error(400, None, -32600, 'missing session id')
+        if not self._drop(session_id):
+            return self._error(404, None, -32000, 'unknown session')
+        return 200, {'content-type': 'application/json'}, b'{}'
+
+    def sse_stream(self) -> Iterable[bytes]:
+        '''Yield SSE keep-alives until the session idle window closes.'''
+        started = self._time.time()
+        yield b': connected\n\n'
+        while self._time.time() - started < self.session_idle:
+            yield b': keep-alive\n\n'
+            self._time.sleep(self.stream_interval)
+
+    def _error(self, status: int, request_id: Any, code: int, message: str) -> Tuple[int, Dict[str, str], bytes]:
+        '''Build a JSON error response tuple.'''
+        body = _error_frame(request_id, code, message)
+        return status, {'content-type': 'application/json'}, json.dumps(body).encode('utf-8')
+
+
 def serve_stdio(agent: Any = None, *, tools: Optional[list] = None, expose: str = 'agent',
                 name: str = 'orchify', version: str = '0.0.1', tool_prefix: str = '',
+                page_size: int = DEFAULT_PAGE_SIZE,
                 instream: Optional[TextIO] = None, outstream: Optional[TextIO] = None) -> None:
     '''Serve an agent over stdio MCP; the one-line entry point for scripts.
 
@@ -316,13 +572,14 @@ def serve_stdio(agent: Any = None, *, tools: Optional[list] = None, expose: str 
         name (str): Server name.
         version (str): Server version.
         tool_prefix (str): Prefix applied to exposed agent tool names.
+        page_size (int): ``tools/list`` page size.
         instream (Optional[TextIO]): Input stream; defaults to stdin.
         outstream (Optional[TextIO]): Output stream; defaults to stdout.
     '''
     server = MCPStdioServer(agent, tools=tools, expose=expose, name=name,
-                            version=version, tool_prefix=tool_prefix)
+                            version=version, tool_prefix=tool_prefix, page_size=page_size)
     server.serve(instream, outstream)
 
 
-__all__ = ['MCPStdioServer', 'MCPRequestError', 'PROTOCOL_VERSION',
-           'build_ask_tool', 'build_tool_entry', 'serve_stdio']
+__all__ = ['MCPStdioServer', 'MCPHTTPServer', 'MCPRequestError', 'PROTOCOL_VERSION',
+           'SUPPORTED_PROTOCOL_VERSIONS', 'build_ask_tool', 'build_tool_entry', 'serve_stdio']

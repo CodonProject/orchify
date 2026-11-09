@@ -322,6 +322,8 @@ class RedisRunStore(RunStore):
     '''Shared store for replicas on different hosts (needs ``redis`` installed).
 
     Records live in one Redis hash plus a sorted set ordered by ``started_at``.
+    The connection is lazy: constructing a store (or listing it in ``status()``)
+    does not import ``redis`` or open a socket; the first real operation does.
 
     Args:
         url (Optional[str]): Redis URL; defaults to ``ORCHIFY_REDIS_URL`` or
@@ -339,9 +341,17 @@ class RedisRunStore(RunStore):
         self.url = url or os.environ.get('ORCHIFY_REDIS_URL') or 'redis://127.0.0.1:6379/0'
         self.prefix = prefix
         self.max_runs = max(0, int(max_runs))
-        self._client = client if client is not None else self._connect()
+        # The connection is lazy: building a store from a spec (or showing it in
+        # ``status()``) must not need the redis package or a reachable server.
+        self._client = client
         self._records_key = f'{prefix}:records'
         self._index_key = f'{prefix}:index'
+
+    def _ensure(self) -> Any:
+        '''Return a connected client, connecting on first use.'''
+        if self._client is None:
+            self._client = self._connect()
+        return self._client
 
     def _connect(self) -> Any:
         try:
@@ -359,17 +369,18 @@ class RedisRunStore(RunStore):
         if not run_id:
             raise ValueError('run record needs a run_id')
         score = float(record.get('started_at') or time.time())
-        self._client.hset(self._records_key, run_id, json.dumps(record, default=str))
-        self._client.zadd(self._index_key, {run_id: score})
+        client = self._ensure()
+        client.hset(self._records_key, run_id, json.dumps(record, default=str))
+        client.zadd(self._index_key, {run_id: score})
         if self.max_runs:
-            stale = self._client.zrange(self._index_key, 0, -self.max_runs - 1)
+            stale = client.zrange(self._index_key, 0, -self.max_runs - 1)
             if stale:
-                self._client.hdel(self._records_key, *stale)
-                self._client.zrem(self._index_key, *stale)
+                client.hdel(self._records_key, *stale)
+                client.zrem(self._index_key, *stale)
 
     def get(self, run_id: str) -> Optional[Dict[str, Any]]:
         '''Read one record.'''
-        raw = self._client.hget(self._records_key, str(run_id or ''))
+        raw = self._ensure().hget(self._records_key, str(run_id or ''))
         return json.loads(raw) if raw else None
 
     def list(self, limit: Optional[int] = 50, kind: Optional[str] = None,
@@ -378,10 +389,11 @@ class RedisRunStore(RunStore):
         stop = -1 if limit is None or limit < 0 else int(limit) - 1
         if stop == -2:
             return []
-        ids = self._client.zrevrange(self._index_key, 0, stop)
+        client = self._ensure()
+        ids = client.zrevrange(self._index_key, 0, stop)
         if not ids:
             return []
-        rows = self._client.hmget(self._records_key, ids)
+        rows = client.hmget(self._records_key, ids)
         items = [json.loads(raw) for raw in rows if raw]
         if kind is not None:
             items = [item for item in items if item.get('kind') == kind]
@@ -392,30 +404,38 @@ class RedisRunStore(RunStore):
     def delete(self, run_id: str) -> bool:
         '''Remove one record.'''
         key = str(run_id or '')
-        removed = int(self._client.hdel(self._records_key, key) or 0)
-        self._client.zrem(self._index_key, key)
+        client = self._ensure()
+        removed = int(client.hdel(self._records_key, key) or 0)
+        client.zrem(self._index_key, key)
         return removed > 0
 
     def count(self) -> int:
         '''Number of stored records.'''
-        return int(self._client.hlen(self._records_key) or 0)
+        return int(self._ensure().hlen(self._records_key) or 0)
 
     def clear(self) -> int:
         '''Delete every record.'''
         removed = self.count()
-        self._client.delete(self._records_key, self._index_key)
+        self._ensure().delete(self._records_key, self._index_key)
         return removed
 
     def close(self) -> None:
         '''Close the client connection when it exposes ``close()``.'''
-        closer = getattr(self._client, 'close', None)
+        client, self._client = self._client, None
+        closer = getattr(client, 'close', None)
         if callable(closer):
             closer()
 
     def snapshot(self) -> Dict[str, Any]:
-        '''Store metadata for reports.'''
-        return {'store': self.name, 'runs': self.count(), 'url': self.url,
-                'prefix': self.prefix}
+        '''Store metadata for reports (a missing redis package is reported, not raised).'''
+        info: Dict[str, Any] = {'store': self.name, 'url': self.url,
+                                'prefix': self.prefix}
+        try:
+            info['runs'] = self.count()
+        except Exception as exc:  # noqa: BLE001 - status must never break a report
+            info['runs'] = None
+            info['error'] = str(exc)
+        return info
 
 
 def _row_value(record: Dict[str, Any], key: str) -> Any:

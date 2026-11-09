@@ -555,8 +555,9 @@ def _plugins(group: str = '', as_json: bool = False, load: bool = False) -> int:
 
 
 def _mcp(setup: str = '', agent_name: str = 'orchify', expose: str = 'agent',
-         name: str = 'orchify', tool_prefix: str = '') -> int:
-    '''Serve an agent over MCP on stdio, for Claude Desktop and other clients.
+         name: str = 'orchify', tool_prefix: str = '', transport: str = 'stdio',
+         host: str = '127.0.0.1', port: int = 8010) -> int:
+    '''Serve an agent over MCP, on stdio or streamable HTTP.
 
     Args:
         setup (str): Python file that defines ``agent`` and/or ``tools``.
@@ -564,12 +565,16 @@ def _mcp(setup: str = '', agent_name: str = 'orchify', expose: str = 'agent',
         expose (str): ``agent``, ``tools`` or ``both``.
         name (str): MCP server name reported during ``initialize``.
         tool_prefix (str): Prefix applied to exposed agent tool names.
+        transport (str): ``'stdio'`` (default) or ``'http'``.
+        host (str): Bind address for ``transport='http'``.
+        port (int): Bind port for ``transport='http'``.
 
     Returns:
         int: :data:`EXIT_ERROR` when the setup file cannot be imported, otherwise
-        the process keeps running as a server until stdin reaches EOF.
+        the process keeps running as a server until stdin reaches EOF (stdio) or
+        until interrupted (HTTP).
     '''
-    from .mcp_server import serve_stdio
+    from .mcp_server import MCPHTTPServer, MCPStdioServer, serve_stdio
 
     agent = None
     tools = None
@@ -588,7 +593,16 @@ def _mcp(setup: str = '', agent_name: str = 'orchify', expose: str = 'agent',
             print('Pass --setup FILE with an "agent" or "tools" object, or set the API env vars.')
             return EXIT_ERROR
     try:
-        serve_stdio(agent, tools=tools, expose=expose, name=name, tool_prefix=tool_prefix)
+        if transport == 'http':
+            from .server import create_app, serve
+
+            server = MCPStdioServer(agent, tools=tools, expose=expose, name=name,
+                                    tool_prefix=tool_prefix)
+            app = create_app(mcp=MCPHTTPServer(server), title='Orchify MCP')
+            print(f'orchify mcp: http://{host}:{port}/mcp (Ctrl+C to stop)')
+            serve(app, host=host, port=port)
+        else:
+            serve_stdio(agent, tools=tools, expose=expose, name=name, tool_prefix=tool_prefix)
     except KeyboardInterrupt:
         return EXIT_OK
     return EXIT_OK
@@ -596,7 +610,7 @@ def _mcp(setup: str = '', agent_name: str = 'orchify', expose: str = 'agent',
 
 def _serve(host: str = '127.0.0.1', port: int = 8010, setup: str = '',
            agent_name: str = 'orchify', keys: str = '', sessions: int = 32,
-           tokens: int = 0, cost: float = 0.0) -> int:
+           tokens: int = 0, cost: float = 0.0, mcp: bool = False) -> int:
     '''Serve the HTTP API (``orchify/server.py``) with uvicorn.
 
     Args:
@@ -607,6 +621,7 @@ def _serve(host: str = '127.0.0.1', port: int = 8010, setup: str = '',
         agent_name (str): Agent name used when the section above supplies none.
         keys (str): Comma-separated API keys; defaults to ``ORCHIFY_API_KEYS``.
         sessions (int): How many conversations the session pool keeps alive.
+        mcp (bool): Also mount the MCP streamable-HTTP endpoint at ``/mcp``.
 
     Returns:
         int: :data:`EXIT_OK` on a clean shutdown, :data:`EXIT_ERROR` when the
@@ -645,8 +660,23 @@ def _serve(host: str = '127.0.0.1', port: int = 8010, setup: str = '',
                       max_per_window=int(os.environ.get('ORCHIFY_SESSION_RUNS', '0') or 0),
                       window=float(os.environ.get('ORCHIFY_SESSION_WINDOW', '60') or 60),
                       max_tokens=tokens, max_cost=cost)
+    mcp_transport = None
+    if mcp:
+        from .mcp_server import MCPHTTPServer
+
+        mcp_agent = agent
+        if mcp_agent is None:
+            try:
+                mcp_agent = Agent.from_env(name=f'{agent_name}-mcp')
+            except Exception as exc:
+                print(f'Cannot build an agent for the MCP endpoint: {exc}')
+        if mcp_agent is not None or tools:
+            mcp_transport = MCPHTTPServer(agent=mcp_agent, tools=tools)
+        else:
+            print('The MCP endpoint needs an agent; skipping /mcp.')
     app = create_app(agent_factory=factory, api_keys=api_keys or None,
                      session_capacity=max(1, int(sessions)), quota=quota,
+                     mcp=mcp_transport,
                      title='Orchify API')
     print(f'orchify serve: http://{host}:{port} (Ctrl+C to stop)')
     try:
@@ -897,6 +927,10 @@ def _build_parser() -> argparse.ArgumentParser:
                      help='what to expose: the whole agent as "ask", its tools, or both')
     mcp.add_argument('--name', default='orchify', help='server name reported during initialize')
     mcp.add_argument('--tool-prefix', default='', help='prefix applied to exposed agent tool names')
+    mcp.add_argument('--transport', choices=['stdio', 'http'], default='stdio',
+                     help='stdio (default, for Claude Desktop) or streamable HTTP')
+    mcp.add_argument('--host', default='127.0.0.1', help='bind address for --transport http')
+    mcp.add_argument('--port', type=int, default=8010, help='bind port for --transport http')
     serve = commands.add_parser('serve', help='serve the HTTP API with uvicorn')
     serve.add_argument('--host', default='127.0.0.1', help='bind address (default: 127.0.0.1)')
     serve.add_argument('--port', type=int, default=8010, help='bind port (default: 8010)')
@@ -908,6 +942,8 @@ def _build_parser() -> argparse.ArgumentParser:
                        help='token budget per session (default: ORCHIFY_SESSION_TOKENS or unlimited)')
     serve.add_argument('--cost', type=float, default=0.0,
                        help='USD budget per session (default: ORCHIFY_SESSION_COST or unlimited)')
+    serve.add_argument('--mcp', action='store_true',
+                       help='also mount the MCP streamable-HTTP endpoint at /mcp')
     chat = commands.add_parser('chat', help='talk to an agent in the terminal')
     chat.add_argument('--setup', default='', help='Python file defining an "agent" and/or "tools" object')
     chat.add_argument('--agent', default='orchify', help='agent name used when --setup is not given')
@@ -941,11 +977,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _plugins(group=args.group, as_json=args.json, load=args.load)
     if args.command == 'mcp':
         return _mcp(setup=args.setup, agent_name=args.agent, expose=args.expose,
-                    name=args.name, tool_prefix=args.tool_prefix)
+                    name=args.name, tool_prefix=args.tool_prefix,
+                    transport=args.transport, host=args.host, port=args.port)
     if args.command == 'serve':
         return _serve(host=args.host, port=args.port, setup=args.setup,
                       agent_name=args.agent, keys=args.keys, sessions=args.sessions,
-                      tokens=args.tokens, cost=args.cost)
+                      tokens=args.tokens, cost=args.cost, mcp=args.mcp)
     if args.command == 'eval':
         return _eval(data=args.data, setup=args.setup, agent_name=args.agent,
                      scorer=args.scorer, max_steps=args.max_steps, as_json=args.json)
