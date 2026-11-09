@@ -1,9 +1,14 @@
 from orchify.llm import Response
-from typing import Literal, Optional, Any, TypeAlias
+from typing import Any, Literal, Optional
 from dataclasses import dataclass
 
 import json
 import time
+
+try:  # ``TypeAlias`` only exists on Python 3.10+
+    from typing import TypeAlias
+except ImportError:  # pragma: no cover - Python 3.9
+    TypeAlias = Any
 
 
 EVENT_TYPES: TypeAlias = Literal[

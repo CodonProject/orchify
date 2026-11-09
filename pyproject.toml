@@ -41,7 +41,7 @@ orchify = "orchify.cli:main"
 Homepage = "https://github.com/YizhouLi/orchify"
 
 [tool.setuptools]
-packages = ["orchify", "orchify.llm"]
+packages = ["orchify", "orchify.llm", "orchify.plugins"]
 
 [tool.setuptools.package-data]
 orchify = ["py.typed"]

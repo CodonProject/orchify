@@ -2,6 +2,8 @@ import io
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from orchify import Agent, orchify_broker
@@ -45,6 +47,7 @@ def test_chat_reports_missing_credentials(monkeypatch):
 
 def test_serve_builds_the_app_and_binds_the_requested_address(monkeypatch, capsys):
     '''The serve subcommand forwards host/port and builds a session factory.'''
+    pytest.importorskip('fastapi')
     import orchify.server as server_module
 
     seen = {}
@@ -73,6 +76,7 @@ def test_serve_uses_the_agent_from_a_setup_file(monkeypatch):
     '''A setup file that exposes a ready agent is served as-is.'''
     import uuid
 
+    pytest.importorskip('fastapi')
     import orchify.server as server_module
 
     directory = os.path.join(os.path.dirname(os.path.abspath(__file__)),
