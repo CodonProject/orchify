@@ -41,7 +41,7 @@ from .structured import (StructuredOutputError, ask_structured, extract_json,
 from .sandbox import (Sandbox, SandboxError, SandboxTimeout, run_sandboxed,
                       sandbox_tool)
 
-__version__ = '0.0.1'
+__version__ = '0.0.2'
 
 __all__ = [
     'Agent',
